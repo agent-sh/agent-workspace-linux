@@ -291,6 +291,10 @@ fn parse_viewer_options(args: &[String]) -> Result<Option<viewer::ViewerOptions>
                 options.always_on_top = true;
                 index += 1;
             }
+            "--input-forwarding" => {
+                options.input_forwarding = true;
+                index += 1;
+            }
             "--exit-when-workspace-gone" => {
                 options.exit_when_workspace_gone = true;
                 index += 1;
@@ -312,7 +316,7 @@ fn parse_viewer_options(args: &[String]) -> Result<Option<viewer::ViewerOptions>
                 return Ok(None);
             }
             unknown => bail!(
-                "unknown viewer option '{unknown}'. Expected: --id ID, --always-on-top, --background, --exit-when-workspace-gone, --help"
+                "unknown viewer option '{unknown}'. Expected: --id ID, --always-on-top, --input-forwarding, --background, --exit-when-workspace-gone, --help"
             ),
         }
     }
@@ -4316,7 +4320,7 @@ fn print_viewer_help() {
         r#"agent-workspace-linux viewer
 
 Usage:
-  agent-workspace-linux viewer [--id ID] [--always-on-top] [--exit-when-workspace-gone]
+  agent-workspace-linux viewer [--id ID] [--always-on-top] [--input-forwarding] [--exit-when-workspace-gone]
   agent-workspace-linux viewer list
   agent-workspace-linux viewer close (--id ID | --all) [--dry-run]
 
@@ -4329,6 +4333,9 @@ that behavior.
 --exit-when-workspace-gone closes the viewer once the selected workspace runtime
 is removed; workspace_open_viewer uses this so MCP-launched monitors do not
 become orphan windows.
+--input-forwarding allows the viewer's explicit in-window Input toggle to arm
+manual mouse/keyboard/paste forwarding into the isolated workspace. It is off by
+default and still requires a visible second-click confirmation in the viewer UI.
 The list and close subcommands use the repo-owned viewer registry, so they can
 inspect and close GPUI viewers even when the desktop compositor does not expose
 them as ordinary controllable windows.
@@ -4406,6 +4413,7 @@ mod tests {
             .expect("parse viewer options")
             .expect("viewer should run");
         assert!(!default_options.always_on_top);
+        assert!(!default_options.input_forwarding);
         assert!(!default_options.exit_when_workspace_gone);
 
         let args = vec!["--always-on-top".to_string()];
@@ -4413,6 +4421,15 @@ mod tests {
             .expect("parse viewer options")
             .expect("viewer should run");
         assert!(always_options.always_on_top);
+    }
+
+    #[test]
+    fn viewer_input_forwarding_is_opt_in() {
+        let args = vec!["--input-forwarding".to_string()];
+        let options = parse_viewer_options(&args)
+            .expect("parse viewer options")
+            .expect("viewer should run");
+        assert!(options.input_forwarding);
     }
 
     #[test]

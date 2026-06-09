@@ -1,6 +1,6 @@
 # GPUI Viewer Direction
 
-Last updated: 2026-05-26
+Last updated: 2026-06-08
 
 `agent-workspace-linux` owns the primary visible Agent Workspace monitor. Codex
 Desktop and other MCP hosts should be thin launchers/settings surfaces, while
@@ -30,8 +30,17 @@ footer mode in the user's XDG config directory.
 - The default viewer does not request always-on-top state.
 - `--always-on-top` and `workspace_open_viewer(always_on_top=true)` are opt-in
   overlay modes for hosts or users that explicitly ask for that behavior.
-- `workspace_open_viewer` reuses an existing registered viewer for the target
-  workspace instead of opening duplicate GPUI windows.
+- `workspace_open_viewer` reuses a compatible existing registered viewer for the target
+  workspace instead of opening duplicate GPUI windows. An
+  `input_forwarding=true` request may open a separate input-capable viewer when
+  only a read-only monitor is already running; later read-only opens can reuse
+  that existing input-capable viewer without arming input.
+- `--input-forwarding` and
+  `workspace_open_viewer(input_forwarding=true)` opt a viewer process into
+  manual read-write capability. Forwarding is still disabled when the window
+  appears; the human must click the in-viewer `Input` control twice to arm it.
+  All forwarded mouse, keyboard, scroll, and paste events go through
+  workspace-owned IPC for the selected workspace, never the host desktop.
 - MCP-opened viewers pass `--exit-when-workspace-gone`, so monitors opened for a
   task disappear when their selected workspace runtime is removed.
 - Direct `agent-workspace-linux viewer` launches remain persistent, so they can
@@ -46,6 +55,14 @@ default; enabling `View` overwrites one reusable frame file instead of creating 
 new timestamped screenshot per refresh. The footer favors user-useful context:
 in-flight viewer actions, latest workspace events, browser reads/navigations,
 active app/window, inferred task intent, and permission/isolation state.
+
+Manual input forwarding is deliberately separate from MCP live control. The MCP
+can be `active` while the viewer remains monitor-only, and an input-capable
+viewer still starts with forwarding off. When enabled, the viewer maps panel
+coordinates back through the rendered screenshot's `ObjectFit::Cover` crop/scale
+using the source screenshot dimensions before dispatching `click`,
+`move_pointer`, `drag`, `scroll`, `key`, `type_text`, or `paste_text` IPC
+actions.
 
 ## Agent Boundary
 

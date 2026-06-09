@@ -194,6 +194,7 @@ impl AgentWorkspaceLinux {
             Some(workspace_id.to_string()),
             &self.permissions,
             always_on_top,
+            false,
         ) {
             Ok(launch) => WorkspaceViewerAutoOpen {
                 requested,
@@ -1088,7 +1089,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_open_viewer",
-        description = "Ensure the small host-visible Agent Workspace GPUI viewer is open for a workspace id when this MCP process is not headless and workspace_doctor reports ready_for_host_viewer=true. If a registered viewer for that workspace is already alive, this reuses it instead of opening a second window. By default it does not request always-on-top state; set always_on_top=true only when the user or host explicitly wants overlay/above behavior. This intentionally launches a separate target-bound viewer child process outside the MCP stdio server so the user can inspect and control the hidden workspace from a gentle local monitor window; the MCP-opened viewer exits once its selected workspace runtime is removed. If the MCP was started with --headless or has no host display, this tool refuses instead of opening a host-visible window.",
+        description = "Ensure the small host-visible Agent Workspace GPUI viewer is open for a workspace id when this MCP process is not headless and workspace_doctor reports ready_for_host_viewer=true. If a compatible registered viewer for that workspace is already alive, this reuses it instead of opening a second window; input_forwarding=true may open a separate input-capable viewer when only a read-only monitor exists. By default it does not request always-on-top state; set always_on_top=true only when the user or host explicitly wants overlay/above behavior. Set input_forwarding=true only when the user explicitly wants a viewer that can arm manual mouse/keyboard/paste forwarding; forwarding still starts disabled and requires an in-viewer confirmation. This intentionally launches a separate target-bound viewer child process outside the MCP stdio server so the user can inspect and control the hidden workspace from a gentle local monitor window; the MCP-opened viewer exits once its selected workspace runtime is removed. If the MCP was started with --headless or has no host display, this tool refuses instead of opening a host-visible window.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1127,7 +1128,12 @@ impl AgentWorkspaceLinux {
             });
         }
         Json(
-            match viewer::open_viewer(params.id, &self.permissions, params.always_on_top) {
+            match viewer::open_viewer(
+                params.id,
+                &self.permissions,
+                params.always_on_top,
+                params.input_forwarding,
+            ) {
                 Ok(launch) => WorkspaceOpenViewerResponse {
                     ok: true,
                     message: if launch.reused {
@@ -1175,6 +1181,7 @@ impl AgentWorkspaceLinux {
                     pid: 0,
                     backend: "error".to_string(),
                     always_on_top: false,
+                    input_forwarding: false,
                     exit_when_workspace_gone: false,
                     executable: std::path::PathBuf::new(),
                     command: Vec::new(),
@@ -7499,7 +7506,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 true,
                 true,
                 "headless_or_host_display_gated_open_world",
-                "Ensures a host-visible GPUI viewer is open unless the MCP process is --headless or workspace_doctor.ready_for_host_viewer=false. Repeated calls reuse any live registered viewer for that workspace instead of opening another window. It remains available while live control is read_only or paused so the user can observe or regain control. The default viewer does not request always-on-top state; always_on_top is opt-in. MCP-opened viewers are target-bound and exit after their selected workspace runtime is removed.",
+                "Ensures a host-visible GPUI viewer is open unless the MCP process is --headless or workspace_doctor.ready_for_host_viewer=false. Repeated calls reuse a compatible live registered viewer for that workspace; input_forwarding=true may open a separate input-capable viewer when only a read-only monitor exists. It remains available while live control is read_only or paused so the user can observe or regain control. The default viewer does not request always-on-top state; always_on_top is opt-in. MCP-opened viewers are target-bound and exit after their selected workspace runtime is removed.",
             )
             .with_parameter_note(
                 "always_on_top",
@@ -7507,6 +7514,13 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 "Requests overlay/above window-manager behavior for the host-visible viewer.",
                 "Allowed while live control is read_only or paused. Blocked when MCP is --headless or the host viewer is not ready; otherwise host-visible/open-world.",
                 "Use only after the user or host explicitly asks for an always-on-top monitor.",
+            )
+            .with_parameter_note(
+                "input_forwarding",
+                "true",
+                "Launches or reuses a viewer capable of explicit in-viewer manual mouse/keyboard/paste forwarding into the isolated workspace; forwarding still starts disabled.",
+                "Allowed while live control is read_only or paused because this only opens host-visible UI; actual forwarded input remains blocked unless MCP control is active.",
+                "Use only when the user explicitly wants manual/RW viewer control.",
             ),
             mcp_action(
                 "workspace_list_viewers",
@@ -8808,6 +8822,8 @@ struct WorkspaceOpenViewerParams {
     id: Option<String>,
     #[serde(default)]
     always_on_top: bool,
+    #[serde(default)]
+    input_forwarding: bool,
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize, JsonSchema)]
@@ -10426,6 +10442,13 @@ mod tests {
             "Blocked unless live control is active"
         ));
 
+        let open_viewer = catalog_tool(&catalog, "workspace_open_viewer");
+        assert!(has_parameter_note(
+            open_viewer,
+            "input_forwarding",
+            "manual mouse/keyboard/paste forwarding"
+        ));
+
         let export = catalog_tool(&catalog, "profile_export");
         assert_eq!(export.control_behavior, "conditional_output_path");
         assert!(has_parameter_note(export, "output_path", "host filesystem"));
@@ -10436,6 +10459,24 @@ mod tests {
             "confirmed_user_request",
             "re-enable mutating actions"
         ));
+    }
+
+    #[test]
+    fn workspace_open_viewer_params_parse_input_forwarding() {
+        let default_params: WorkspaceOpenViewerParams =
+            serde_json::from_value(serde_json::json!({ "id": "qa" })).expect("default params");
+        assert!(!default_params.input_forwarding);
+
+        let rw_params: WorkspaceOpenViewerParams = serde_json::from_value(serde_json::json!({
+            "id": "qa",
+            "input_forwarding": true
+        }))
+        .expect("rw params");
+        assert!(rw_params.input_forwarding);
+
+        let schema = serde_json::to_value(schemars::schema_for!(WorkspaceOpenViewerParams))
+            .expect("schema value");
+        assert!(schema.to_string().contains("input_forwarding"));
     }
 
     #[test]
