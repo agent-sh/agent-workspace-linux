@@ -107,6 +107,9 @@ const CLEAN_CONFIRM_SECONDS: u64 = 6;
 const REVOKE_CONFIRM_SECONDS: u64 = 6;
 const INPUT_FORWARD_CONFIRM_SECONDS: u64 = 6;
 const INPUT_FORWARD_DRAG_THRESHOLD_PX: f32 = 3.0;
+// Bound manual input backlog so a slow workspace daemon cannot accumulate
+// unbounded stale key/scroll/click events behind the current user gesture.
+const MAX_INPUT_FORWARDING_QUEUE_LEN: usize = 128;
 const INPUT_FORWARD_REFRESH_BURST_DELAYS_MS: [u64; 3] = [90, 220, 500];
 // GPUI pixel scroll events are converted to X11 wheel ticks for workspace IPC.
 // 80px is a conservative one-notch touchpad/wheel unit; a high clamp prevents
@@ -276,23 +279,25 @@ fn track_bounds(div: Div, bounds: Arc<Mutex<Option<Bounds<Pixels>>>>) -> BoundsT
     BoundsTrackedDiv { div, bounds }
 }
 
+fn lock_screen_bounds(
+    tracked_bounds: &Arc<Mutex<Option<Bounds<Pixels>>>>,
+) -> std::sync::MutexGuard<'_, Option<Bounds<Pixels>>> {
+    tracked_bounds
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn store_screen_bounds(
     tracked_bounds: &Arc<Mutex<Option<Bounds<Pixels>>>>,
     next_bounds: Option<Bounds<Pixels>>,
 ) {
-    match tracked_bounds.lock() {
-        Ok(mut stored_bounds) => *stored_bounds = next_bounds,
-        Err(poisoned) => *poisoned.into_inner() = next_bounds,
-    }
+    *lock_screen_bounds(tracked_bounds) = next_bounds;
 }
 
 fn screen_bounds_snapshot(
     tracked_bounds: &Arc<Mutex<Option<Bounds<Pixels>>>>,
 ) -> Option<Bounds<Pixels>> {
-    match tracked_bounds.lock() {
-        Ok(stored_bounds) => *stored_bounds,
-        Err(poisoned) => *poisoned.into_inner(),
-    }
+    *lock_screen_bounds(tracked_bounds)
 }
 
 impl Element for BoundsTrackedDiv {
@@ -410,6 +415,8 @@ enum ViewerFrameUpdate {
     Replace(Option<ViewerFrame>),
 }
 
+type QueuedInputForwardingRequest = (u64, String, InputForwardingRequest);
+
 struct AgentWorkspaceViewer {
     target_id: String,
     bound_target_id: Option<String>,
@@ -431,7 +438,7 @@ struct AgentWorkspaceViewer {
     input_forwarding_enabled: bool,
     input_forwarding_arm_expires_at_unix: Option<u64>,
     input_forwarding_drag: Option<InputForwardingDrag>,
-    input_forwarding_queue: VecDeque<(u64, String, InputForwardingRequest)>,
+    input_forwarding_queue: VecDeque<QueuedInputForwardingRequest>,
     input_forwarding_in_flight: bool,
     input_forwarding_epoch: u64,
     input_forwarding_burst_generation: u64,
@@ -740,6 +747,18 @@ impl InputForwardingRequest {
             Self::Key { key } => workspace::key(target_id, key),
         }
     }
+}
+
+fn push_bounded_input_forwarding_request(
+    queue: &mut VecDeque<QueuedInputForwardingRequest>,
+    request: QueuedInputForwardingRequest,
+) -> bool {
+    let dropped = queue.len() >= MAX_INPUT_FORWARDING_QUEUE_LEN;
+    if dropped {
+        queue.pop_front();
+    }
+    queue.push_back(request);
+    dropped
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1510,11 +1529,16 @@ impl AgentWorkspaceViewer {
         request: InputForwardingRequest,
         cx: &mut Context<Self>,
     ) {
-        self.input_forwarding_queue.push_back((
-            self.input_forwarding_epoch,
-            self.target_id.clone(),
-            request,
-        ));
+        let dropped = push_bounded_input_forwarding_request(
+            &mut self.input_forwarding_queue,
+            (self.input_forwarding_epoch, self.target_id.clone(), request),
+        );
+        if dropped {
+            self.message = format!(
+                "Input forwarding is busy; dropped oldest queued input after {MAX_INPUT_FORWARDING_QUEUE_LEN} pending requests"
+            );
+            self.error = None;
+        }
         self.spawn_input_forwarding_worker(cx);
     }
 
@@ -3216,7 +3240,7 @@ impl Render for AgentWorkspaceViewer {
                     .border_color(rgb(BORDER))
                     .bg(rgb(0x0b0d10))
                     .overflow_hidden()
-                    .cursor(if self.input_forwarding_enabled {
+                    .cursor(if self.input_forwarding_ready() {
                         CursorStyle::Crosshair
                     } else {
                         CursorStyle::Arrow
@@ -6105,6 +6129,76 @@ mod tests {
             key_char: None,
         };
         assert!(!is_paste_keystroke(&ctrl_shift_v));
+    }
+
+    #[test]
+    fn xdotool_key_normalization_covers_forwarded_keyboard_edges() {
+        assert_eq!(normalize_xdotool_key(" F1 "), Some("F1".to_string()));
+        assert_eq!(normalize_xdotool_key("f12"), Some("F12".to_string()));
+        assert_eq!(
+            normalize_xdotool_key("page_down"),
+            Some("Page_Down".to_string())
+        );
+        assert_eq!(normalize_xdotool_key("unknown-key"), None);
+        assert_eq!(normalize_xdotool_key("  "), None);
+
+        let chord = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                alt: true,
+                shift: true,
+                platform: true,
+                ..Default::default()
+            },
+            key: " F12 ".to_string(),
+            key_char: None,
+        };
+        assert_eq!(
+            xdotool_key_for_keystroke(&chord),
+            Some("ctrl+alt+shift+super+F12".to_string())
+        );
+    }
+
+    #[test]
+    fn input_forwarding_queue_keeps_recent_requests_with_fixed_cap() {
+        let mut queue = VecDeque::new();
+        for x in 0..MAX_INPUT_FORWARDING_QUEUE_LEN {
+            let dropped = push_bounded_input_forwarding_request(
+                &mut queue,
+                (
+                    7,
+                    "qa".to_string(),
+                    InputForwardingRequest::MovePointer { x: x as i32, y: 1 },
+                ),
+            );
+            assert!(!dropped);
+        }
+
+        let dropped = push_bounded_input_forwarding_request(
+            &mut queue,
+            (
+                7,
+                "qa".to_string(),
+                InputForwardingRequest::Click {
+                    x: 999,
+                    y: 1,
+                    button: 1,
+                },
+            ),
+        );
+
+        assert!(dropped);
+        assert_eq!(queue.len(), MAX_INPUT_FORWARDING_QUEUE_LEN);
+        assert!(matches!(
+            queue.front(),
+            Some((7, target, InputForwardingRequest::MovePointer { x: 1, y: 1 }))
+                if target == "qa"
+        ));
+        assert!(matches!(
+            queue.back(),
+            Some((7, target, InputForwardingRequest::Click { x: 999, y: 1, button: 1 }))
+                if target == "qa"
+        ));
     }
 
     #[test]
