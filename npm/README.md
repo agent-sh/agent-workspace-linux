@@ -8,7 +8,9 @@ npm distribution wrapper for the [`agent-workspace-linux`](https://github.com/ag
 npm install -g @agent-sh/agent-workspace-linux
 ```
 
-The installer automatically downloads the prebuilt binary for your architecture from the matching [GitHub Release](https://github.com/agent-sh/agent-workspace-linux/releases).
+The installer automatically downloads the prebuilt binary for your architecture
+from the matching [GitHub Release](https://github.com/agent-sh/agent-workspace-linux/releases),
+then verifies the required `<asset>.sha256` sidecar before installing it.
 
 **Linux only.** `x64` (x86_64) and `arm64` (aarch64) are supported.
 

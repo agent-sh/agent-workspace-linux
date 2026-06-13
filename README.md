@@ -67,7 +67,14 @@ Or install the npm wrapper, which downloads the matching prebuilt Linux binary:
 npm install -g @agent-sh/agent-workspace-linux
 ```
 
-Prebuilt `x86_64` and `aarch64` Linux binaries are also attached to each [GitHub Release](https://github.com/agent-sh/agent-workspace-linux/releases/latest) — download the one for your architecture, `chmod +x`, and put it on your `PATH`.
+The npm wrapper downloads `agent-workspace-linux-<target>` from the matching
+GitHub Release and verifies the required
+`agent-workspace-linux-<target>.sha256` sidecar before installing it.
+
+Prebuilt `x86_64` and `aarch64` Linux binaries are also attached to each
+[GitHub Release](https://github.com/agent-sh/agent-workspace-linux/releases/latest)
+with their `.sha256` sidecars — download the one for your architecture, verify
+it with `sha256sum -c`, `chmod +x`, and put it on your `PATH`.
 
 ## Quick start
 
@@ -112,6 +119,24 @@ In short: **by default the agent host owns permission**, a developer can **lock 
 - **Profiles** — reusable workspace definitions (mounts, network mode, setup commands, startup apps), e.g. `profile template project-dev` or `browser-session`.
 - **Viewer** — a small GPUI window that shows workspace state and a live screen view, with pause / read-only / stop controls. It is not always-on-top by default.
 - **Workspace browser** — workspace-owned Chrome/Chromium reached over a loopback DevTools endpoint, so browser automation never attaches to your host Chrome.
+
+### Real-profile browser-session dogfood
+
+For Slack/GitHub account-session validation, keep the only human step explicit:
+approve the Chrome/Chromium user-data directory, then run the opt-in helper:
+
+```sh
+node scripts/mcp_real_profile_browser_session_dogfood.js \
+  --approved-user-data-dir ~/.config/google-chrome \
+  --site github
+```
+
+The helper refuses obvious active-profile hazards, copies the approved profile to
+a disposable directory, launches the current `browser-session` template through
+the repo-owned MCP path, and proves the logged-in page with workspace browser
+tools instead of the host Chrome bridge. Use `--site slack` for Slack, set
+`BROWSER_BIN=chromium` when needed, and rerun with `--expect-text` for account
+or workspace-specific page text.
 
 ## The skill (progressive tool loading)
 

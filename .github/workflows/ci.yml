@@ -61,6 +61,9 @@ jobs:
       - name: Build
         run: cargo build --locked
 
+      - name: Installer smoke
+        run: scripts/install_smoke.sh
+
       - name: Clippy
         run: cargo clippy --locked -- -D warnings
 
@@ -143,6 +146,9 @@ jobs:
 
       - name: Syntax check postinstall.js
         run: node --check npm/scripts/postinstall.js
+
+      - name: Test postinstall checksum verification
+        run: node --test npm/scripts/postinstall.test.js
 
       - name: Syntax check agent-workspace-linux.js
         run: node --check npm/bin/agent-workspace-linux.js

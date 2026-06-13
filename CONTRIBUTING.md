@@ -86,7 +86,12 @@ agent-workspace-linux/
 ## Release Model
 
 Releases are tagged manually. A human final-diff review of all changes precedes
-any version tag. There is no automated release cut.
+any version tag. `.github/workflows/release.yml` is the authoritative release
+path: on version tags it builds and uploads GitHub Release binaries plus
+matching `.sha256` sidecars, then publishes the npm wrapper from the same
+workflow. There is no separate npm release workflow or automated release cut.
+The npm wrapper's postinstall script treats the sidecar as part of the release
+contract and fails installation if it is missing or does not match the binary.
 
 ## Public Hygiene
 

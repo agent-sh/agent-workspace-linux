@@ -220,7 +220,7 @@ Rules:
 
 The permission ceiling is enforced today at both the MCP front-end and the
 workspace daemon. The items below track what is validated and the gaps that
-remain (status as of 2026-05-26):
+remain (status as of 2026-06-02):
 
 - A is validated for the current X11/bubblewrap runtime surface covered by the
   integration smoke. Real MCP dogfood and `scripts/integration_smoke.sh` have
@@ -267,15 +267,17 @@ remain (status as of 2026-05-26):
   executable files and `.desktop` launchers, parsing launcher `Name`/`Exec`
   fields into startup app commands without a shell.
   Authenticated browser-profile sharing now has a `browser-session` starter
-  template and a first Codex for Linux picker/copy/lock-warning flow for
-  explicitly user-approved browser data directories. The installed MCP path has
-  also proven that template end to end with a synthetic Chrome profile: approval
-  preview, real startup, visible Chrome window, mounted browser-data read/write,
-  screenshots, read-only observation, workspace-owned browser target discovery,
-  page snapshot, navigation, browser action events, artifacts, stop, profile
-  deletion, and stale cleanup. Live real-account dogfood is still needed before making
-  that path the default
-  recommendation for shopping-style tasks.
+  template, a first Codex for Linux picker/copy/lock-warning flow for explicitly
+  user-approved browser data directories, and an opt-in real-profile dogfood
+  helper for Slack/GitHub. The installed MCP path has also proven that template
+  end to end with a synthetic Chrome profile: approval preview, real startup,
+  visible Chrome window, mounted browser-data read/write, screenshots, read-only
+  observation, workspace-owned browser target discovery, page snapshot,
+  navigation, browser action events, artifacts, stop, profile deletion, and stale
+  cleanup. Real-account dogfood still requires a human-approved profile
+  directory, but the remaining human step is now explicit and reproducible:
+  `node scripts/mcp_real_profile_browser_session_dogfood.js --approved-user-data-dir ~/.config/google-chrome --site github`
+  or `--site slack`.
 
 ### A. Runtime claims validated with real workloads
 
@@ -296,6 +298,16 @@ These runtime claims hold under real usage:
   browser/shopping automation inspect and navigate the workspace browser
   through MCP tools instead of attaching to the user's host Chrome bridge or
   using external browser-control workarounds.
+- Opt-in real-profile dogfood command: run
+  `node scripts/mcp_real_profile_browser_session_dogfood.js --approved-user-data-dir PATH --site github|slack`
+  after approving a stopped Chrome/Chromium user-data directory. The helper
+  refuses obvious active-profile hazards (`Singleton*` or `DevToolsActivePort`),
+  validates `Local State`, copies the approved directory to a disposable profile,
+  generates the current `browser-session` template against that copy, opens it
+  through `workspace_open_profile`, and proves logged-in page access with
+  `workspace_browser_targets` plus `workspace_browser_navigate`/snapshot. The
+  evidence reports a loopback workspace DevTools endpoint and does not call the
+  host Chrome bridge.
 - Validated: workspace QA has run against this repo, Codex for Linux, and
   `agent-chrome-bridge`, including local dev server/browser paths and
   project-mounted test commands.

@@ -87,11 +87,17 @@ jobs:
 
       # The npm wrapper expects assets named agent-workspace-linux-<target>.
       # cargo places the binary at target/<target>/release/agent-workspace-linux,
-      # so rename it before upload.  This naming is a CONTRACT — do not change.
+      # so rename it before upload. This naming is a CONTRACT; postinstall also
+      # expects a matching agent-workspace-linux-<target>.sha256 sidecar.
       - name: Rename binary for release asset
         run: |
           cp target/${{ matrix.target }}/release/agent-workspace-linux \
              agent-workspace-linux-${{ matrix.target }}
+
+      - name: Generate checksum sidecar
+        run: |
+          sha256sum agent-workspace-linux-${{ matrix.target }} \
+            > agent-workspace-linux-${{ matrix.target }}.sha256
 
       # Upload to the GitHub Release only when triggered by a version tag.
       # workflow_dispatch without a tag skips this step (avoids a missing-tag
@@ -101,15 +107,16 @@ jobs:
         uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3
         with:
           tag_name: ${{ github.ref_name }}
-          files: agent-workspace-linux-${{ matrix.target }}
+          files: |
+            agent-workspace-linux-${{ matrix.target }}
+            agent-workspace-linux-${{ matrix.target }}.sha256
           generate_release_notes: true
 
   # After both target binaries are attached to the Release, publish the npm
   # wrapper so `npm install -g @agent-sh/agent-workspace-linux` resolves the new version.
-  # The wrapper's postinstall downloads the matching binary from the Release, so
-  # those assets must exist first — hence `needs: build`. This replaces the old
-  # cross-workflow `release: published` trigger, which never fired because a
-  # Release created by GITHUB_TOKEN does not emit events that start workflows.
+  # The wrapper's postinstall downloads the matching binary and verifies its
+  # `.sha256` sidecar from the Release, so those assets must exist first — hence
+  # `needs: build`.
   #
   # NOTE: NPM_TOKEN must be able to *create* the package on the FIRST publish.
   # A package-scoped granular token cannot create a not-yet-existing package
