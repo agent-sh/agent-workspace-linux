@@ -19,6 +19,10 @@ CODEX_MCP_CONFIG_CHANGED=0
 RUN_DOCTOR=1
 INSTALL_SKILL=1
 SKILL_NAME="agent-workspace-linux"
+SKILLS_DIR_EXPLICIT=0
+if [ "${SKILLS_DIR+x}" = x ] && [ -n "$SKILLS_DIR" ]; then
+  SKILLS_DIR_EXPLICIT=1
+fi
 SKILLS_DIR="${SKILLS_DIR:-$CODEX_HOME/skills}"
 SKILL_SRC="$ROOT_DIR/skills/$SKILL_NAME/SKILL.md"
 
@@ -73,6 +77,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     --skills-dir)
       SKILLS_DIR="${2:?missing value for --skills-dir}"
+      SKILLS_DIR_EXPLICIT=1
       shift
       ;;
     --prefix)
@@ -87,6 +92,9 @@ while [ "$#" -gt 0 ]; do
     --codex-home)
       CODEX_HOME="${2:?missing value for --codex-home}"
       CODEX_CONFIG="$CODEX_HOME/config.toml"
+      if [ "$SKILLS_DIR_EXPLICIT" -eq 0 ]; then
+        SKILLS_DIR="$CODEX_HOME/skills"
+      fi
       shift
       ;;
     --codex-config)
