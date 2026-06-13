@@ -10,12 +10,13 @@ categories = ["command-line-utilities", "development-tools"]
 # Not published to crates.io: this package still uses git dependencies
 # (`gpui` is pinned to git here, and `gpui_platform` is not available on
 # crates.io), which `cargo publish` rejects. Release-on-tag ships prebuilt
-# binaries via GitHub Releases (.github/workflows/release.yml) and the npm
-# wrapper. Flip this to publish and add a crates step once the viewer
-# dependencies are registry-backed.
+# binaries plus .sha256 sidecars via GitHub Releases
+# (.github/workflows/release.yml) and the npm wrapper. Flip this to publish
+# and add a crates step once the viewer dependencies are registry-backed.
 publish = false
 
 [dependencies]
+mimalloc = { version = "0.1", default-features = false }
 anyhow = "1.0"
 gpui = { git = "https://github.com/zed-industries/zed", branch = "main", default-features = false, features = ["font-kit", "wayland", "x11"] }
 gpui_platform = { git = "https://github.com/zed-industries/zed", branch = "main", default-features = false, features = ["wayland", "x11"] }
@@ -26,3 +27,8 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.51", features = ["macros", "rt"] }
 x11rb = "0.13.2"
+
+[profile.release]
+codegen-units = 1
+opt-level = 3
+lto = "fat"
