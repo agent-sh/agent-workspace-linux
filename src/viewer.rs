@@ -8,23 +8,26 @@ use anyhow::{bail, Context as AnyhowContext, Result};
 use gpui::{
     div, img, layer_shell::Anchor, layer_shell::KeyboardInteractivity, layer_shell::Layer,
     layer_shell::LayerShellOptions, point, prelude::*, px, rgb, rgba, size, AnyElement, App,
-    Bounds, ClickEvent, Context, CursorStyle, Div, InteractiveElement, IntoElement, MouseButton,
-    MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit, ParentElement, Pixels, Point, Render,
-    RenderImage, ResizeEdge, SharedString, Size, Stateful, Styled, Task, Window,
-    WindowBackgroundAppearance, WindowBounds, WindowKind, WindowOptions,
+    Bounds, ClickEvent, Context, CursorStyle, DevicePixels, Div, DivFrameState, Element, ElementId,
+    FocusHandle, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, IntoElement,
+    KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
+    ParentElement, Pixels, Point, Render, RenderImage, ResizeEdge, ScrollDelta, ScrollWheelEvent,
+    SharedString, Size, Stateful, Styled, Task, Window, WindowBackgroundAppearance, WindowBounds,
+    WindowKind, WindowOptions,
 };
 use gpui_platform::application;
 use image::{Frame, ImageBuffer};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
+    collections::VecDeque,
     env,
     ffi::OsString,
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use x11rb::{
@@ -102,6 +105,17 @@ const OVERLAY_MIN_HEIGHT: f32 = 280.0;
 const OVERLAY_MARGIN: f32 = 18.0;
 const CLEAN_CONFIRM_SECONDS: u64 = 6;
 const REVOKE_CONFIRM_SECONDS: u64 = 6;
+const INPUT_FORWARD_CONFIRM_SECONDS: u64 = 6;
+const INPUT_FORWARD_DRAG_THRESHOLD_PX: f32 = 3.0;
+// Bound manual input backlog so a slow workspace daemon cannot accumulate
+// unbounded stale key/scroll/click events behind the current user gesture.
+const MAX_INPUT_FORWARDING_QUEUE_LEN: usize = 128;
+const INPUT_FORWARD_REFRESH_BURST_DELAYS_MS: [u64; 3] = [90, 220, 500];
+// GPUI pixel scroll events are converted to X11 wheel ticks for workspace IPC.
+// 80px is a conservative one-notch touchpad/wheel unit; a high clamp prevents
+// large touchpad flings from turning into unbounded synthetic wheel bursts.
+const SCROLL_PIXELS_PER_WORKSPACE_TICK: f32 = 80.0;
+const MAX_WORKSPACE_SCROLL_TICKS: f32 = 12.0;
 const VIEWER_PREFERENCES_FILE: &str = "viewer.json";
 const VIEWER_FRAME_FILE: &str = "viewer-frame.png";
 const VIEWER_REGISTRY_DIR: &str = "viewers";
@@ -135,6 +149,10 @@ pub struct ViewerOptions {
     pub id: String,
     pub permissions: McpPermissionState,
     pub always_on_top: bool,
+    /// Allow the viewer UI to explicitly arm manual input forwarding. Runtime
+    /// forwarding still starts off and requires an in-viewer acknowledgement
+    /// before click/drag/scroll/keyboard events are sent to workspace IPC.
+    pub input_forwarding: bool,
     pub exit_when_workspace_gone: bool,
     /// Start with the live screen view off ("always bg"). The screen is shown by
     /// default; this launch flag opts into a background (screen-off) start. The
@@ -148,6 +166,7 @@ impl Default for ViewerOptions {
             id: workspace::default_workspace_id(),
             permissions: viewer_permissions_from_env().unwrap_or_default(),
             always_on_top: false,
+            input_forwarding: false,
             exit_when_workspace_gone: false,
             background: false,
         }
@@ -161,6 +180,7 @@ pub struct ViewerLaunch {
     pub pid: u32,
     pub backend: String,
     pub always_on_top: bool,
+    pub input_forwarding: bool,
     pub exit_when_workspace_gone: bool,
     pub executable: PathBuf,
     pub command: Vec<String>,
@@ -175,6 +195,8 @@ struct ViewerRegistryEntry {
     pid: u32,
     backend: String,
     always_on_top: bool,
+    #[serde(default)]
+    input_forwarding: bool,
     #[serde(default)]
     exit_when_workspace_gone: bool,
     executable: PathBuf,
@@ -195,6 +217,7 @@ pub struct ViewerListEntry {
     pub pid: u32,
     pub backend: String,
     pub always_on_top: bool,
+    pub input_forwarding: bool,
     pub exit_when_workspace_gone: bool,
     pub executable: PathBuf,
     pub command: Vec<String>,
@@ -221,6 +244,7 @@ pub struct ViewerCloseEntry {
     pub pid: u32,
     pub backend: String,
     pub always_on_top: bool,
+    pub input_forwarding: bool,
     pub exit_when_workspace_gone: bool,
     pub registry_path: PathBuf,
     pub reason: String,
@@ -242,6 +266,104 @@ struct ViewerSnapshot {
 #[derive(Clone)]
 struct ViewerFrame {
     image: Arc<RenderImage>,
+    width: u32,
+    height: u32,
+}
+
+struct BoundsTrackedDiv {
+    div: Div,
+    bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
+}
+
+fn track_bounds(div: Div, bounds: Arc<Mutex<Option<Bounds<Pixels>>>>) -> BoundsTrackedDiv {
+    BoundsTrackedDiv { div, bounds }
+}
+
+fn lock_screen_bounds(
+    tracked_bounds: &Arc<Mutex<Option<Bounds<Pixels>>>>,
+) -> std::sync::MutexGuard<'_, Option<Bounds<Pixels>>> {
+    tracked_bounds
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn store_screen_bounds(
+    tracked_bounds: &Arc<Mutex<Option<Bounds<Pixels>>>>,
+    next_bounds: Option<Bounds<Pixels>>,
+) {
+    *lock_screen_bounds(tracked_bounds) = next_bounds;
+}
+
+fn screen_bounds_snapshot(
+    tracked_bounds: &Arc<Mutex<Option<Bounds<Pixels>>>>,
+) -> Option<Bounds<Pixels>> {
+    *lock_screen_bounds(tracked_bounds)
+}
+
+impl Element for BoundsTrackedDiv {
+    type RequestLayoutState = DivFrameState;
+    type PrepaintState = Option<Hitbox>;
+
+    fn id(&self) -> Option<ElementId> {
+        Element::id(&self.div)
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        Element::source_location(&self.div)
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        self.div.request_layout(id, inspector_id, window, cx)
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        store_screen_bounds(&self.bounds, Some(bounds));
+        self.div
+            .prepaint(id, inspector_id, bounds, request_layout, window, cx)
+    }
+
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&InspectorElementId>,
+        bounds: Bounds<Pixels>,
+        request_layout: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        self.div.paint(
+            id,
+            inspector_id,
+            bounds,
+            request_layout,
+            prepaint,
+            window,
+            cx,
+        )
+    }
+}
+
+impl IntoElement for BoundsTrackedDiv {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
+    }
 }
 
 struct ViewerTooltip {
@@ -293,21 +415,34 @@ enum ViewerFrameUpdate {
     Replace(Option<ViewerFrame>),
 }
 
+type QueuedInputForwardingRequest = (u64, String, InputForwardingRequest);
+
 struct AgentWorkspaceViewer {
     target_id: String,
     bound_target_id: Option<String>,
     snapshot: ViewerSnapshot,
     selected_profile_id: Option<String>,
     permissions: McpPermissionState,
+    focus_handle: FocusHandle,
     preferences: ViewerPreferences,
     active_window: Option<workspace::WorkspaceWindow>,
     latest_activity: Option<ViewerActivity>,
     control_state: McpControlState,
     frame: Option<ViewerFrame>,
+    screen_bounds: Arc<Mutex<Option<Bounds<Pixels>>>>,
     last_refresh_unix: u64,
     message: String,
     error: Option<String>,
     screen_stream: bool,
+    input_forwarding_allowed: bool,
+    input_forwarding_enabled: bool,
+    input_forwarding_arm_expires_at_unix: Option<u64>,
+    input_forwarding_drag: Option<InputForwardingDrag>,
+    input_forwarding_queue: VecDeque<QueuedInputForwardingRequest>,
+    input_forwarding_in_flight: bool,
+    input_forwarding_epoch: u64,
+    input_forwarding_burst_generation: u64,
+    input_refresh_burst_active: bool,
     exit_when_workspace_gone: bool,
     footer_mode: FooterMode,
     refresh_in_flight: bool,
@@ -322,7 +457,9 @@ struct AgentWorkspaceViewer {
     _poll_task: Option<Task<()>>,
     _refresh_task: Option<Task<()>>,
     _action_task: Option<Task<()>>,
+    _input_forwarding_task: Option<Task<()>>,
     _interaction_task: Option<Task<()>>,
+    _input_refresh_burst_task: Option<Task<()>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -356,6 +493,168 @@ fn initial_screen_stream(background: bool, preference: bool) -> bool {
     !background && preference
 }
 
+fn screen_position_to_workspace_point(
+    source_width: u32,
+    source_height: u32,
+    bounds: Bounds<Pixels>,
+    position: Point<Pixels>,
+) -> Option<WorkspacePoint> {
+    if source_width == 0 || source_height == 0 {
+        return None;
+    }
+    let view_width = bounds.size.width.as_f32();
+    let view_height = bounds.size.height.as_f32();
+    if view_width <= 0.0 || view_height <= 0.0 {
+        return None;
+    }
+
+    let local_x = (position.x - bounds.origin.x).as_f32();
+    let local_y = (position.y - bounds.origin.y).as_f32();
+    if local_x < 0.0 || local_y < 0.0 || local_x > view_width || local_y > view_height {
+        return None;
+    }
+
+    let source_width_f = source_width as f32;
+    let source_height_f = source_height as f32;
+    let image_bounds = ObjectFit::Cover.get_bounds(
+        bounds,
+        size(
+            DevicePixels::from(source_width),
+            DevicePixels::from(source_height),
+        ),
+    );
+    let rendered_width = image_bounds.size.width.as_f32();
+    let rendered_height = image_bounds.size.height.as_f32();
+    if rendered_width <= 0.0 || rendered_height <= 0.0 {
+        return None;
+    }
+
+    let source_x = (position.x - image_bounds.origin.x).as_f32() * source_width_f / rendered_width;
+    let source_y =
+        (position.y - image_bounds.origin.y).as_f32() * source_height_f / rendered_height;
+    if source_x < 0.0 || source_y < 0.0 || source_x > source_width_f || source_y > source_height_f {
+        return None;
+    }
+    Some(WorkspacePoint {
+        x: source_x.round().clamp(0.0, (source_width - 1) as f32) as i32,
+        y: source_y.round().clamp(0.0, (source_height - 1) as f32) as i32,
+    })
+}
+
+fn x11_button_for_mouse_button(button: MouseButton) -> Option<u8> {
+    match button {
+        MouseButton::Left => Some(1),
+        MouseButton::Middle => Some(2),
+        MouseButton::Right => Some(3),
+        MouseButton::Navigate(_) => None,
+    }
+}
+
+fn scroll_wheel_to_workspace_scroll(
+    delta: ScrollDelta,
+) -> Option<(workspace::ScrollDirection, u8)> {
+    let (x, y, unit) = match delta {
+        ScrollDelta::Pixels(point) => (
+            point.x.as_f32(),
+            point.y.as_f32(),
+            SCROLL_PIXELS_PER_WORKSPACE_TICK,
+        ),
+        ScrollDelta::Lines(point) => (point.x, point.y, 1.0),
+    };
+    let (direction, magnitude) = if x.abs() > y.abs() {
+        if x > 0.0 {
+            (workspace::ScrollDirection::Left, x.abs())
+        } else {
+            (workspace::ScrollDirection::Right, x.abs())
+        }
+    } else if y > 0.0 {
+        (workspace::ScrollDirection::Up, y.abs())
+    } else if y < 0.0 {
+        (workspace::ScrollDirection::Down, y.abs())
+    } else {
+        return None;
+    };
+    let amount = (magnitude / unit)
+        .ceil()
+        .clamp(1.0, MAX_WORKSPACE_SCROLL_TICKS) as u8;
+    Some((direction, amount))
+}
+
+fn is_paste_keystroke(keystroke: &gpui::Keystroke) -> bool {
+    let key = keystroke.key.trim();
+    (keystroke.modifiers.control || keystroke.modifiers.platform)
+        && !keystroke.modifiers.alt
+        && !keystroke.modifiers.shift
+        && key.eq_ignore_ascii_case("v")
+}
+
+fn printable_keystroke_text(keystroke: &gpui::Keystroke) -> Option<String> {
+    if keystroke.modifiers.control
+        || keystroke.modifiers.alt
+        || keystroke.modifiers.platform
+        || keystroke.modifiers.function
+    {
+        return None;
+    }
+    keystroke
+        .key_char
+        .as_ref()
+        .filter(|text| !text.is_empty() && !text.chars().any(char::is_control))
+        .cloned()
+}
+
+fn xdotool_key_for_keystroke(keystroke: &gpui::Keystroke) -> Option<String> {
+    let key = normalize_xdotool_key(&keystroke.key)?;
+    let mut parts = Vec::new();
+    if keystroke.modifiers.control {
+        parts.push("ctrl".to_string());
+    }
+    if keystroke.modifiers.alt {
+        parts.push("alt".to_string());
+    }
+    if keystroke.modifiers.shift {
+        parts.push("shift".to_string());
+    }
+    if keystroke.modifiers.platform {
+        parts.push("super".to_string());
+    }
+    parts.push(key);
+    Some(parts.join("+"))
+}
+
+fn normalize_xdotool_key(key: &str) -> Option<String> {
+    let trimmed = key.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let normalized = match trimmed.to_ascii_lowercase().as_str() {
+        "enter" | "return" => "Return".to_string(),
+        "escape" | "esc" => "Escape".to_string(),
+        "backspace" | "back_space" => "BackSpace".to_string(),
+        "delete" | "del" => "Delete".to_string(),
+        "tab" => "Tab".to_string(),
+        "space" | " " => "space".to_string(),
+        "up" | "arrowup" => "Up".to_string(),
+        "down" | "arrowdown" => "Down".to_string(),
+        "left" | "arrowleft" => "Left".to_string(),
+        "right" | "arrowright" => "Right".to_string(),
+        "home" => "Home".to_string(),
+        "end" => "End".to_string(),
+        "pageup" | "page_up" => "Page_Up".to_string(),
+        "pagedown" | "page_down" => "Page_Down".to_string(),
+        other if other.len() == 1 => other.to_string(),
+        other
+            if other.starts_with('f')
+                && other.len() <= 3
+                && other[1..].chars().all(|ch| ch.is_ascii_digit()) =>
+        {
+            other.to_ascii_uppercase()
+        }
+        _ => return None,
+    };
+    Some(normalized)
+}
+
 impl Default for ViewerPreferences {
     fn default() -> Self {
         Self {
@@ -373,6 +672,93 @@ struct InteractionDrag {
     kind: DragKind,
     start_position: Point<Pixels>,
     start_size: Size<Pixels>,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+struct WorkspacePoint {
+    x: i32,
+    y: i32,
+}
+
+#[derive(Copy, Clone, Debug, PartialEq)]
+struct InputForwardingDrag {
+    start: WorkspacePoint,
+    start_position: Point<Pixels>,
+    button: u8,
+}
+
+#[derive(Debug)]
+enum InputForwardingRequest {
+    MovePointer {
+        x: i32,
+        y: i32,
+    },
+    Click {
+        x: i32,
+        y: i32,
+        button: u8,
+    },
+    Drag {
+        from_x: i32,
+        from_y: i32,
+        to_x: i32,
+        to_y: i32,
+        button: u8,
+    },
+    Scroll {
+        x: i32,
+        y: i32,
+        direction: workspace::ScrollDirection,
+        amount: u8,
+    },
+    PasteText {
+        text: String,
+    },
+    TypeText {
+        text: String,
+    },
+    Key {
+        key: String,
+    },
+}
+
+impl InputForwardingRequest {
+    fn dispatch(self, target_id: &str) -> Result<workspace::IpcResponse> {
+        match self {
+            Self::MovePointer { x, y } => workspace::move_pointer(target_id, x, y),
+            Self::Click { x, y, button } => {
+                workspace::click(target_id, x, y, Some(button), Some(1))
+            }
+            Self::Drag {
+                from_x,
+                from_y,
+                to_x,
+                to_y,
+                button,
+            } => workspace::drag(target_id, from_x, from_y, to_x, to_y, Some(button)),
+            Self::Scroll {
+                x,
+                y,
+                direction,
+                amount,
+            } => workspace::scroll(target_id, x, y, direction, Some(amount)),
+            Self::PasteText { text } => workspace::paste_text(target_id, text, None),
+            Self::TypeText { text } => workspace::type_text(target_id, text),
+            Self::Key { key } => workspace::key(target_id, key),
+        }
+    }
+}
+
+fn push_bounded_input_forwarding_request(
+    queue: &mut VecDeque<QueuedInputForwardingRequest>,
+    request: QueuedInputForwardingRequest,
+) -> bool {
+    let dropped = queue.len() >= MAX_INPUT_FORWARDING_QUEUE_LEN;
+    if dropped {
+        queue.pop_front();
+    }
+    queue.push_back(request);
+    dropped
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -614,6 +1000,7 @@ impl AgentWorkspaceViewer {
     fn new(options: ViewerOptions, cx: &mut Context<Self>) -> Self {
         let preferences = load_viewer_preferences();
         let footer_mode = preferences.footer_mode;
+        let screen_stream = initial_screen_stream(options.background, preferences.screen_stream);
         let bound_target_id = options.exit_when_workspace_gone.then(|| options.id.clone());
         let mut viewer = Self {
             target_id: options.id,
@@ -621,8 +1008,7 @@ impl AgentWorkspaceViewer {
             snapshot: ViewerSnapshot::default(),
             selected_profile_id: None,
             permissions: options.permissions,
-            screen_stream: initial_screen_stream(options.background, preferences.screen_stream),
-            exit_when_workspace_gone: options.exit_when_workspace_gone,
+            focus_handle: cx.focus_handle(),
             preferences,
             active_window: None,
             latest_activity: None,
@@ -630,9 +1016,21 @@ impl AgentWorkspaceViewer {
                 .map(|status| status.state)
                 .unwrap_or_default(),
             frame: None,
+            screen_bounds: Arc::new(Mutex::new(None)),
             last_refresh_unix: wall_clock_seconds(),
             message: "Loading workspace state".to_string(),
             error: None,
+            screen_stream,
+            input_forwarding_allowed: options.input_forwarding,
+            input_forwarding_enabled: false,
+            input_forwarding_arm_expires_at_unix: None,
+            input_forwarding_drag: None,
+            input_forwarding_queue: VecDeque::new(),
+            input_forwarding_in_flight: false,
+            input_forwarding_epoch: 0,
+            input_forwarding_burst_generation: 0,
+            input_refresh_burst_active: false,
+            exit_when_workspace_gone: options.exit_when_workspace_gone,
             footer_mode,
             refresh_in_flight: false,
             action_in_flight: None,
@@ -643,7 +1041,9 @@ impl AgentWorkspaceViewer {
             _poll_task: None,
             _refresh_task: None,
             _action_task: None,
+            _input_forwarding_task: None,
             _interaction_task: None,
+            _input_refresh_burst_task: None,
         };
         viewer.request_refresh(cx, None);
         viewer._poll_task = Some(cx.spawn(async move |this, cx| loop {
@@ -718,6 +1118,7 @@ impl AgentWorkspaceViewer {
             self.latest_activity = None;
             self.pending_cleanup = None;
             self.pending_revoke = None;
+            self.reset_input_forwarding_state(true, true);
         }
         if let Some(activity) = refresh.latest_activity {
             if self
@@ -748,6 +1149,7 @@ impl AgentWorkspaceViewer {
         let now = wall_clock_seconds();
         self.clear_stale_cleanup_prompt(now);
         self.clear_stale_revoke_prompt(now);
+        self.clear_expired_input_forward_prompt(now);
     }
 
     fn start_selected(&mut self, cx: &mut Context<Self>) {
@@ -915,6 +1317,7 @@ impl AgentWorkspaceViewer {
         self.latest_activity = None;
         self.pending_cleanup = None;
         self.pending_revoke = None;
+        self.reset_input_forwarding_state(true, true);
         self.error = None;
         self.message = format!(
             "Viewing workspace {} ({}/{})",
@@ -980,7 +1383,369 @@ impl AgentWorkspaceViewer {
     }
 
     fn interaction_active(&self) -> bool {
-        self.interaction_drag.is_some()
+        self.interaction_drag.is_some() || self.input_forwarding_drag.is_some()
+    }
+
+    fn reset_input_forwarding_state(&mut self, disable_enabled: bool, clear_bounds: bool) {
+        if disable_enabled {
+            self.input_forwarding_enabled = false;
+        }
+        self.input_forwarding_arm_expires_at_unix = None;
+        self.input_forwarding_drag = None;
+        self.input_forwarding_queue.clear();
+        self.input_forwarding_epoch = self.input_forwarding_epoch.wrapping_add(1);
+        self.input_forwarding_burst_generation =
+            self.input_forwarding_burst_generation.wrapping_add(1);
+        if clear_bounds {
+            store_screen_bounds(&self.screen_bounds, None);
+        }
+    }
+
+    fn toggle_input_forwarding(&mut self) {
+        if !self.input_forwarding_allowed {
+            self.message = "Input forwarding was not enabled for this viewer session".to_string();
+            self.error = None;
+            return;
+        }
+
+        let now = wall_clock_seconds();
+        self.clear_expired_input_forward_prompt(now);
+        if self.input_forwarding_enabled {
+            self.reset_input_forwarding_state(true, false);
+            self.message = "Manual input forwarding disabled".to_string();
+            self.error = None;
+        } else if self
+            .input_forwarding_arm_expires_at_unix
+            .is_some_and(|expires_at| expires_at > now)
+        {
+            self.input_forwarding_enabled = true;
+            self.input_forwarding_arm_expires_at_unix = None;
+            self.message =
+                "Manual input forwarding enabled; clicks, scroll, keys, and paste target only the isolated workspace"
+                    .to_string();
+            self.error = None;
+        } else {
+            self.input_forwarding_arm_expires_at_unix = Some(now + INPUT_FORWARD_CONFIRM_SECONDS);
+            self.message = format!(
+                "Click Input again within {INPUT_FORWARD_CONFIRM_SECONDS}s to forward clicks, scroll, and keyboard into {}",
+                self.target_id
+            );
+            self.error = None;
+        }
+    }
+
+    fn clear_expired_input_forward_prompt(&mut self, now: u64) {
+        if self
+            .input_forwarding_arm_expires_at_unix
+            .is_some_and(|expires_at| expires_at <= now)
+        {
+            self.input_forwarding_arm_expires_at_unix = None;
+        }
+    }
+
+    fn input_forwarding_armed_seconds_left(&self, now: u64) -> Option<u64> {
+        self.input_forwarding_arm_expires_at_unix
+            .filter(|expires_at| *expires_at > now)
+            .map(|expires_at| expires_at.saturating_sub(now).max(1))
+    }
+
+    fn input_forwarding_ready(&self) -> bool {
+        self.input_forwarding_allowed
+            && self.input_forwarding_enabled
+            && self.screen_stream
+            && matches!(self.control_state.mode, McpControlMode::Active)
+            && self
+                .selected_workspace()
+                .is_some_and(|workspace| workspace.running)
+    }
+
+    fn input_forwarding_workspace_point(&self, position: Point<Pixels>) -> Option<WorkspacePoint> {
+        if !self.input_forwarding_ready() {
+            return None;
+        }
+        let frame = self.frame.as_ref()?;
+        let bounds = screen_bounds_snapshot(&self.screen_bounds)?;
+        screen_position_to_workspace_point(frame.width, frame.height, bounds, position)
+    }
+
+    fn schedule_input_refresh_burst(&mut self, cx: &mut Context<Self>) {
+        if !self.screen_stream {
+            return;
+        }
+
+        self.input_forwarding_burst_generation =
+            self.input_forwarding_burst_generation.wrapping_add(1);
+        self.request_refresh(cx, None);
+        if self.input_refresh_burst_active {
+            return;
+        }
+        self.input_refresh_burst_active = true;
+
+        let executor = cx.background_executor().clone();
+        self._input_refresh_burst_task = Some(cx.spawn(async move |this, cx| 'burst: loop {
+            let generation =
+                match this.update(cx, |viewer, _cx| viewer.input_forwarding_burst_generation) {
+                    Ok(generation) => generation,
+                    Err(_) => break,
+                };
+            for delay_ms in INPUT_FORWARD_REFRESH_BURST_DELAYS_MS {
+                executor.timer(Duration::from_millis(delay_ms)).await;
+                let restart = match this.update(cx, move |viewer, cx| {
+                    if viewer.input_forwarding_burst_generation != generation {
+                        return true;
+                    }
+                    if viewer.action_in_flight.is_none() && !viewer.interaction_active() {
+                        viewer.request_refresh(cx, None);
+                    }
+                    false
+                }) {
+                    Ok(restart) => restart,
+                    Err(_) => break 'burst,
+                };
+                if restart {
+                    continue 'burst;
+                }
+            }
+            let restart = match this.update(cx, move |viewer, _cx| {
+                if viewer.input_forwarding_burst_generation != generation {
+                    true
+                } else {
+                    viewer.input_refresh_burst_active = false;
+                    false
+                }
+            }) {
+                Ok(restart) => restart,
+                Err(_) => break,
+            };
+            if restart {
+                continue 'burst;
+            }
+            break;
+        }));
+    }
+
+    fn enqueue_input_forwarding(
+        &mut self,
+        request: InputForwardingRequest,
+        cx: &mut Context<Self>,
+    ) {
+        let dropped = push_bounded_input_forwarding_request(
+            &mut self.input_forwarding_queue,
+            (self.input_forwarding_epoch, self.target_id.clone(), request),
+        );
+        if dropped {
+            self.message = format!(
+                "Input forwarding is busy; dropped oldest queued input after {MAX_INPUT_FORWARDING_QUEUE_LEN} pending requests"
+            );
+            self.error = None;
+        }
+        self.spawn_input_forwarding_worker(cx);
+    }
+
+    fn spawn_input_forwarding_worker(&mut self, cx: &mut Context<Self>) {
+        if self.input_forwarding_in_flight {
+            return;
+        }
+        self.input_forwarding_in_flight = true;
+        let executor = cx.background_executor().clone();
+        self._input_forwarding_task = Some(cx.spawn(async move |this, cx| loop {
+            let Some((epoch, target_id, request)) = this
+                .update(cx, |viewer: &mut AgentWorkspaceViewer, _cx| {
+                    viewer.input_forwarding_queue.pop_front()
+                })
+                .ok()
+                .flatten()
+            else {
+                let _ = this.update(cx, |viewer, _cx| {
+                    viewer.input_forwarding_in_flight = false;
+                });
+                break;
+            };
+
+            let is_current_epoch = this
+                .update(cx, move |viewer, _cx| {
+                    viewer.input_forwarding_epoch == epoch
+                })
+                .unwrap_or(false);
+            if !is_current_epoch {
+                continue;
+            }
+
+            let result = executor
+                .spawn(async move { request.dispatch(&target_id) })
+                .await;
+            if this
+                .update(cx, move |viewer, cx| {
+                    if viewer.input_forwarding_epoch == epoch {
+                        viewer.apply_input_forwarding_result(result, cx);
+                    }
+                })
+                .is_err()
+            {
+                break;
+            }
+        }));
+    }
+
+    fn begin_input_forward(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.input_forwarding_allowed {
+            return;
+        }
+        let Some(point) = self.input_forwarding_workspace_point(event.position) else {
+            return;
+        };
+        let Some(button) = x11_button_for_mouse_button(event.button) else {
+            return;
+        };
+        self.focus_handle.focus(window, cx);
+        self.input_forwarding_drag = Some(InputForwardingDrag {
+            start: point,
+            start_position: event.position,
+            button,
+        });
+        self.enqueue_input_forwarding(
+            InputForwardingRequest::MovePointer {
+                x: point.x,
+                y: point.y,
+            },
+            cx,
+        );
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn end_input_forward(
+        &mut self,
+        event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(drag) = self.input_forwarding_drag.take() else {
+            return;
+        };
+        let Some(button) = x11_button_for_mouse_button(event.button) else {
+            return;
+        };
+        if drag.button != button {
+            return;
+        }
+        let Some(point) = self.input_forwarding_workspace_point(event.position) else {
+            cx.stop_propagation();
+            cx.notify();
+            return;
+        };
+
+        let delta_x = (event.position.x - drag.start_position.x).as_f32();
+        let delta_y = (event.position.y - drag.start_position.y).as_f32();
+        let request = if delta_x.hypot(delta_y) >= INPUT_FORWARD_DRAG_THRESHOLD_PX {
+            InputForwardingRequest::Drag {
+                from_x: drag.start.x,
+                from_y: drag.start.y,
+                to_x: point.x,
+                to_y: point.y,
+                button,
+            }
+        } else {
+            InputForwardingRequest::Click {
+                x: point.x,
+                y: point.y,
+                button,
+            }
+        };
+        self.enqueue_input_forwarding(request, cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn forward_scroll(
+        &mut self,
+        event: &ScrollWheelEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(point) = self.input_forwarding_workspace_point(event.position) else {
+            return;
+        };
+        let Some((direction, amount)) = scroll_wheel_to_workspace_scroll(event.delta) else {
+            return;
+        };
+        self.enqueue_input_forwarding(
+            InputForwardingRequest::Scroll {
+                x: point.x,
+                y: point.y,
+                direction,
+                amount,
+            },
+            cx,
+        );
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn forward_key_down(
+        &mut self,
+        event: &KeyDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.input_forwarding_ready() || event.is_held {
+            return;
+        }
+
+        let request = if is_paste_keystroke(&event.keystroke) {
+            match cx.read_from_clipboard().and_then(|item| item.text()) {
+                Some(text) if !text.is_empty() => InputForwardingRequest::PasteText { text },
+                _ => {
+                    self.message = "Host clipboard has no text to paste".to_string();
+                    self.error = None;
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
+            }
+        } else if let Some(text) = printable_keystroke_text(&event.keystroke) {
+            InputForwardingRequest::TypeText { text }
+        } else if let Some(key) = xdotool_key_for_keystroke(&event.keystroke) {
+            InputForwardingRequest::Key { key }
+        } else {
+            return;
+        };
+
+        self.enqueue_input_forwarding(request, cx);
+        cx.stop_propagation();
+        cx.notify();
+    }
+
+    fn apply_input_forwarding_result(
+        &mut self,
+        result: Result<workspace::IpcResponse>,
+        cx: &mut Context<Self>,
+    ) {
+        match result {
+            Ok(response) if response.ok => self.schedule_input_refresh_burst(cx),
+            Ok(response) => self.record_input_forwarding_response(response),
+            Err(error) => self.record_input_forwarding_error(error),
+        }
+        cx.notify();
+    }
+
+    fn record_input_forwarding_response(&mut self, response: workspace::IpcResponse) {
+        self.message = "Input forwarding failed".to_string();
+        self.error = Some(if response.message.is_empty() {
+            "workspace daemon returned an unsuccessful response".to_string()
+        } else {
+            response.message
+        });
+    }
+
+    fn record_input_forwarding_error(&mut self, error: anyhow::Error) {
+        self.message = "Input forwarding failed".to_string();
+        self.error = Some(error.to_string());
     }
 
     fn persist_screen_stream_preference(&mut self) {
@@ -1820,7 +2585,13 @@ impl Render for AgentWorkspaceViewer {
             };
             if this.screen_stream {
                 this.request_refresh(cx, Some("Capturing workspace screen".to_string()));
+            } else {
+                this.reset_input_forwarding_state(true, false);
             }
+            cx.notify();
+        });
+        let on_input = cx.listener(|this: &mut Self, _event: &ClickEvent, _window, cx| {
+            this.toggle_input_forwarding();
             cx.notify();
         });
         let on_control_active = cx.listener(|this: &mut Self, _event: &ClickEvent, _window, cx| {
@@ -1907,6 +2678,7 @@ impl Render for AgentWorkspaceViewer {
         let now = wall_clock_seconds();
         self.clear_stale_cleanup_prompt(now);
         self.clear_stale_revoke_prompt(now);
+        self.clear_expired_input_forward_prompt(now);
         let selected = self.selected_workspace();
         let status = selected.and_then(|entry| entry.status.as_ref());
         let manifest = selected.and_then(|entry| entry.manifest.as_ref());
@@ -1952,6 +2724,14 @@ impl Render for AgentWorkspaceViewer {
                 .then_some(pending.expires_at_unix.saturating_sub(now).max(1))
         });
         let revoke_armed = revoke_confirm_seconds_left.is_some();
+        let input_forward_confirm_seconds_left = self.input_forwarding_armed_seconds_left(now);
+        let input_forwarding_wait_reason = if self.input_forwarding_enabled && !running {
+            Some("waiting for a running workspace")
+        } else if self.input_forwarding_enabled && !matches!(control_mode, McpControlMode::Active) {
+            Some("waiting for MCP Run mode")
+        } else {
+            None
+        };
         let activity_label = self
             .active_window
             .as_ref()
@@ -1971,6 +2751,10 @@ impl Render for AgentWorkspaceViewer {
                 "Click Clean again within {seconds_left}s to remove {}",
                 self.target_id
             )
+        } else if let Some(seconds_left) = input_forward_confirm_seconds_left {
+            format!("Click Input again within {seconds_left}s to enable manual workspace input")
+        } else if let Some(reason) = input_forwarding_wait_reason {
+            format!("Input forwarding enabled, {reason}")
         } else if let Some(error) = &self.error {
             error.clone()
         } else if running {
@@ -2003,6 +2787,12 @@ impl Render for AgentWorkspaceViewer {
             format!(
                 "Confirm cleanup: click Clean again within {seconds_left}s to remove stopped workspace files"
             )
+        } else if let Some(seconds_left) = input_forward_confirm_seconds_left {
+            format!(
+                "Manual input is opt-in: click Input again within {seconds_left}s to forward clicks, scroll, and keyboard into the isolated workspace"
+            )
+        } else if let Some(reason) = input_forwarding_wait_reason {
+            format!("Manual input forwarding is enabled but {reason}")
         } else if footer_locked {
             footer_activity_label(
                 busy_action.as_ref(),
@@ -2055,6 +2845,9 @@ impl Render for AgentWorkspaceViewer {
         };
         if !matches!(control_mode, McpControlMode::Active) && !footer_locked {
             footer_text = format!("MCP {} | {footer_text}", control_mode.label());
+        }
+        if self.input_forwarding_enabled && input_forwarding_wait_reason.is_none() {
+            footer_text = format!("Input RW | {footer_text}");
         }
 
         div()
@@ -2230,6 +3023,36 @@ impl Render for AgentWorkspaceViewer {
                                 on_live,
                             )
                         })
+                        .child(if !self.input_forwarding_allowed {
+                            div().into_any_element()
+                        } else if self.input_forwarding_enabled {
+                            selected_button_with_tooltip(
+                                "viewer-input-on",
+                                "Input",
+                                Some(tooltip_text(
+                                    "Manual input forwarding is ON: clicks, drag release, scroll, keyboard, and paste target the isolated workspace. Hover motion is not forwarded.",
+                                )),
+                                on_input,
+                            )
+                        } else if input_forward_confirm_seconds_left.is_some() {
+                            danger_button_with_tooltip(
+                                "viewer-input-confirm",
+                                "Input?",
+                                Some(tooltip_text(
+                                    "Confirm opt-in: forward viewer clicks, scroll, keyboard, and paste into the isolated workspace only",
+                                )),
+                                on_input,
+                            )
+                        } else {
+                            button_with_tooltip(
+                                "viewer-input",
+                                "Input",
+                                Some(tooltip_text(
+                                    "Opt in to manual read-write control through this viewer (requires a second click)",
+                                )),
+                                on_input,
+                            )
+                        })
                         .child(if let Some(label) = workspace_cycle_label {
                             if busy_action.is_some() || refreshing {
                                 disabled_button_with_tooltip(
@@ -2403,7 +3226,7 @@ impl Render for AgentWorkspaceViewer {
             // Screen view: spans the full content width of the panel and fills
             // the remaining vertical space. The frame image covers the box
             // edge-to-edge (no letterbox inset) while preserving aspect.
-            .child(
+            .child(track_bounds(
                 div()
                     .flex()
                     .flex_1()
@@ -2417,10 +3240,28 @@ impl Render for AgentWorkspaceViewer {
                     .border_color(rgb(BORDER))
                     .bg(rgb(0x0b0d10))
                     .overflow_hidden()
-                    .cursor(CursorStyle::Arrow)
-                    .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
-                        cx.stop_propagation();
+                    .cursor(if self.input_forwarding_ready() {
+                        CursorStyle::Crosshair
+                    } else {
+                        CursorStyle::Arrow
                     })
+                    .track_focus(&self.focus_handle)
+                    .on_mouse_down(MouseButton::Left, cx.listener(Self::begin_input_forward))
+                    .on_mouse_down(MouseButton::Right, cx.listener(Self::begin_input_forward))
+                    .on_mouse_down(MouseButton::Middle, cx.listener(Self::begin_input_forward))
+                    .on_mouse_up(MouseButton::Left, cx.listener(Self::end_input_forward))
+                    .on_mouse_up(MouseButton::Right, cx.listener(Self::end_input_forward))
+                    .on_mouse_up(MouseButton::Middle, cx.listener(Self::end_input_forward))
+                    .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_input_forward))
+                    .on_mouse_up_out(MouseButton::Right, cx.listener(Self::end_input_forward))
+                    .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::end_input_forward))
+                    // Do not forward hover-only mouse motion. In practice that
+                    // can emit dozens of workspace IPC requests per second and
+                    // make human handoff feel noisy/laggy. Clicks still move the
+                    // workspace pointer to the target point, and
+                    // drag gestures are replayed on release.
+                    .on_scroll_wheel(cx.listener(Self::forward_scroll))
+                    .capture_key_down(cx.listener(Self::forward_key_down))
                     .child(match image {
                         Some(image) => img(image)
                             .size_full()
@@ -2437,7 +3278,8 @@ impl Render for AgentWorkspaceViewer {
                             })
                             .into_any_element(),
                     }),
-            )
+                self.screen_bounds.clone(),
+            ))
             .child(
                 div()
                     .flex()
@@ -2575,7 +3417,7 @@ pub fn run(options: ViewerOptions) -> Result<()> {
         }
 
         let layer_options = options.clone();
-        if let Err(error) = cx.open_window(layer_shell_window_options(), move |window, cx| {
+        if let Err(error) = cx.open_window(layer_shell_window_options(options.input_forwarding), move |window, cx| {
             window.set_app_id(VIEWER_APP_ID);
             cx.new(|cx| AgentWorkspaceViewer::new(layer_options.clone(), cx))
         }) {
@@ -2660,7 +3502,7 @@ fn is_gnome_desktop() -> bool {
     .any(|value| value.to_ascii_lowercase().contains("gnome"))
 }
 
-fn layer_shell_window_options() -> WindowOptions {
+fn layer_shell_window_options(input_forwarding: bool) -> WindowOptions {
     let margin = px(OVERLAY_MARGIN);
     let preferences = load_viewer_preferences();
     WindowOptions {
@@ -2673,7 +3515,11 @@ fn layer_shell_window_options() -> WindowOptions {
             layer: Layer::Overlay,
             anchor: Anchor::TOP | Anchor::RIGHT,
             margin: Some((margin, margin, px(0.0), px(0.0))),
-            keyboard_interactivity: KeyboardInteractivity::None,
+            keyboard_interactivity: if input_forwarding {
+                KeyboardInteractivity::OnDemand
+            } else {
+                KeyboardInteractivity::None
+            },
             ..Default::default()
         }),
         is_movable: true,
@@ -2925,16 +3771,18 @@ fn viewer_registry_path(
     id: &str,
     backend: ViewerBackend,
     always_on_top: bool,
+    input_forwarding: bool,
     exit_when_workspace_gone: bool,
 ) -> PathBuf {
     let mode = if always_on_top { "topmost" } else { "normal" };
+    let input = if input_forwarding { "rw" } else { "ro" };
     let lifecycle = if exit_when_workspace_gone {
         "bound"
     } else {
         "free"
     };
     viewer_registry_dir().join(format!(
-        "{}-{}-{mode}-{lifecycle}.json",
+        "{}-{}-{mode}-{input}-{lifecycle}.json",
         sanitize_viewer_registry_component(id),
         backend.launch_label(always_on_top)
     ))
@@ -2955,11 +3803,13 @@ fn sanitize_viewer_registry_component(value: &str) -> String {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn viewer_registry_entry(
     id: &str,
     pid: u32,
     backend: ViewerBackend,
     always_on_top: bool,
+    input_forwarding: bool,
     exit_when_workspace_gone: bool,
     executable: PathBuf,
     command: Vec<String>,
@@ -2970,6 +3820,7 @@ fn viewer_registry_entry(
         pid,
         backend: backend.launch_label(always_on_top).to_string(),
         always_on_top,
+        input_forwarding,
         exit_when_workspace_gone,
         executable,
         command,
@@ -3034,6 +3885,7 @@ pub fn list_viewers() -> Result<ViewerList> {
             pid: entry.pid,
             backend: entry.backend.clone(),
             always_on_top: entry.always_on_top,
+            input_forwarding: entry.input_forwarding,
             exit_when_workspace_gone: entry.exit_when_workspace_gone,
             executable: entry.executable.clone(),
             command: entry.command.clone(),
@@ -3095,6 +3947,7 @@ fn close_viewer_registry_entry(
         pid: entry.pid,
         backend: entry.backend.clone(),
         always_on_top: entry.always_on_top,
+        input_forwarding: entry.input_forwarding,
         exit_when_workspace_gone: entry.exit_when_workspace_gone,
         registry_path: registry_path.clone(),
         reason,
@@ -3144,9 +3997,16 @@ fn existing_viewer_launch(
     id: &str,
     backend: ViewerBackend,
     always_on_top: bool,
+    input_forwarding: bool,
     exit_when_workspace_gone: bool,
 ) -> Option<ViewerLaunch> {
-    let path = viewer_registry_path(id, backend, always_on_top, exit_when_workspace_gone);
+    let path = viewer_registry_path(
+        id,
+        backend,
+        always_on_top,
+        input_forwarding,
+        exit_when_workspace_gone,
+    );
     let entry = read_viewer_registry_entry(&path)?;
     if viewer_registry_entry_is_alive(&entry) {
         return Some(viewer_launch_from_registry_entry(path, entry));
@@ -3197,6 +4057,7 @@ fn viewer_launch_from_registry_entry(path: PathBuf, entry: ViewerRegistryEntry) 
         pid: entry.pid,
         backend: entry.backend,
         always_on_top: entry.always_on_top,
+        input_forwarding: entry.input_forwarding,
         exit_when_workspace_gone: entry.exit_when_workspace_gone,
         executable: entry.executable,
         command: entry.command,
@@ -3213,6 +4074,7 @@ fn acquire_viewer_instance(
         &options.id,
         backend,
         options.always_on_top,
+        options.input_forwarding,
         options.exit_when_workspace_gone,
     ) {
         if existing.pid != std::process::id() {
@@ -3224,6 +4086,7 @@ fn acquire_viewer_instance(
         &options.id,
         backend,
         options.always_on_top,
+        options.input_forwarding,
         options.exit_when_workspace_gone,
     );
     let executable = env::current_exe().context("failed to resolve current executable")?;
@@ -3234,6 +4097,7 @@ fn acquire_viewer_instance(
         pid,
         backend,
         options.always_on_top,
+        options.input_forwarding,
         options.exit_when_workspace_gone,
         executable,
         command,
@@ -3254,6 +4118,7 @@ fn viewer_process_matches_entry(entry: &ViewerRegistryEntry) -> bool {
     if !viewer_cmdline_matches(
         &entry.id,
         entry.always_on_top,
+        entry.input_forwarding,
         entry.exit_when_workspace_gone,
         &cmdline,
     ) {
@@ -3314,6 +4179,7 @@ fn wait_for_viewer_exit(pid: u32, timeout: Duration) -> bool {
 fn viewer_cmdline_matches(
     id: &str,
     always_on_top: bool,
+    input_forwarding: bool,
     exit_when_workspace_gone: bool,
     args: &[String],
 ) -> bool {
@@ -3321,6 +4187,9 @@ fn viewer_cmdline_matches(
         return false;
     }
     if args.iter().any(|arg| arg == "--always-on-top") != always_on_top {
+        return false;
+    }
+    if args.iter().any(|arg| arg == "--input-forwarding") != input_forwarding {
         return false;
     }
     if args.iter().any(|arg| arg == "--exit-when-workspace-gone") != exit_when_workspace_gone {
@@ -3354,23 +4223,29 @@ pub fn open_viewer(
     id: Option<String>,
     permissions: &McpPermissionState,
     always_on_top: bool,
+    input_forwarding: bool,
 ) -> Result<ViewerLaunch> {
     let id = id.unwrap_or_else(workspace::default_workspace_id);
     let options = ViewerOptions {
         id: id.clone(),
         permissions: permissions.clone(),
         always_on_top,
+        input_forwarding,
         exit_when_workspace_gone: true,
         background: false,
     };
     let executable = std::env::current_exe().context("failed to resolve current executable")?;
     let args = viewer_command_args(&options);
     let backend = preferred_viewer_backend();
-    if let Some(existing) = existing_viewer_launch(&id, backend, always_on_top, true) {
+    if let Some(existing) =
+        existing_viewer_launch(&id, backend, always_on_top, input_forwarding, true)
+    {
         return Ok(existing);
     }
-    if let Some(existing) = existing_viewer_launch_for_id(&id) {
-        return Ok(existing);
+    if !input_forwarding {
+        if let Some(existing) = existing_viewer_launch_for_id(&id) {
+            return Ok(existing);
+        }
     }
     let mut command = Command::new(&executable);
     let permissions_json =
@@ -3395,12 +4270,13 @@ pub fn open_viewer(
     let command = std::iter::once(executable.display().to_string())
         .chain(args)
         .collect::<Vec<_>>();
-    let registry_path = viewer_registry_path(&id, backend, always_on_top, true);
+    let registry_path = viewer_registry_path(&id, backend, always_on_top, input_forwarding, true);
     let entry = viewer_registry_entry(
         &id,
         pid,
         backend,
         always_on_top,
+        input_forwarding,
         true,
         executable.clone(),
         command.clone(),
@@ -3414,6 +4290,7 @@ pub fn open_viewer(
         pid,
         backend: backend.launch_label(always_on_top).to_string(),
         always_on_top,
+        input_forwarding,
         exit_when_workspace_gone: true,
         executable,
         command,
@@ -3429,6 +4306,9 @@ fn viewer_command_args(options: &ViewerOptions) -> Vec<String> {
     }
     if options.exit_when_workspace_gone {
         args.push("--exit-when-workspace-gone".to_string());
+    }
+    if options.input_forwarding {
+        args.push("--input-forwarding".to_string());
     }
     if options.background {
         args.push("--background".to_string());
@@ -3471,6 +4351,8 @@ fn capture_screenshot(id: &str) -> Result<ViewerFrame> {
     let frame = Frame::new(buffer);
     Ok(ViewerFrame {
         image: Arc::new(RenderImage::new(vec![frame])),
+        width,
+        height,
     })
 }
 
@@ -5134,6 +6016,7 @@ mod tests {
             id: "qa".to_string(),
             permissions: McpPermissionState::default(),
             always_on_top: true,
+            input_forwarding: false,
             exit_when_workspace_gone: true,
             background: false,
         });
@@ -5148,6 +6031,193 @@ mod tests {
                 "--exit-when-workspace-gone"
             ]
         );
+    }
+
+    #[test]
+    fn input_forwarding_viewer_args_are_explicit() {
+        let args = viewer_command_args(&ViewerOptions {
+            id: "qa".to_string(),
+            permissions: McpPermissionState::default(),
+            always_on_top: false,
+            input_forwarding: true,
+            exit_when_workspace_gone: false,
+            background: false,
+        });
+
+        assert_eq!(args, vec!["viewer", "--id", "qa", "--input-forwarding"]);
+    }
+
+    #[test]
+    fn input_forwarding_coordinate_mapping_handles_cover_fit() {
+        let matching = Bounds {
+            origin: point(px(10.0), px(20.0)),
+            size: size(px(200.0), px(100.0)),
+        };
+        assert_eq!(
+            screen_position_to_workspace_point(100, 50, matching, point(px(110.0), px(70.0))),
+            Some(WorkspacePoint { x: 50, y: 25 })
+        );
+        assert_eq!(
+            screen_position_to_workspace_point(100, 50, matching, point(px(9.0), px(70.0))),
+            None
+        );
+
+        let horizontal_crop = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(200.0), px(100.0)),
+        };
+        assert_eq!(
+            screen_position_to_workspace_point(
+                100,
+                100,
+                horizontal_crop,
+                point(px(100.0), px(0.0))
+            ),
+            Some(WorkspacePoint { x: 50, y: 25 })
+        );
+
+        let vertical_crop = Bounds {
+            origin: point(px(0.0), px(0.0)),
+            size: size(px(100.0), px(200.0)),
+        };
+        assert_eq!(
+            screen_position_to_workspace_point(100, 100, vertical_crop, point(px(0.0), px(100.0))),
+            Some(WorkspacePoint { x: 25, y: 50 })
+        );
+    }
+
+    #[test]
+    fn screen_bounds_tracking_recovers_from_poisoned_mutex() {
+        let tracked_bounds = Arc::new(Mutex::new(None));
+        let poisoned_bounds = tracked_bounds.clone();
+        let old_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+        let poison_result = std::panic::catch_unwind(move || {
+            let _guard = poisoned_bounds.lock().expect("lock before poison");
+            panic!("poison tracked bounds");
+        });
+        std::panic::set_hook(old_hook);
+        assert!(poison_result.is_err());
+
+        let next_bounds = Bounds {
+            origin: point(px(1.0), px(2.0)),
+            size: size(px(3.0), px(4.0)),
+        };
+        store_screen_bounds(&tracked_bounds, Some(next_bounds));
+        assert_eq!(screen_bounds_snapshot(&tracked_bounds), Some(next_bounds));
+    }
+
+    #[test]
+    fn paste_keystroke_does_not_intercept_shift_modified_terminal_paste() {
+        let ctrl_v = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..Default::default()
+            },
+            key: "v".to_string(),
+            key_char: None,
+        };
+        assert!(is_paste_keystroke(&ctrl_v));
+
+        let ctrl_shift_v = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                shift: true,
+                ..Default::default()
+            },
+            key: "v".to_string(),
+            key_char: None,
+        };
+        assert!(!is_paste_keystroke(&ctrl_shift_v));
+    }
+
+    #[test]
+    fn xdotool_key_normalization_covers_forwarded_keyboard_edges() {
+        assert_eq!(normalize_xdotool_key(" F1 "), Some("F1".to_string()));
+        assert_eq!(normalize_xdotool_key("f12"), Some("F12".to_string()));
+        assert_eq!(
+            normalize_xdotool_key("page_down"),
+            Some("Page_Down".to_string())
+        );
+        assert_eq!(normalize_xdotool_key("unknown-key"), None);
+        assert_eq!(normalize_xdotool_key("  "), None);
+
+        let chord = gpui::Keystroke {
+            modifiers: gpui::Modifiers {
+                control: true,
+                alt: true,
+                shift: true,
+                platform: true,
+                ..Default::default()
+            },
+            key: " F12 ".to_string(),
+            key_char: None,
+        };
+        assert_eq!(
+            xdotool_key_for_keystroke(&chord),
+            Some("ctrl+alt+shift+super+F12".to_string())
+        );
+    }
+
+    #[test]
+    fn input_forwarding_queue_keeps_recent_requests_with_fixed_cap() {
+        let mut queue = VecDeque::new();
+        for x in 0..MAX_INPUT_FORWARDING_QUEUE_LEN {
+            let dropped = push_bounded_input_forwarding_request(
+                &mut queue,
+                (
+                    7,
+                    "qa".to_string(),
+                    InputForwardingRequest::MovePointer { x: x as i32, y: 1 },
+                ),
+            );
+            assert!(!dropped);
+        }
+
+        let dropped = push_bounded_input_forwarding_request(
+            &mut queue,
+            (
+                7,
+                "qa".to_string(),
+                InputForwardingRequest::Click {
+                    x: 999,
+                    y: 1,
+                    button: 1,
+                },
+            ),
+        );
+
+        assert!(dropped);
+        assert_eq!(queue.len(), MAX_INPUT_FORWARDING_QUEUE_LEN);
+        assert!(matches!(
+            queue.front(),
+            Some((7, target, InputForwardingRequest::MovePointer { x: 1, y: 1 }))
+                if target == "qa"
+        ));
+        assert!(matches!(
+            queue.back(),
+            Some((7, target, InputForwardingRequest::Click { x: 999, y: 1, button: 1 }))
+                if target == "qa"
+        ));
+    }
+
+    #[test]
+    fn scroll_wheel_to_workspace_scroll_uses_named_semantic_limits() {
+        assert_eq!(SCROLL_PIXELS_PER_WORKSPACE_TICK, 80.0);
+        assert_eq!(MAX_WORKSPACE_SCROLL_TICKS, 12.0);
+
+        let small_scroll =
+            scroll_wheel_to_workspace_scroll(ScrollDelta::Pixels(point(px(1.0), px(0.0))));
+        assert!(matches!(
+            small_scroll,
+            Some((workspace::ScrollDirection::Left, 1))
+        ));
+        let large_scroll =
+            scroll_wheel_to_workspace_scroll(ScrollDelta::Pixels(point(px(960.0), px(0.0))));
+        assert!(matches!(
+            large_scroll,
+            Some((workspace::ScrollDirection::Left, 12))
+        ));
     }
 
     #[test]
@@ -5423,6 +6493,28 @@ mod tests {
     }
 
     #[test]
+    fn layer_shell_viewer_requests_keyboard_only_for_input_forwarding() {
+        let read_only = layer_shell_window_options(false);
+        let input_capable = layer_shell_window_options(true);
+
+        let WindowKind::LayerShell(read_only_layer) = read_only.kind else {
+            panic!("expected layer shell options");
+        };
+        let WindowKind::LayerShell(input_capable_layer) = input_capable.kind else {
+            panic!("expected layer shell options");
+        };
+
+        assert_eq!(
+            read_only_layer.keyboard_interactivity,
+            KeyboardInteractivity::None
+        );
+        assert_eq!(
+            input_capable_layer.keyboard_interactivity,
+            KeyboardInteractivity::OnDemand
+        );
+    }
+
+    #[test]
     fn viewer_registry_key_sanitizes_workspace_id() {
         assert_eq!(
             sanitize_viewer_registry_component("project/default:qa"),
@@ -5433,10 +6525,12 @@ mod tests {
 
     #[test]
     fn viewer_registry_path_separates_bound_and_free_viewers() {
-        let free = viewer_registry_path("qa", ViewerBackend::X11Popup, false, false);
-        let bound = viewer_registry_path("qa", ViewerBackend::X11Popup, false, true);
+        let free = viewer_registry_path("qa", ViewerBackend::X11Popup, false, false, false);
+        let bound = viewer_registry_path("qa", ViewerBackend::X11Popup, false, false, true);
+        let input = viewer_registry_path("qa", ViewerBackend::X11Popup, false, true, true);
 
         assert_ne!(free, bound);
+        assert_ne!(bound, input);
         assert!(free
             .file_name()
             .and_then(|name| name.to_str())
@@ -5445,6 +6539,10 @@ mod tests {
             .file_name()
             .and_then(|name| name.to_str())
             .is_some_and(|name| name.ends_with("-bound.json")));
+        assert!(input
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.contains("-rw-")));
     }
 
     #[test]
@@ -5454,6 +6552,7 @@ mod tests {
             "qa",
             42,
             ViewerBackend::X11Popup,
+            false,
             false,
             true,
             executable.clone(),
@@ -5470,6 +6569,7 @@ mod tests {
             43,
             ViewerBackend::X11Popup,
             true,
+            false,
             true,
             executable.clone(),
             vec![
@@ -5487,6 +6587,7 @@ mod tests {
             ViewerBackend::X11Popup,
             false,
             false,
+            false,
             executable,
             vec![
                 "/tmp/agent-workspace-linux".to_string(),
@@ -5499,6 +6600,7 @@ mod tests {
             "other",
             45,
             ViewerBackend::X11Popup,
+            false,
             false,
             true,
             PathBuf::from("/tmp/agent-workspace-linux"),
@@ -5525,6 +6627,7 @@ mod tests {
         assert_eq!(launch.id, "qa");
         assert_eq!(launch.pid, 42);
         assert!(!launch.always_on_top);
+        assert!(!launch.input_forwarding);
         assert!(launch.exit_when_workspace_gone);
         assert!(launch.reused);
         assert_eq!(
@@ -5562,12 +6665,14 @@ mod tests {
             "--id".to_string(),
             "qa".to_string(),
         ];
-        assert!(viewer_cmdline_matches("qa", false, false, &args));
-        assert!(!viewer_cmdline_matches("other", false, false, &args));
-        assert!(!viewer_cmdline_matches("qa", true, false, &args));
-        assert!(!viewer_cmdline_matches("qa", false, true, &args));
+        assert!(viewer_cmdline_matches("qa", false, false, false, &args));
+        assert!(!viewer_cmdline_matches("other", false, false, false, &args));
+        assert!(!viewer_cmdline_matches("qa", true, false, false, &args));
+        assert!(!viewer_cmdline_matches("qa", false, true, false, &args));
+        assert!(!viewer_cmdline_matches("qa", false, false, true, &args));
         assert!(!viewer_cmdline_matches(
             "qa",
+            false,
             false,
             false,
             &["/tmp/agent-workspace-linux".to_string()]
@@ -5575,13 +6680,54 @@ mod tests {
 
         let mut topmost_args = args.clone();
         topmost_args.push("--always-on-top".to_string());
-        assert!(viewer_cmdline_matches("qa", true, false, &topmost_args));
-        assert!(!viewer_cmdline_matches("qa", false, false, &topmost_args));
+        assert!(viewer_cmdline_matches(
+            "qa",
+            true,
+            false,
+            false,
+            &topmost_args
+        ));
+        assert!(!viewer_cmdline_matches(
+            "qa",
+            false,
+            false,
+            false,
+            &topmost_args
+        ));
 
         let mut bound_args = args.clone();
         bound_args.push("--exit-when-workspace-gone".to_string());
-        assert!(viewer_cmdline_matches("qa", false, true, &bound_args));
-        assert!(!viewer_cmdline_matches("qa", false, false, &bound_args));
+        assert!(viewer_cmdline_matches(
+            "qa",
+            false,
+            false,
+            true,
+            &bound_args
+        ));
+        assert!(!viewer_cmdline_matches(
+            "qa",
+            false,
+            false,
+            false,
+            &bound_args
+        ));
+
+        let mut input_args = args.clone();
+        input_args.push("--input-forwarding".to_string());
+        assert!(viewer_cmdline_matches(
+            "qa",
+            false,
+            true,
+            false,
+            &input_args
+        ));
+        assert!(!viewer_cmdline_matches(
+            "qa",
+            false,
+            false,
+            false,
+            &input_args
+        ));
     }
 
     #[test]
