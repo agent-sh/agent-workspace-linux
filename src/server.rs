@@ -3048,7 +3048,6 @@ impl AgentWorkspaceLinux {
 
 #[tool_handler(
     name = "agent-workspace-linux",
-    version = "0.1.1",
     instructions = "\
 Use mcp_agent_context for one low-noise snapshot with active/read_only/paused, headless/no-host-display, viewer, app_id/window_id/viewer_id/browser_target_id handles, and recovery hints. Use mcp_permissions first when the host may have spawned this MCP with a permissions ceiling, mcp_control_state to check whether live user control has put the server in active, read_only, or paused mode, mcp_action_catalog when deciding whether a tool is read-only, idempotent, destructive, host-visible/open-world, or blocked by live control, mcp_session_brief when you need a condensed session summary with suggested next actions, and mcp_task_plan when the user intent is app QA, browser/shopping, observation, or cleanup and you need a safe read-only plan before calling mutating tools. \
 If configured=true, any populated permission dimensions are an immutable spawn-time ceiling for profile, start, launch, setup, and startup actions; clients may only narrow those dimensions. If configured=true but restricted=false, the MCP has an explicit empty/open ceiling, so enforcement stays open while the configured state remains visible. If configured=false, the MCP does not impose its own ceiling; respect the host/client harness boundary and use mcp_action_catalog plus each tool's annotations and description to classify the action type before acting. \
@@ -9963,7 +9962,19 @@ fn push_unique(values: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rmcp::ServerHandler;
     use std::fs;
+
+    #[test]
+    fn mcp_server_version_matches_crate_version() {
+        // The #[tool_handler] macro defaults the advertised server version to
+        // CARGO_PKG_VERSION when no `version =` is set. This guards against a
+        // reintroduced hardcoded literal drifting from Cargo.toml (it had been
+        // stuck at "0.1.1" across two releases).
+        let info = AgentWorkspaceLinux::default().get_info();
+        assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
+        assert_eq!(info.server_info.name, "agent-workspace-linux");
+    }
 
     fn catalog_tool<'a>(catalog: &'a McpActionCatalog, name: &str) -> &'a McpActionInfo {
         catalog
