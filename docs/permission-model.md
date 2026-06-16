@@ -14,7 +14,8 @@ to the host tool's approval flow (Claude Code, Codex, and similar). In that mode
 the acknowledgement parameters and approval bundles are API shape and audit
 metadata for the host UI; a richer human-approval experience in Codex for Linux
 is the part still being built. Live viewer control (read_only/paused) is a
-best-effort convenience, not an authoritative boundary.
+runtime convenience, not an authoritative boundary; mutating daemon IPC fails
+closed if the shared control state cannot be read.
 
 See [Status and remaining work](#status-and-remaining-work) for what is done and
 what is still planned.
@@ -206,10 +207,11 @@ Rules:
   start/open-profile, direct launch/run, and profile setup/startup launches) and
   the workspace daemon IPC socket (every IPC request, including those from
   workspace-launched apps and other same-uid callers). Live control state
-  (read_only/paused) is a separate, best-effort convenience layer: the daemon
-  honors a runtime pause when it can read the shared control state and fails open
-  if it cannot, so it is not relied on as a security boundary. The standalone CLI
-  can also generate and validate ceiling files for hosts that do not have the
+  (read_only/paused) is a separate runtime convenience layer: the daemon honors
+  a runtime pause when it can read the shared control state and fails closed for
+  mutating IPC if it cannot, while read-only inspection and the safety stop stay
+  available. It is still not the authoritative security boundary. The standalone
+  CLI can also generate and validate ceiling files for hosts that do not have the
   Codex for Linux UI.
 - The CLI also accepts a leading `--permissions PATH` global option. When used,
   profile and workspace actions are checked against the same ceiling. This is

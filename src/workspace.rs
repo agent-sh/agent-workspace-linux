@@ -3231,6 +3231,10 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
         Some(path) => load_mcp_permission_state(path)?,
         None => McpPermissionState::default(),
     };
+    control::ensure_control_state_initialized(
+        "workspace_daemon",
+        Some("initialize missing live control state for workspace daemon".to_string()),
+    )?;
 
     let mut x_server = spawn_xvfb(&options)?;
     wait_for_display(&options.display, &options.xauthority_path)?;
@@ -4189,42 +4193,63 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
         serde_json::from_str(line.trim()).context("failed to parse workspace IPC request")?;
     refresh_apps(state)?;
 
-    // Apply live control (active / read_only / paused) inside the daemon as a
-    // best-effort convenience layer, NOT the authoritative boundary. The control
-    // mode is file-backed (control::control_status reads mcp-control.json under
-    // the shared runtime dir), so this daemon observes mode changes made by the
-    // viewer or MCP front-end and can honor a user's runtime pause. It is gated
-    // before the request match so no mutating handler runs while paused, and
-    // read-only inspection plus the safety stop stay allowed even when paused.
-    // Crucially, this is independent of the permission ceiling: the ceiling is
+    // Apply live control (active / read_only / paused) inside the daemon. The
+    // control mode is file-backed (mcp-control.json under the shared runtime
+    // dir), so this daemon observes mode changes made by the viewer or MCP
+    // front-end and can honor a user's runtime pause. It is gated before the
+    // request match so no mutating handler runs while paused, and read-only
+    // inspection plus the safety stop stay allowed even when paused.
+    //
+    // This remains independent of the permission ceiling: the ceiling is
     // re-checked authoritatively in spawn_app regardless of what happens here.
-    // If the control state cannot be read we fail OPEN (allow the request),
-    // because best-effort live control must never block legitimate work or
-    // become a dependency the security model relies on.
-    let control_mode = match control::control_status() {
-        Ok(status) => Some(status.state.mode),
+    // For mutating IPC, unreadable live-control state fails closed so viewer-
+    // forwarded input cannot bypass read_only/paused intent by corrupting,
+    // deleting, or making the shared control file unreadable.
+    let (control_gate_state, control_read_error) = match control::strict_control_status() {
+        Ok(status) => (LiveControlGateState::Readable(status.state.mode), None),
         Err(error) => {
-            eprintln!("best-effort live control state unreadable; allowing request: {error:#}");
-            None
+            eprintln!(
+                "live control state unreadable; mutating IPC requests will fail closed: {error:#}"
+            );
+            (LiveControlGateState::Unreadable, Some(error.to_string()))
         }
     };
-    if let Some(mode) = control_gate_block_reason(&request, control_mode) {
-        record_event(
-            state,
-            "control_blocked",
-            serde_json::json!({
-                "mode": mode.as_str(),
-                "request": ipc_request_kind(&request),
-            }),
-        )?;
-        let response = response_with_status(
-            false,
-            format!(
-                "workspace is {}; this mutating action is disabled until live control returns to active",
-                mode.label()
-            ),
-            &state.status,
-        );
+    if let Some(reason) = control_gate_block_reason(&request, control_gate_state) {
+        let response = match reason {
+            LiveControlBlockReason::Mode(mode) => {
+                record_event(
+                    state,
+                    "control_blocked",
+                    serde_json::json!({
+                        "mode": mode.as_str(),
+                        "request": ipc_request_kind(&request),
+                    }),
+                )?;
+                response_with_status(
+                    false,
+                    format!(
+                        "workspace is {}; this mutating action is disabled until live control returns to active",
+                        mode.label()
+                    ),
+                    &state.status,
+                )
+            }
+            LiveControlBlockReason::Unreadable => {
+                record_event(
+                    state,
+                    "control_unreadable_blocked",
+                    serde_json::json!({
+                        "request": ipc_request_kind(&request),
+                        "error": control_read_error.as_deref().unwrap_or("unknown"),
+                    }),
+                )?;
+                response_with_status(
+                    false,
+                    "live control state is unreadable; mutating actions are disabled until the control state can be read",
+                    &state.status,
+                )
+            }
+        };
         return finish_ipc_response(stream, response, false);
     }
 
@@ -6519,22 +6544,36 @@ fn finish_ipc_response(
     Ok(should_stop)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveControlGateState {
+    Readable(McpControlMode),
+    Unreadable,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LiveControlBlockReason {
+    Mode(McpControlMode),
+    Unreadable,
+}
+
 /// Pure live-control gate decision: given an incoming request and the current
-/// control mode, return `Some(mode)` when the request must be blocked (it
-/// mutates and the mode does not allow agent mutation), or `None` when it is
-/// allowed. Kept separate from `handle_stream` so it can be unit-tested without
-/// touching the file-backed control state or process-global environment.
-///
-/// `mode` is `None` when the live control state is unknown/unreadable. In that
-/// case this returns `None` (allow): live control is a best-effort convenience,
-/// so it fails OPEN and never blocks work. The authoritative permission ceiling
-/// is enforced separately in `spawn_app` and does not depend on this gate.
+/// control state, return `Some(reason)` when the request must be blocked, or
+/// `None` when it is allowed. Kept separate from `handle_stream` so it can be
+/// unit-tested without touching the file-backed control state or process-global
+/// environment.
 fn control_gate_block_reason(
     request: &IpcRequest,
-    mode: Option<McpControlMode>,
-) -> Option<McpControlMode> {
-    match mode {
-        Some(mode) if request_mutates(request) && !mode.allows_agent_mutation() => Some(mode),
+    state: LiveControlGateState,
+) -> Option<LiveControlBlockReason> {
+    match state {
+        LiveControlGateState::Readable(mode)
+            if request_mutates(request) && !mode.allows_agent_mutation() =>
+        {
+            Some(LiveControlBlockReason::Mode(mode))
+        }
+        LiveControlGateState::Unreadable if request_mutates(request) => {
+            Some(LiveControlBlockReason::Unreadable)
+        }
         _ => None,
     }
 }
@@ -10244,48 +10283,101 @@ mod tests {
 
         // Paused blocks mutating ops.
         assert_eq!(
-            control_gate_block_reason(&mutating, Some(McpControlMode::Paused)),
-            Some(McpControlMode::Paused)
+            control_gate_block_reason(
+                &mutating,
+                LiveControlGateState::Readable(McpControlMode::Paused)
+            ),
+            Some(LiveControlBlockReason::Mode(McpControlMode::Paused))
         );
         assert_eq!(
-            control_gate_block_reason(&type_text, Some(McpControlMode::Paused)),
-            Some(McpControlMode::Paused)
+            control_gate_block_reason(
+                &type_text,
+                LiveControlGateState::Readable(McpControlMode::Paused)
+            ),
+            Some(LiveControlBlockReason::Mode(McpControlMode::Paused))
         );
         // Read-only inspection stays allowed even when paused.
         assert_eq!(
-            control_gate_block_reason(&read_only, Some(McpControlMode::Paused)),
+            control_gate_block_reason(
+                &read_only,
+                LiveControlGateState::Readable(McpControlMode::Paused)
+            ),
             None
         );
         // Safety stop stays allowed even when paused.
         assert_eq!(
-            control_gate_block_reason(&safety_stop, Some(McpControlMode::Paused)),
+            control_gate_block_reason(
+                &safety_stop,
+                LiveControlGateState::Readable(McpControlMode::Paused)
+            ),
             None
         );
         // read_only mode also blocks mutating ops and allows inspection.
         assert_eq!(
-            control_gate_block_reason(&mutating, Some(McpControlMode::ReadOnly)),
-            Some(McpControlMode::ReadOnly)
+            control_gate_block_reason(
+                &mutating,
+                LiveControlGateState::Readable(McpControlMode::ReadOnly)
+            ),
+            Some(LiveControlBlockReason::Mode(McpControlMode::ReadOnly))
         );
         assert_eq!(
-            control_gate_block_reason(&read_only, Some(McpControlMode::ReadOnly)),
+            control_gate_block_reason(
+                &read_only,
+                LiveControlGateState::Readable(McpControlMode::ReadOnly)
+            ),
             None
         );
         // Active permits everything.
         assert_eq!(
-            control_gate_block_reason(&mutating, Some(McpControlMode::Active)),
+            control_gate_block_reason(
+                &mutating,
+                LiveControlGateState::Readable(McpControlMode::Active)
+            ),
             None
         );
         assert_eq!(
-            control_gate_block_reason(&safety_stop, Some(McpControlMode::Active)),
+            control_gate_block_reason(
+                &safety_stop,
+                LiveControlGateState::Readable(McpControlMode::Active)
+            ),
             None
         );
 
-        // Best-effort fail-open: when the live control state is unreadable
-        // (mode is None), even mutating ops are allowed. Live control is a
-        // convenience layer, not the authoritative boundary; the permission
-        // ceiling is enforced independently in spawn_app.
-        assert_eq!(control_gate_block_reason(&mutating, None), None);
-        assert_eq!(control_gate_block_reason(&type_text, None), None);
+        // Unreadable live-control state fails closed for mutating IPC while
+        // preserving read-only inspection and the safety stop.
+        let click = IpcRequest::Click {
+            x: 1,
+            y: 2,
+            button: 1,
+            count: 1,
+        };
+        let key = IpcRequest::Key {
+            key: "Escape".to_string(),
+        };
+        let paste = IpcRequest::PasteText {
+            text: "hello".to_string(),
+            key: "ctrl+v".to_string(),
+        };
+        assert_eq!(
+            control_gate_block_reason(&click, LiveControlGateState::Unreadable),
+            Some(LiveControlBlockReason::Unreadable)
+        );
+        assert_eq!(
+            control_gate_block_reason(&key, LiveControlGateState::Unreadable),
+            Some(LiveControlBlockReason::Unreadable)
+        );
+        assert_eq!(
+            control_gate_block_reason(&paste, LiveControlGateState::Unreadable),
+            Some(LiveControlBlockReason::Unreadable)
+        );
+        assert_eq!(
+            control_gate_block_reason(&read_only, LiveControlGateState::Unreadable),
+            None
+        );
+        assert_eq!(
+            control_gate_block_reason(&safety_stop, LiveControlGateState::Unreadable),
+            None
+        );
 
         // Dry-run previews are treated as read-only.
         let kill_dry_run = IpcRequest::KillApp {
@@ -10297,12 +10389,18 @@ mod tests {
             dry_run: false,
         };
         assert_eq!(
-            control_gate_block_reason(&kill_dry_run, Some(McpControlMode::Paused)),
+            control_gate_block_reason(
+                &kill_dry_run,
+                LiveControlGateState::Readable(McpControlMode::Paused)
+            ),
             None
         );
         assert_eq!(
-            control_gate_block_reason(&kill_real, Some(McpControlMode::Paused)),
-            Some(McpControlMode::Paused)
+            control_gate_block_reason(
+                &kill_real,
+                LiveControlGateState::Readable(McpControlMode::Paused)
+            ),
+            Some(LiveControlBlockReason::Mode(McpControlMode::Paused))
         );
     }
 

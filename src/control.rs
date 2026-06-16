@@ -94,6 +94,20 @@ pub fn control_status() -> Result<McpControlStatus> {
     Ok(McpControlStatus { path, state })
 }
 
+pub fn strict_control_status() -> Result<McpControlStatus> {
+    let path = control_state_path();
+    let state = load_existing_control_state_from_path(&path)?;
+    Ok(McpControlStatus { path, state })
+}
+
+pub fn ensure_control_state_initialized(
+    updated_by: impl Into<String>,
+    reason: Option<String>,
+) -> Result<()> {
+    let path = control_state_path();
+    ensure_control_state_initialized_at_path(&path, updated_by, reason)
+}
+
 pub fn set_control_mode(
     mode: McpControlMode,
     updated_by: impl Into<String>,
@@ -120,6 +134,35 @@ fn load_control_state_from_path(path: &Path) -> Result<McpControlState> {
         return Ok(McpControlState::default());
     }
     serde_json::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn load_existing_control_state_from_path(path: &Path) -> Result<McpControlState> {
+    if !path.exists() {
+        bail!("MCP control state missing at {}", path.display());
+    }
+    let content =
+        fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))?;
+    if content.trim().is_empty() {
+        bail!("MCP control state empty at {}", path.display());
+    }
+    serde_json::from_str(&content).with_context(|| format!("failed to parse {}", path.display()))
+}
+
+fn ensure_control_state_initialized_at_path(
+    path: &Path,
+    updated_by: impl Into<String>,
+    reason: Option<String>,
+) -> Result<()> {
+    if load_existing_control_state_from_path(path).is_ok() {
+        return Ok(());
+    }
+    let state = McpControlState {
+        mode: McpControlMode::Active,
+        updated_at_unix: wall_clock_seconds(),
+        updated_by: Some(updated_by.into()),
+        reason: reason.filter(|reason| !reason.trim().is_empty()),
+    };
+    save_control_state_to_path(path, &state)
 }
 
 fn save_control_state_to_path(path: &Path, state: &McpControlState) -> Result<()> {
@@ -180,6 +223,25 @@ mod tests {
     }
 
     #[test]
+    fn strict_missing_control_state_fails_closed() {
+        let path = temp_control_path("strict-missing");
+        let _ = fs::remove_file(&path);
+        let error =
+            load_existing_control_state_from_path(&path).expect_err("missing state should fail");
+        assert!(error.to_string().contains("MCP control state missing"));
+    }
+
+    #[test]
+    fn strict_empty_control_state_fails_closed() {
+        let path = temp_control_path("strict-empty");
+        fs::write(&path, "\n").expect("write empty state");
+        let error =
+            load_existing_control_state_from_path(&path).expect_err("empty state should fail");
+        assert!(error.to_string().contains("MCP control state empty"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn control_state_round_trips() {
         let path = temp_control_path("round-trip");
         let _ = fs::remove_file(&path);
@@ -204,6 +266,72 @@ mod tests {
         let error = load_control_state_from_path(&path).expect_err("invalid state should fail");
         assert!(error.to_string().contains("failed to parse"));
         let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn initialization_repairs_corrupt_control_state() {
+        let path = temp_control_path("repair-corrupt");
+        fs::write(&path, "{not json").expect("write invalid state");
+
+        ensure_control_state_initialized_at_path(
+            &path,
+            "test",
+            Some("repair corrupt state".to_string()),
+        )
+        .expect("repair corrupt state");
+
+        let loaded = load_existing_control_state_from_path(&path).expect("load repaired state");
+        assert_eq!(loaded.mode, McpControlMode::Active);
+        assert_eq!(loaded.updated_by.as_deref(), Some("test"));
+        assert_eq!(loaded.reason.as_deref(), Some("repair corrupt state"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn initialization_preserves_valid_control_state() {
+        let path = temp_control_path("preserve-valid");
+        let state = McpControlState {
+            mode: McpControlMode::ReadOnly,
+            updated_at_unix: 42,
+            updated_by: Some("existing".to_string()),
+            reason: Some("user paused".to_string()),
+        };
+        save_control_state_to_path(&path, &state).expect("save state");
+
+        ensure_control_state_initialized_at_path(&path, "test", None)
+            .expect("preserve valid state");
+
+        let loaded = load_existing_control_state_from_path(&path).expect("load state");
+        assert_eq!(loaded.mode, McpControlMode::ReadOnly);
+        assert_eq!(loaded.updated_at_unix, 42);
+        assert_eq!(loaded.updated_by.as_deref(), Some("existing"));
+        assert_eq!(loaded.reason.as_deref(), Some("user paused"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn strict_unreadable_control_state_fails_closed() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let path = temp_control_path("strict-unreadable");
+        let _ = fs::remove_file(&path);
+        fs::write(&path, r#"{"mode":"active"}"#).expect("write state");
+        let original_permissions = fs::metadata(&path).expect("state metadata").permissions();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o000))
+            .expect("remove state permissions");
+
+        let result = load_existing_control_state_from_path(&path);
+
+        fs::set_permissions(&path, original_permissions).expect("restore state permissions");
+        let _ = fs::remove_file(&path);
+
+        if result.is_ok() {
+            eprintln!("skipping unreadable-file assertion for privileged test user");
+            return;
+        }
+        let error = result.expect_err("unreadable state should fail");
+        assert!(error.to_string().contains("failed to read"));
     }
 
     #[test]
