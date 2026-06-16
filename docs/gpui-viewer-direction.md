@@ -40,7 +40,9 @@ footer mode in the user's XDG config directory.
   manual read-write capability. Forwarding is still disabled when the window
   appears; the human must click the in-viewer `Input` control twice to arm it.
   All forwarded mouse, keyboard, scroll, and paste events go through
-  workspace-owned IPC for the selected workspace, never the host desktop.
+  workspace-owned IPC for the selected workspace, never the host desktop. Paste
+  forwarding reads text from the host clipboard and sends at most 64 KiB into
+  the workspace.
 - MCP-opened viewers pass `--exit-when-workspace-gone`, so monitors opened for a
   task disappear when their selected workspace runtime is removed.
 - Direct `agent-workspace-linux viewer` launches remain persistent, so they can
