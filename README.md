@@ -107,10 +107,10 @@ The single most important thing to understand is **who sets the limits in each s
 |----------|-----------------------|------------------|----------------------------------|
 | **Default** (no `--permissions`) | Your **agent host** (Claude Code, Codex, …) | The MCP adds **no ceiling of its own** and defers to the host's approval flow. One explicit hidden-workspace acknowledgement scopes workspace-local actions to that environment. | Yes — the host/user owns approvals. |
 | **Developer ceiling** (`--permissions file.json` or `AGENT_WORKSPACE_PERMISSIONS` env) | The **developer / operator** who launched the MCP | Network mode, mount paths, and an app allowlist, **enforced at both the MCP front-end and the workspace daemon's IPC socket** — so even workspace-launched apps and other same-uid processes are capped. | **No** — only by restarting the MCP with new config. This is the authoritative boundary. |
-| **Live viewer control** (pause / read-only) | The **human watching**, in real time | Best-effort: honors a runtime pause when the shared control state is readable, and fails open if it isn't. | It's a convenience layer, **not** the security boundary — the ceiling above is. |
+| **Live viewer control** (pause / read-only) | The **human watching**, in real time | Honors a runtime pause when the shared control state is readable; if the daemon cannot read that state, mutating IPC fails closed while inspection and stop remain available. | It's a convenience layer, **not** the security boundary — the ceiling above is. |
 | **Workspace vs. host** | The **runtime** | Input, screenshots, windows, clipboard, and browser control target the hidden workspace **only** — never your real desktop or host Chrome. | Leakage to the host is a reportable bug. |
 
-In short: **by default the agent host owns permission**, a developer can **lock a hard, daemon-enforced ceiling** via flag or env, and the **viewer gives a human a best-effort live stop** — layered, not conflicting. See [docs/permission-model.md](docs/permission-model.md) and [SECURITY.md](SECURITY.md) for the full model and trust assumptions.
+In short: **by default the agent host owns permission**, a developer can **lock a hard, daemon-enforced ceiling** via flag or env, and the **viewer gives a human live pause/read-only/stop controls** — layered, not conflicting. See [docs/permission-model.md](docs/permission-model.md) and [SECURITY.md](SECURITY.md) for the full model and trust assumptions.
 
 ## Core concepts
 
@@ -148,7 +148,7 @@ The MCP exposes ~86 tools. To avoid dumping them all into the agent's context, i
 - Optional, daemon-enforced permission ceiling (network / mounts / app allowlist) via flag or `AGENT_WORKSPACE_PERMISSIONS`.
 - bubblewrap-backed mount and network isolation (`disabled`, `local_only`, `inherit_host`) when available.
 - Workspace-owned browser control over loopback CDP — discover targets, read pages, navigate, extract results.
-- A native floating viewer with best-effort live pause / read-only / stop.
+- A native floating viewer with live pause / read-only / stop.
 - Saveable profiles with setup and startup commands.
 - A bundled skill for low-context, on-demand tool use across MCP hosts.
 
@@ -158,7 +158,7 @@ The MCP exposes ~86 tools. To avoid dumping them all into the agent's context, i
 - **Pre-1.0.** Interfaces and tool schemas can change between versions.
 - **Single-user trust model.** The control socket is a same-uid Unix socket (mode 0600); there is no cross-user protection by design. Run as a dedicated user for multi-user isolation.
 - **Mount/network enforcement needs bubblewrap.** Without it, those policies are declared but not enforced (the runtime tells you which).
-- **Live viewer control is best-effort**, not a hard guarantee — the permission ceiling is the authoritative boundary.
+- **Live viewer control is not the hard permission boundary** — the permission ceiling is authoritative, while unreadable live-control state fails closed for mutating daemon IPC.
 
 ## Docs
 
