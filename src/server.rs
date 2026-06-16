@@ -2679,7 +2679,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_set_clipboard",
-        description = "Set the clipboard selection inside an isolated agent workspace. Event logs store only size metadata, not the raw clipboard text.",
+        description = "Set the clipboard selection inside an isolated agent workspace. Text is capped at 64 KiB. Event logs store only size metadata, not the raw clipboard text.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2724,7 +2724,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_paste_text",
-        description = "Set the isolated workspace clipboard to text, then send a paste key chord to the focused app. Defaults to ctrl+v. Response includes active_window when focus can be resolved after the action. Event logs store only size metadata, not the raw text.",
+        description = "Set the isolated workspace clipboard to text, then send a paste key chord to the focused app. Text is capped at 64 KiB. Defaults to ctrl+v. Response includes active_window when focus can be resolved after the action. Event logs store only size metadata, not the raw text.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2749,7 +2749,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_paste_window",
-        description = "Set the isolated workspace clipboard to text, focus a visible window by X11 id/title/class/pid/app filter, then send a paste key chord. Prefer app_id from workspace_launch_app when controlling a launched app because GUI titles can change. Defaults to ctrl+v. Response includes the target window and active_window when focus can be resolved after the action. Event logs store only size metadata, not the raw text.",
+        description = "Set the isolated workspace clipboard to text, focus a visible window by X11 id/title/class/pid/app filter, then send a paste key chord. Text is capped at 64 KiB. Prefer app_id from workspace_launch_app when controlling a launched app because GUI titles can change. Defaults to ctrl+v. Response includes the target window and active_window when focus can be resolved after the action. Event logs store only size metadata, not the raw text.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,

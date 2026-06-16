@@ -761,6 +761,13 @@ fn push_bounded_input_forwarding_request(
     dropped
 }
 
+fn host_clipboard_too_large_message(byte_len: usize) -> String {
+    format!(
+        "Host clipboard text is {byte_len} bytes; maximum workspace paste is {} bytes",
+        workspace::MAX_CLIPBOARD_TEXT_BYTES
+    )
+}
+
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 enum DragKind {
     Move,
@@ -1421,13 +1428,13 @@ impl AgentWorkspaceViewer {
             self.input_forwarding_enabled = true;
             self.input_forwarding_arm_expires_at_unix = None;
             self.message =
-                "Manual input forwarding enabled; clicks, scroll, keys, and paste target only the isolated workspace"
+                "Manual input forwarding enabled; clicks, scroll, keys, and host clipboard paste target only the isolated workspace"
                     .to_string();
             self.error = None;
         } else {
             self.input_forwarding_arm_expires_at_unix = Some(now + INPUT_FORWARD_CONFIRM_SECONDS);
             self.message = format!(
-                "Click Input again within {INPUT_FORWARD_CONFIRM_SECONDS}s to forward clicks, scroll, and keyboard into {}",
+                "Click Input again within {INPUT_FORWARD_CONFIRM_SECONDS}s to forward clicks, scroll, keyboard, and host clipboard paste into {}",
                 self.target_id
             );
             self.error = None;
@@ -1699,7 +1706,17 @@ impl AgentWorkspaceViewer {
 
         let request = if is_paste_keystroke(&event.keystroke) {
             match cx.read_from_clipboard().and_then(|item| item.text()) {
-                Some(text) if !text.is_empty() => InputForwardingRequest::PasteText { text },
+                Some(text) if !text.is_empty() => {
+                    let byte_len = text.len();
+                    if byte_len > workspace::MAX_CLIPBOARD_TEXT_BYTES {
+                        self.message = host_clipboard_too_large_message(byte_len);
+                        self.error = None;
+                        cx.stop_propagation();
+                        cx.notify();
+                        return;
+                    }
+                    InputForwardingRequest::PasteText { text }
+                }
                 _ => {
                     self.message = "Host clipboard has no text to paste".to_string();
                     self.error = None;
@@ -2789,7 +2806,7 @@ impl Render for AgentWorkspaceViewer {
             )
         } else if let Some(seconds_left) = input_forward_confirm_seconds_left {
             format!(
-                "Manual input is opt-in: click Input again within {seconds_left}s to forward clicks, scroll, and keyboard into the isolated workspace"
+                "Manual input is opt-in: click Input again within {seconds_left}s to forward clicks, scroll, keyboard, and host clipboard paste into the isolated workspace"
             )
         } else if let Some(reason) = input_forwarding_wait_reason {
             format!("Manual input forwarding is enabled but {reason}")
@@ -3030,7 +3047,7 @@ impl Render for AgentWorkspaceViewer {
                                 "viewer-input-on",
                                 "Input",
                                 Some(tooltip_text(
-                                    "Manual input forwarding is ON: clicks, drag release, scroll, keyboard, and paste target the isolated workspace. Hover motion is not forwarded.",
+                                    "Manual input forwarding is ON: clicks, drag release, scroll, keyboard, and host clipboard paste target the isolated workspace. Hover motion is not forwarded.",
                                 )),
                                 on_input,
                             )
@@ -3039,7 +3056,7 @@ impl Render for AgentWorkspaceViewer {
                                 "viewer-input-confirm",
                                 "Input?",
                                 Some(tooltip_text(
-                                    "Confirm opt-in: forward viewer clicks, scroll, keyboard, and paste into the isolated workspace only",
+                                    "Confirm opt-in: forward viewer clicks, scroll, keyboard, and host clipboard text into the isolated workspace only",
                                 )),
                                 on_input,
                             )
@@ -3048,7 +3065,7 @@ impl Render for AgentWorkspaceViewer {
                                 "viewer-input",
                                 "Input",
                                 Some(tooltip_text(
-                                    "Opt in to manual read-write control through this viewer (requires a second click)",
+                                    "Opt in to manual read-write control through this viewer, including host clipboard paste (requires a second click)",
                                 )),
                                 on_input,
                             )
@@ -6199,6 +6216,17 @@ mod tests {
             Some((7, target, InputForwardingRequest::Click { x: 999, y: 1, button: 1 }))
                 if target == "qa"
         ));
+    }
+
+    #[test]
+    fn host_clipboard_size_message_names_workspace_paste_boundary() {
+        let byte_len = workspace::MAX_CLIPBOARD_TEXT_BYTES + 1;
+        let message = host_clipboard_too_large_message(byte_len);
+
+        assert!(message.contains("Host clipboard text"));
+        assert!(message.contains(&byte_len.to_string()));
+        assert!(message.contains(&workspace::MAX_CLIPBOARD_TEXT_BYTES.to_string()));
+        assert!(message.contains("workspace paste"));
     }
 
     #[test]

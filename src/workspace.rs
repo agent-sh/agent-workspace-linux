@@ -54,6 +54,7 @@ const ESRCH: i32 = 3;
 const PRIVATE_RUNTIME_DIR_MODE: u32 = 0o700;
 const PRIVATE_SOCKET_MODE: u32 = 0o600;
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
+pub(crate) const MAX_CLIPBOARD_TEXT_BYTES: usize = 64 * 1024;
 const APPLIED_POLICY_FILE: &str = "applied_policy.json";
 const EVENT_LOG_FILE: &str = "events.jsonl";
 const WORKSPACE_MANIFEST_FILE: &str = "workspace.json";
@@ -9632,6 +9633,12 @@ fn validate_clipboard_text(text: &str) -> Result<()> {
     if text.is_empty() {
         bail!("clipboard text cannot be empty");
     }
+    let byte_len = text.len();
+    if byte_len > MAX_CLIPBOARD_TEXT_BYTES {
+        bail!(
+            "clipboard text is {byte_len} bytes; maximum is {MAX_CLIPBOARD_TEXT_BYTES} bytes. Paste a smaller selection or transfer large content through a mounted file"
+        );
+    }
     if text.contains('\0') {
         bail!("clipboard text cannot contain NUL bytes");
     }
@@ -9905,6 +9912,20 @@ mod tests {
         assert_eq!(detail["source"], "workspace_screenshot_window");
         assert_eq!(detail["target"], "window");
         assert_eq!(detail["window_id"], "4194307");
+    }
+
+    #[test]
+    fn clipboard_text_rejects_oversized_payloads() {
+        let at_limit = "x".repeat(MAX_CLIPBOARD_TEXT_BYTES);
+        validate_clipboard_text(&at_limit).expect("limit-sized clipboard text should pass");
+
+        let too_large = "x".repeat(MAX_CLIPBOARD_TEXT_BYTES + 1);
+        let error =
+            validate_clipboard_text(&too_large).expect_err("oversized clipboard text should fail");
+        let message = error.to_string();
+        assert!(message.contains(&(MAX_CLIPBOARD_TEXT_BYTES + 1).to_string()));
+        assert!(message.contains(&MAX_CLIPBOARD_TEXT_BYTES.to_string()));
+        assert!(message.contains("mounted file"));
     }
 
     #[test]
