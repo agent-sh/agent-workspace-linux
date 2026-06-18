@@ -8317,7 +8317,33 @@ fn capture_workspace_screenshot(
             .with_context(|| format!("failed to create {}", parent.display()))?;
     }
 
-    if command_path_check("import").ok {
+    // Prefer ffmpeg's x11grab: it is the only readily-available capture that can
+    // composite the pointer sprite (`-draw_mouse 1`) into the frame. Xvfb keeps
+    // the cursor in a separate XFIXES plane, so `import`/`scrot` (and therefore
+    // the live viewer that streams these frames) render no cursor at all.
+    if command_path_check("ffmpeg").ok {
+        let video_size = format!("{}x{}", status.width, status.height);
+        let output = workspace_command(status, "ffmpeg")
+            .args([
+                "-y",
+                "-loglevel",
+                "error",
+                "-f",
+                "x11grab",
+                "-draw_mouse",
+                "1",
+                "-video_size",
+                &video_size,
+                "-i",
+                &status.display,
+                "-frames:v",
+                "1",
+            ])
+            .arg(&path)
+            .output()
+            .context("failed to run ffmpeg for workspace screenshot")?;
+        output_text(output, "ffmpeg x11grab")?;
+    } else if command_path_check("import").ok {
         let output = workspace_command(status, "import")
             .args(["-window", "root"])
             .arg(&path)
@@ -8560,26 +8586,43 @@ fn show_workspace_window(status: &WorkspaceStatus, window_id: &str) -> Result<Wo
     window_info(status, &window_id)
 }
 
+/// Run the embedded `__xtest` synthetic-input helper as a child process so it
+/// inherits the workspace DISPLAY/XAUTHORITY. Motion is injected via
+/// `XTestFakeMotionEvent` (a real device event XInput2 apps like winit observe),
+/// unlike `xdotool mousemove` which warps the pointer without a motion event and
+/// leaves egui/winit clicking at a stale position.
+fn run_xtest_input(status: &WorkspaceStatus, args: &[String]) -> Result<()> {
+    let exe = std::env::current_exe().context("resolve current executable for xtest input")?;
+    let exe = exe
+        .to_str()
+        .context("current executable path is not valid UTF-8")?;
+    let output = workspace_command(status, exe)
+        .arg("__xtest")
+        .args(args)
+        .output()
+        .context("failed to run __xtest input helper")?;
+    output_text(output, "xtest input")?;
+    Ok(())
+}
+
 fn click_workspace(status: &WorkspaceStatus, x: i32, y: i32, button: u8, count: u8) -> Result<()> {
     validate_workspace_coordinates(status, x, y, "click")?;
     validate_click_options(button, count)?;
-    let output = workspace_command(status, "xdotool")
-        .args(["mousemove", "--sync", &x.to_string(), &y.to_string()])
-        .args(["click", "--repeat", &count.to_string(), &button.to_string()])
-        .output()
-        .context("failed to run xdotool click")?;
-    output_text(output, "xdotool click")?;
-    Ok(())
+    run_xtest_input(
+        status,
+        &[
+            "click".to_string(),
+            x.to_string(),
+            y.to_string(),
+            button.to_string(),
+            count.to_string(),
+        ],
+    )
 }
 
 fn move_workspace_pointer(status: &WorkspaceStatus, x: i32, y: i32) -> Result<()> {
     validate_workspace_coordinates(status, x, y, "pointer")?;
-    let output = workspace_command(status, "xdotool")
-        .args(["mousemove", "--sync", &x.to_string(), &y.to_string()])
-        .output()
-        .context("failed to run xdotool mousemove")?;
-    output_text(output, "xdotool mousemove")?;
-    Ok(())
+    run_xtest_input(status, &["move".to_string(), x.to_string(), y.to_string()])
 }
 
 fn drag_workspace(
@@ -8593,20 +8636,17 @@ fn drag_workspace(
     validate_workspace_coordinates(status, from_x, from_y, "drag start")?;
     validate_workspace_coordinates(status, to_x, to_y, "drag end")?;
     validate_click_options(button, DEFAULT_CLICK_COUNT)?;
-    let output = workspace_command(status, "xdotool")
-        .args([
-            "mousemove",
-            "--sync",
-            &from_x.to_string(),
-            &from_y.to_string(),
-        ])
-        .args(["mousedown", &button.to_string()])
-        .args(["mousemove", "--sync", &to_x.to_string(), &to_y.to_string()])
-        .args(["mouseup", &button.to_string()])
-        .output()
-        .context("failed to run xdotool drag")?;
-    output_text(output, "xdotool drag")?;
-    Ok(())
+    run_xtest_input(
+        status,
+        &[
+            "drag".to_string(),
+            from_x.to_string(),
+            from_y.to_string(),
+            to_x.to_string(),
+            to_y.to_string(),
+            button.to_string(),
+        ],
+    )
 }
 
 fn scroll_workspace(
@@ -8618,15 +8658,16 @@ fn scroll_workspace(
 ) -> Result<()> {
     validate_workspace_coordinates(status, x, y, "scroll")?;
     validate_scroll_options(direction, amount)?;
-    let button = direction.x11_button().to_string();
-    let amount = amount.to_string();
-    let output = workspace_command(status, "xdotool")
-        .args(["mousemove", "--sync", &x.to_string(), &y.to_string()])
-        .args(["click", "--repeat", &amount, &button])
-        .output()
-        .context("failed to run xdotool scroll")?;
-    output_text(output, "xdotool scroll")?;
-    Ok(())
+    run_xtest_input(
+        status,
+        &[
+            "scroll".to_string(),
+            x.to_string(),
+            y.to_string(),
+            direction.x11_button().to_string(),
+            amount.to_string(),
+        ],
+    )
 }
 
 fn key_workspace(status: &WorkspaceStatus, key: String) -> Result<()> {
