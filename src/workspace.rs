@@ -1077,7 +1077,10 @@ pub fn doctor_report() -> DoctorReport {
         xprop: command_path_check("xprop"),
         window_manager: first_available_command(&["openbox", "i3", "fluxbox"]),
         xdotool: command_path_check("xdotool"),
-        screenshot: first_available_command(&["import", "scrot"]),
+        // Mirror the runtime capture order in capture_workspace_screenshot:
+        // ffmpeg (cursor-capable) is preferred, then import/scrot. An
+        // ffmpeg-only host can take screenshots, so it must read as ready here.
+        screenshot: first_available_command(&["ffmpeg", "import", "scrot"]),
         clipboard: first_available_command(&["xclip", "xsel"]),
         policy: policy_runtime_capabilities(),
     };
@@ -1116,7 +1119,10 @@ pub fn doctor_report() -> DoctorReport {
         );
     }
     if !runtime.screenshot.ok {
-        blockers.push("Install ImageMagick import or scrot for workspace screenshots.".to_string());
+        blockers.push(
+            "Install ffmpeg (cursor capture), ImageMagick import, or scrot for workspace screenshots."
+                .to_string(),
+        );
     }
 
     let mut viewer_blockers = Vec::new();
