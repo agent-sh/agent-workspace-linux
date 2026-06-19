@@ -48,9 +48,22 @@ pub fn run(args: &[String]) -> Result<()> {
     // Let the app process the motion (emit CursorMoved) before the button.
     let settle = || std::thread::sleep(std::time::Duration::from_millis(25));
 
+    // Callers validate/serialize coordinates as i32/u32 (no upper bound on
+    // --width/--height), but the XTEST wire protocol carries root_x/root_y as
+    // i16. Parse the wider type first, then narrow with an explicit range check
+    // so an out-of-range coordinate (display larger than 32767 px) yields a
+    // clear bounds error instead of a confusing "invalid" parse failure.
     let parse = |s: &str, what: &str| -> Result<i16> {
-        s.parse::<i16>()
-            .with_context(|| format!("XTEST: invalid {what}: {s:?}"))
+        let v: i32 = s
+            .parse()
+            .with_context(|| format!("XTEST: invalid {what}: {s:?}"))?;
+        i16::try_from(v).with_context(|| {
+            format!(
+                "XTEST: {what} {v} out of range for XTEST (must be {}..={})",
+                i16::MIN,
+                i16::MAX
+            )
+        })
     };
     // Buttons are X11 button IDs (1..=255); parse as u8 so out-of-range or
     // negative input fails loudly instead of silently wrapping (e.g. 300 -> 44).
