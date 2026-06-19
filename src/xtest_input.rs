@@ -52,6 +52,12 @@ pub fn run(args: &[String]) -> Result<()> {
         s.parse::<i16>()
             .with_context(|| format!("XTEST: invalid {what}: {s:?}"))
     };
+    // Buttons are X11 button IDs (1..=255); parse as u8 so out-of-range or
+    // negative input fails loudly instead of silently wrapping (e.g. 300 -> 44).
+    let parse_button = |s: &str| -> Result<u8> {
+        s.parse::<u8>()
+            .with_context(|| format!("XTEST: invalid button: {s:?}"))
+    };
 
     match args.first().map(String::as_str) {
         Some("move") if args.len() >= 3 => {
@@ -59,7 +65,7 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         Some("click") if args.len() >= 4 => {
             let (x, y) = (parse(&args[1], "x")?, parse(&args[2], "y")?);
-            let b = parse(&args[3], "button")? as u8;
+            let b = parse_button(&args[3])?;
             let count = args
                 .get(4)
                 .and_then(|s| s.parse::<u8>().ok())
@@ -76,7 +82,7 @@ pub fn run(args: &[String]) -> Result<()> {
         }
         Some("scroll") if args.len() >= 4 => {
             let (x, y) = (parse(&args[1], "x")?, parse(&args[2], "y")?);
-            let b = parse(&args[3], "button")? as u8;
+            let b = parse_button(&args[3])?;
             let count = args
                 .get(4)
                 .and_then(|s| s.parse::<u8>().ok())
@@ -92,7 +98,7 @@ pub fn run(args: &[String]) -> Result<()> {
         Some("drag") if args.len() >= 6 => {
             let (x1, y1) = (parse(&args[1], "x1")?, parse(&args[2], "y1")?);
             let (x2, y2) = (parse(&args[3], "x2")?, parse(&args[4], "y2")?);
-            let b = parse(&args[5], "button")? as u8;
+            let b = parse_button(&args[5])?;
             motion(x1, y1)?;
             settle();
             button(b, true)?;

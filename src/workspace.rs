@@ -11,7 +11,9 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env, fs,
+    env,
+    ffi::OsStr,
+    fs,
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
         ffi::OsStrExt,
@@ -8321,28 +8323,44 @@ fn capture_workspace_screenshot(
     // composite the pointer sprite (`-draw_mouse 1`) into the frame. Xvfb keeps
     // the cursor in a separate XFIXES plane, so `import`/`scrot` (and therefore
     // the live viewer that streams these frames) render no cursor at all.
+    //
+    // ffmpeg may be installed yet unusable here (built without x11grab, minimal
+    // container, …), so treat any failure as non-fatal and fall back to the
+    // cursor-less capture utilities rather than aborting the screenshot.
+    let mut captured = false;
     if command_path_check("ffmpeg").ok {
         let video_size = format!("{}x{}", status.width, status.height);
-        let output = workspace_command(status, "ffmpeg")
-            .args([
-                "-y",
-                "-loglevel",
-                "error",
-                "-f",
-                "x11grab",
-                "-draw_mouse",
-                "1",
-                "-video_size",
-                &video_size,
-                "-i",
-                &status.display,
-                "-frames:v",
-                "1",
-            ])
-            .arg(&path)
-            .output()
-            .context("failed to run ffmpeg for workspace screenshot")?;
-        output_text(output, "ffmpeg x11grab")?;
+        let run_ffmpeg = || -> Result<()> {
+            let output = workspace_command(status, "ffmpeg")
+                .args([
+                    "-y",
+                    "-loglevel",
+                    "error",
+                    "-f",
+                    "x11grab",
+                    "-draw_mouse",
+                    "1",
+                    "-video_size",
+                    &video_size,
+                    "-i",
+                    &status.display,
+                    "-frames:v",
+                    "1",
+                ])
+                .arg(&path)
+                .output()
+                .context("failed to run ffmpeg for workspace screenshot")?;
+            output_text(output, "ffmpeg x11grab")?;
+            Ok(())
+        };
+        match run_ffmpeg() {
+            Ok(()) => captured = true,
+            Err(err) => eprintln!("ffmpeg screenshot failed, falling back: {err:#}"),
+        }
+    }
+
+    if captured {
+        // Captured with the cursor composited in.
     } else if command_path_check("import").ok {
         let output = workspace_command(status, "import")
             .args(["-window", "root"])
@@ -8357,7 +8375,7 @@ fn capture_workspace_screenshot(
             .context("failed to run scrot for workspace screenshot")?;
         output_text(output, "scrot")?;
     } else {
-        bail!("missing screenshot command: install ImageMagick import or scrot");
+        bail!("missing screenshot command: install ffmpeg (cursor capture), ImageMagick import, or scrot");
     }
 
     workspace_screenshot_result(
@@ -8592,11 +8610,12 @@ fn show_workspace_window(status: &WorkspaceStatus, window_id: &str) -> Result<Wo
 /// unlike `xdotool mousemove` which warps the pointer without a motion event and
 /// leaves egui/winit clicking at a stale position.
 fn run_xtest_input(status: &WorkspaceStatus, args: &[String]) -> Result<()> {
-    let exe = std::env::current_exe().context("resolve current executable for xtest input")?;
-    let exe = exe
-        .to_str()
-        .context("current executable path is not valid UTF-8")?;
-    let output = workspace_command(status, exe)
+    // Reuse daemon_executable_path() so an updated/replaced binary (whose
+    // /proc/self/exe reads back as "… (deleted)") still resolves to the stable
+    // on-disk path; pass the PathBuf straight through to avoid rejecting
+    // non-UTF8 executable paths.
+    let exe = daemon_executable_path().context("resolve current executable for xtest input")?;
+    let output = workspace_command(status, &exe)
         .arg("__xtest")
         .args(args)
         .output()
@@ -9104,7 +9123,7 @@ fn app_exit_event_detail(app: &WorkspaceApp) -> serde_json::Value {
     })
 }
 
-fn workspace_command(status: &WorkspaceStatus, program: &str) -> Command {
+fn workspace_command(status: &WorkspaceStatus, program: impl AsRef<OsStr>) -> Command {
     let mut command = Command::new(program);
     configure_x11_workspace_process_environment(&mut command, status);
     command.stdin(Stdio::null());
