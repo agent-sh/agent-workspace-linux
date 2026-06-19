@@ -16,6 +16,7 @@ mod profile;
 mod server;
 mod viewer;
 mod workspace;
+mod xtest_input;
 
 use anyhow::{bail, Context, Result};
 use policy::{AppliedWorkspacePolicy, MountMode, ProfileMount};
@@ -26,6 +27,11 @@ use workspace::{DaemonOptions, EnvVar, LaunchSpec, WorkspaceStartOptions};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    // Internal helper: synthetic XTEST pointer input (motion+button) used by the
+    // workspace daemon so synthetic clicks reach XInput2 apps (winit/egui, …).
+    if args.first().map(String::as_str) == Some("__xtest") {
+        return xtest_input::run(&args[1..]);
+    }
     let permissions = parse_global_options(&mut args)?;
     match args.first().map(String::as_str) {
         Some("doctor") => {
