@@ -34,7 +34,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       # Install the same system packages as ci.yml so the gpui / X11 / Wayland
       # / xkbcommon build succeeds.  Source: .github/workflows/ci.yml (the
@@ -132,7 +132,7 @@ jobs:
       id-token: write # required for npm publish --provenance (OIDC attestation)
     steps:
       - name: Checkout
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
 
       - name: Set up Node.js
         uses: actions/setup-node@v6
