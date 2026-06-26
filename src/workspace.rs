@@ -8347,7 +8347,10 @@ fn absolute_window_origin(status: &WorkspaceStatus, id: &str) -> Option<(i32, i3
     if !output.status.success() {
         return None;
     }
-    let text = String::from_utf8(output.stdout).ok()?;
+    // Lossy: xwininfo echoes the window title, which can contain invalid UTF-8.
+    // The geometry lines we parse are pure ASCII, so a mangled title byte must
+    // not throw away the whole (valid) origin read.
+    let text = String::from_utf8_lossy(&output.stdout);
     parse_absolute_window_origin(&text)
 }
 
