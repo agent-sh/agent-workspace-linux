@@ -8223,6 +8223,17 @@ fn window_info_with_visibility(
         .output()
         .with_context(|| format!("failed to read window geometry for {id}"))?;
     let geometry_text = output_text(geometry_output, "xdotool getwindowgeometry")?;
+    let mut geometry = parse_window_geometry(&geometry_text)?;
+
+    // Prefer xwininfo's true absolute origin over xdotool's (which double-counts
+    // the reparent/title-bar offset under a reparenting WM). This keeps click
+    // coordinates aligned with window-screenshot pixels — see
+    // absolute_window_origin. Width/height/screen stay from xdotool; only the
+    // origin is corrected, and only when xwininfo resolves it.
+    if let Some((abs_x, abs_y)) = absolute_window_origin(status, id) {
+        geometry.x = abs_x;
+        geometry.y = abs_y;
+    }
 
     Ok(WorkspaceWindow {
         id: id.to_string(),
@@ -8232,7 +8243,7 @@ fn window_info_with_visibility(
         pid,
         app_id: pid.and_then(|pid| workspace_app_id_for_pid(status, pid)),
         visible,
-        geometry: parse_window_geometry(&geometry_text)?,
+        geometry,
     })
 }
 
@@ -8312,6 +8323,54 @@ fn parse_window_geometry(text: &str) -> Result<WindowGeometry> {
         height: height.context("window geometry missing HEIGHT")?,
         screen,
     })
+}
+
+/// The window's TRUE root-absolute upper-left, from `xwininfo`'s
+/// "Absolute upper-left X/Y".
+///
+/// Why this exists: under a reparenting WM, `xdotool getwindowgeometry` reports
+/// an origin that double-counts the frame offset (client-absolute PLUS the
+/// client's offset within its frame — e.g. a 22px title bar counted twice), so
+/// its X/Y land ~titlebar-height below the real client origin. Meanwhile
+/// `import -window <id>` captures the CLIENT drawable, whose top-left is the true
+/// absolute origin. Keying clicks off xdotool's value while screenshots use the
+/// client origin makes a coordinate read off a window screenshot miss by the
+/// title-bar height. xwininfo's "Absolute upper-left" is the same origin import
+/// captures from, so using it aligns click coordinates with screenshot pixels:
+/// a point read at (x,y) in `workspace_screenshot_window` is exactly the
+/// `click_window` (x,y) that lands there.
+fn absolute_window_origin(status: &WorkspaceStatus, id: &str) -> Option<(i32, i32)> {
+    let output = workspace_command(status, "xwininfo")
+        .args(["-id", id])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    // Lossy: xwininfo echoes the window title, which can contain invalid UTF-8.
+    // The geometry lines we parse are pure ASCII, so a mangled title byte must
+    // not throw away the whole (valid) origin read.
+    let text = String::from_utf8_lossy(&output.stdout);
+    parse_absolute_window_origin(&text)
+}
+
+/// Parse `xwininfo`'s "Absolute upper-left X/Y" lines into a root-absolute
+/// origin. Split from the spawn so it can be unit-tested on captured output.
+fn parse_absolute_window_origin(text: &str) -> Option<(i32, i32)> {
+    let mut x = None;
+    let mut y = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if let Some(rest) = line.strip_prefix("Absolute upper-left X:") {
+            x = rest.trim().parse::<i32>().ok();
+        } else if let Some(rest) = line.strip_prefix("Absolute upper-left Y:") {
+            y = rest.trim().parse::<i32>().ok();
+        }
+    }
+    match (x, y) {
+        (Some(x), Some(y)) => Some((x, y)),
+        _ => None,
+    }
 }
 
 fn capture_workspace_screenshot(
@@ -9992,6 +10051,32 @@ mod tests {
         assert!(message.contains(&(MAX_CLIPBOARD_TEXT_BYTES + 1).to_string()));
         assert!(message.contains(&MAX_CLIPBOARD_TEXT_BYTES.to_string()));
         assert!(message.contains("mounted file"));
+    }
+
+    #[test]
+    fn parses_absolute_window_origin_from_xwininfo() {
+        // Real xwininfo output for a reparented window: the absolute upper-left
+        // is the true client origin (what `import -window` captures from), which
+        // differs from xdotool's double-counted geometry by the title-bar height.
+        let sample = "\
+xwininfo: Window id: 0x400005 \"Eigen\"
+
+  Absolute upper-left X:  111
+  Absolute upper-left Y:  142
+  Relative upper-left X:  1
+  Relative upper-left Y:  22
+  Width: 1180
+  Height: 760
+";
+        assert_eq!(parse_absolute_window_origin(sample), Some((111, 142)));
+    }
+
+    #[test]
+    fn absolute_window_origin_none_when_fields_absent() {
+        assert_eq!(parse_absolute_window_origin("no geometry here"), None);
+        // Negative coordinates (partially off-screen window) parse fine.
+        let sample = "  Absolute upper-left X:  -5\n  Absolute upper-left Y:  -10\n";
+        assert_eq!(parse_absolute_window_origin(sample), Some((-5, -10)));
     }
 
     #[test]

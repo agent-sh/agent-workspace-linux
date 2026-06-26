@@ -43,7 +43,7 @@ It builds from source straight from git — no crates.io needed. Install the sys
 # latest from main
 cargo install --git https://github.com/agent-sh/agent-workspace-linux
 # or pin a tagged release
-cargo install --git https://github.com/agent-sh/agent-workspace-linux --tag v0.1.6
+cargo install --git https://github.com/agent-sh/agent-workspace-linux --tag v0.2.0
 ```
 
 That puts `agent-workspace-linux` on your `PATH`. Unlike `install.sh`, it installs only the binary — register it with your MCP host manually (below), and copy `skills/agent-workspace-linux/` into your skills directory if you want the bundled skill.
