@@ -131,15 +131,24 @@ function parseSha256Sidecar(contents, expectedAssetName) {
 
   const candidates = [];
   for (const line of lines) {
-    const match = line.match(/^([a-fA-F0-9]{64})(?:\s+(?:\*)?(.+))?$/);
-    if (!match) {
+    // Safe linear parse instead of potentially quadratic regex on untrusted sidecar content.
+    // Sidecar format: "<64-hex> [ *]<filename>"
+    const trimmed = line.trim();
+    if (!/^[a-fA-F0-9]{64}(\s+\*?(\S.*)?)?$/.test(trimmed)) {
       throw new Error(`invalid checksum sidecar line: ${line}`);
     }
-
-    const [, checksum, fileName] = match;
+    const spaceIdx = trimmed.indexOf(' ');
+    let checksum, fileNamePart;
+    if (spaceIdx === -1) {
+      checksum = trimmed;
+      fileNamePart = null;
+    } else {
+      checksum = trimmed.slice(0, spaceIdx);
+      fileNamePart = trimmed.slice(spaceIdx + 1).replace(/^\*?\s*/, '');
+    }
     candidates.push({
       checksum: checksum.toLowerCase(),
-      fileName: fileName ? fileName.trim() : null,
+      fileName: fileNamePart && fileNamePart.length ? fileNamePart.trim() : null,
     });
   }
 
@@ -222,8 +231,10 @@ async function main() {
   } catch (err) {
     removeFileQuietly(tmpPath);
     removeFileQuietly(tmpChecksumPath);
+    // Do not interpolate raw err.message (from untrusted sidecar/network) into logs.
+    // This was flagged as log-injection (js/log-injection).
     console.error(
-      `\nagent-workspace-linux: checksum verification failed — ${err.message}`
+      "\nagent-workspace-linux: checksum verification failed. The sidecar may be malformed or the binary tampered."
     );
     process.exit(1);
   }
