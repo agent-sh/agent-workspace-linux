@@ -276,13 +276,11 @@ function validateLoggedInPage(site, page, expectText) {
     );
   }
   if (expectText) {
-    // Intentionally a user-provided regex (dogfood helper, CLI-only).
-    // The value comes from argv and is used only for page-text matching in this
-    // one-off validation script. We limit length to reduce ReDoS surface.
+    // codeql[js/regex-injection]  -- intentional for this CLI dogfood tool only.
+    // Input is bounded (length check) and comes from trusted operator running the script locally.
     if (expectText.length > 200) {
       throw new Error("--expect-text pattern too long (max 200 chars)");
     }
-    // codeql[js/regex-injection]  -- by design for this dev dogfood tool
     const pattern = new RegExp(expectText, "i");
     if (!pattern.test(text)) {
       throw new Error(`--expect-text ${expectText} did not match title/url/text from the workspace browser`);
