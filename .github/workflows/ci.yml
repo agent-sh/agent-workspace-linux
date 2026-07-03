@@ -104,6 +104,12 @@ jobs:
         #   RUSTSEC-2024-0436 paste            unmaintained
         #   RUSTSEC-2026-0173 proc-macro-error2 unmaintained
         #   RUSTSEC-2026-0186 memmap2          unsound (via gpui→fontdb/cosmic-text/xkbcommon)
+        #   RUSTSEC-2026-0192 ttf-parser       unmaintained (via gpui→fontdb/cosmic-text)
+        #   RUSTSEC-2026-0194 quick-xml        DoS in dup-attribute check — build-time
+        #   RUSTSEC-2026-0195 quick-xml        DoS in NsReader namespace alloc — build-time
+        #     (quick-xml 0.30/0.39 reachable only through wayland-scanner /
+        #     gpui asset pipelines parsing vendored XML at build time, never
+        #     attacker input; unignore when upstream moves to quick-xml >= 0.41)
         # Everything else is still denied, so a real advisory fails CI.
         run: |
           cargo audit --deny warnings \
@@ -111,7 +117,10 @@ jobs:
             --ignore RUSTSEC-2024-0384 \
             --ignore RUSTSEC-2024-0436 \
             --ignore RUSTSEC-2026-0173 \
-            --ignore RUSTSEC-2026-0186
+            --ignore RUSTSEC-2026-0186 \
+            --ignore RUSTSEC-2026-0192 \
+            --ignore RUSTSEC-2026-0194 \
+            --ignore RUSTSEC-2026-0195
 
   # Validate the shipped SKILL.md and any agent config via agnix.
   # Scoped to skills/ rather than the repo root so the linter only sees the

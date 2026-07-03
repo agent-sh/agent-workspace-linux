@@ -6506,7 +6506,9 @@ fn build_mcp_agent_context(
         .as_ref()
         .map(|status| status.apps.clone())
         .unwrap_or_default();
-    for app in &apps {
+    // Only expose running apps as actionable handles; exited apps from earlier
+    // in the session (or a stale manifest) would otherwise look targetable.
+    for app in apps.iter().filter(|app| app.running) {
         push_unique(&mut handles.app_ids, app.id.clone());
     }
     let active_app_id = active_window_ref
@@ -6653,6 +6655,10 @@ fn mcp_agent_context_next_tools(
             .into_iter()
             .map(str::to_string),
         );
+        // A selected-but-stopped workspace has no live IPC state (app counts
+        // are always 0 here), but its runtime dir and manifest linger on disk;
+        // workspace_cleanup_stale is how those get purged.
+        tools.push("workspace_cleanup_stale".to_string());
     }
     if !mode.allows_agent_mutation {
         tools.push("mcp_control_update".to_string());
@@ -6676,7 +6682,18 @@ fn mcp_agent_context_recovery_hints(
     if workspace.running {
         hints.push("Use returned app_id, window_id, viewer_id, and browser_target_id handles instead of rediscovering by title.".to_string());
     } else {
-        hints.push("No running workspace is selected; use workspace_start or workspace_open_profile before window/app/browser tools.".to_string());
+        hints.push("No running workspace is selected; use workspace_start or workspace_open_profile before window/app/browser tools; workspace_cleanup_stale removes leftover runtime state from stopped workspaces.".to_string());
+    }
+    // Only reachable while the workspace is running: app state comes from live
+    // daemon IPC, so a stopped workspace always reports zero apps here.
+    let stale_apps = workspace
+        .app_count
+        .saturating_sub(workspace.running_app_count);
+    if stale_apps > 0 {
+        hints.push(format!(
+            "{stale_apps} of {total} tracked apps have exited; their app_ids are omitted from handles (workspace_read_app_log still accepts exited app ids).",
+            total = workspace.app_count,
+        ));
     }
     hints
 }
@@ -11697,5 +11714,62 @@ mod tests {
                 .any(|step| step.tool == "workspace_open_viewer"),
             "open_viewer=false should suppress viewer-first plan steps: {plan:?}"
         );
+    }
+
+    fn stale_apps_workspace(running: bool) -> McpAgentWorkspaceContext {
+        McpAgentWorkspaceContext {
+            id: "default".to_string(),
+            running,
+            session_id: None,
+            purpose: None,
+            profile_id: None,
+            app_count: 19,
+            running_app_count: 0,
+            active_app_id: None,
+            active_window: None,
+            windows: Vec::new(),
+            browser: None,
+            error: None,
+        }
+    }
+
+    #[test]
+    fn agent_context_hints_flag_stale_apps() {
+        // Reachable state: running workspace whose IPC status lists exited apps.
+        let mode = build_agent_mode_summary(true);
+        let hints = mcp_agent_context_recovery_hints(&mode, &stale_apps_workspace(true));
+        assert!(
+            hints
+                .iter()
+                .any(|hint| hint.contains("19 of 19") && hint.contains("omitted from handles")),
+            "expected stale-app hint, got: {hints:?}"
+        );
+    }
+
+    #[test]
+    fn agent_context_next_tools_suggest_cleanup_when_not_running() {
+        // Reachable state: stopped workspace always reports zero apps (no live
+        // IPC), so the cleanup suggestion must not depend on app counts.
+        let mut workspace = stale_apps_workspace(false);
+        workspace.app_count = 0;
+        workspace.running_app_count = 0;
+        let mode = build_agent_mode_summary(true);
+        let tools = mcp_agent_context_next_tools(&mode, &workspace);
+        assert!(tools.iter().any(|tool| tool == "workspace_cleanup_stale"));
+        let hints = mcp_agent_context_recovery_hints(&mode, &workspace);
+        assert!(hints
+            .iter()
+            .any(|hint| hint.contains("workspace_cleanup_stale")));
+    }
+
+    #[test]
+    fn agent_context_no_stale_hint_when_all_running() {
+        let mode = build_agent_mode_summary(true);
+        let mut workspace = stale_apps_workspace(true);
+        workspace.running_app_count = 19;
+        let hints = mcp_agent_context_recovery_hints(&mode, &workspace);
+        assert!(!hints
+            .iter()
+            .any(|hint| hint.contains("omitted from handles")));
     }
 }
