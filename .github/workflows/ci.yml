@@ -107,6 +107,7 @@ jobs:
         #   RUSTSEC-2026-0192 ttf-parser       unmaintained (via gpui→fontdb/cosmic-text)
         #   RUSTSEC-2026-0194 quick-xml        DoS in dup-attribute check — build-time
         #   RUSTSEC-2026-0195 quick-xml        DoS in NsReader namespace alloc — build-time
+#   RUSTSEC-2026-0206 rustybuzz        unmaintained (via gpui→fontdb/cosmic-text)
         #     (quick-xml 0.30/0.39 reachable only through wayland-scanner /
         #     gpui asset pipelines parsing vendored XML at build time, never
         #     attacker input; unignore when upstream moves to quick-xml >= 0.41)
@@ -120,7 +121,8 @@ jobs:
             --ignore RUSTSEC-2026-0186 \
             --ignore RUSTSEC-2026-0192 \
             --ignore RUSTSEC-2026-0194 \
-            --ignore RUSTSEC-2026-0195
+            --ignore RUSTSEC-2026-0195 \
+            --ignore RUSTSEC-2026-0206
 
   # Validate the shipped SKILL.md and any agent config via agnix.
   # Scoped to skills/ rather than the repo root so the linter only sees the
