@@ -112,6 +112,21 @@ Use the workspace-owned browser over its loopback DevTools endpoint. Start with
 with `workspace_browser_snapshot` or `workspace_browser_search_results`, then
 navigate or click with browser tools.
 
+Browser tools require a Chrome launched with `--user-data-dir` and loopback
+DevTools. Always get it from `workspace_open_browser` (MCP) or
+`workspace open-browser` (CLI) rather than hand-rolling a `workspace_launch_app`
+argv.
+
+If you attach your own CDP/WebSocket client to that endpoint, omit the `Origin`
+header (e.g. `websocket-client`'s `suppress_origin=True`). The DevTools port is
+ephemeral, so Chrome's origin allow-list cannot be pre-seeded and an `Origin`-
+bearing handshake is rejected with `403 Forbidden`.
+
+After `workspace_browser_navigate` or `workspace_browser_click`, read
+`page.url` / `page.title` for post-action state. `target.*` is refreshed to match,
+but if the refresh fails the response carries a warning saying it may be stale —
+check `warnings` before trusting `target` for verification.
+
 Skip unless: the task is web/browser automation that can run in the isolated
 workspace. Do not attach to host Chrome, Playwright, or Computer Use as a
 shortcut.

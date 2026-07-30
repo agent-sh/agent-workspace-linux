@@ -97,6 +97,34 @@ agent-workspace-linux workspace observe --screenshot --output /tmp/ws.png
 agent-workspace-linux workspace stop
 ```
 
+### Browser automation
+
+Browser commands need a workspace-owned Chrome with loopback DevTools. `open-browser`
+launches one with the right flags:
+
+```bash
+# Launch workspace-owned Chrome (use --dry-run to inspect the argv first)
+agent-workspace-linux workspace open-browser --dry-run
+agent-workspace-linux workspace open-browser "http://127.0.0.1:8111"
+
+# Drive it — URL is positional
+agent-workspace-linux workspace browser-navigate "http://127.0.0.1:8111/page" --wait-ms 1500
+agent-workspace-linux workspace browser-snapshot --max-text-chars 2000
+```
+
+`browser-navigate` and `browser-click` re-read the page after acting, so `target.url` /
+`target.title` describe the page you landed on rather than the one you left. If that
+refresh fails the response carries a warning instead of silently reporting stale metadata.
+
+**Attaching your own CDP client.** DevTools binds to an *ephemeral* loopback port, and
+Chrome rejects WebSocket upgrades whose `Origin` header is not allow-listed — matching on
+the port too, so no static `--remote-allow-origins` value can match (`*` would, but it
+disables that CSRF protection). Instead, omit the `Origin` header:
+
+```python
+ws = websocket.create_connection(ws_debugger_url, suppress_origin=True)
+```
+
 Through an MCP host you don't run these by hand — the agent calls the matching tools. Start it via the [bundled skill](#the-skill-progressive-tool-loading) so the agent loads only the tools it needs.
 
 ## Who controls the boundaries
