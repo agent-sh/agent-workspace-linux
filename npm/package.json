@@ -1,6 +1,6 @@
 {
   "name": "@agent-sh/agent-workspace-linux",
-  "version": "0.2.1",
+  "version": "0.3.0",
   "description": "Isolated Linux desktop workspaces for AI agents — MCP server binary wrapper.",
   "license": "MIT",
   "publishConfig": {
