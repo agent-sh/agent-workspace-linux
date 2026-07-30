@@ -1019,12 +1019,23 @@ pub(crate) fn workspace_browser_navigate_from_status(
     let timeout = cdp_timeout(timeout_ms);
     let navigation = navigate_target(&selected.target, &url, timeout)?;
     std::thread::sleep(Duration::from_millis(wait_ms.unwrap_or(750).min(30_000)));
-    // The target metadata was captured before navigating, so its title/url still
-    // describe the previous page. Refresh it so `target` and `page` agree.
+    let page = if snapshot {
+        Some(read_page_snapshot(
+            &selected.target,
+            max_text_chars.unwrap_or(12_000).min(200_000),
+            timeout,
+        )?)
+    } else {
+        None
+    };
+    // Target metadata was captured before navigating, so its title/url still
+    // describe the previous page. Refresh so `target` and `page` agree. When a
+    // snapshot was taken it already read document.title/location.href, so reuse
+    // it instead of paying for a second CDP round-trip.
     let mut navigated_target = selected.target.clone();
     let mut warnings = selected.targets.warnings.clone();
     warnings.extend(selected.warnings.clone());
-    match refresh_target_document(&selected.target, timeout) {
+    match refresh_target_document(&selected.target, timeout, page.as_ref()) {
         Ok((title, current_url)) => {
             navigated_target.title = title;
             navigated_target.url = current_url;
@@ -1035,15 +1046,6 @@ pub(crate) fn workspace_browser_navigate_from_status(
             ));
         }
     }
-    let page = if snapshot {
-        Some(read_page_snapshot(
-            &selected.target,
-            max_text_chars.unwrap_or(12_000).min(200_000),
-            timeout,
-        )?)
-    } else {
-        None
-    };
     let response = WorkspaceBrowserNavigate {
         ok: true,
         message: "workspace browser navigated through workspace-owned Chrome DevTools".to_string(),
@@ -1149,12 +1151,22 @@ pub(crate) fn workspace_browser_click_from_status(
         timeout,
     )?;
     std::thread::sleep(Duration::from_millis(wait_ms.unwrap_or(250).min(30_000)));
+    let page = if snapshot {
+        Some(read_page_snapshot(
+            &selected.target,
+            max_text_chars.unwrap_or(12_000).min(200_000),
+            timeout,
+        )?)
+    } else {
+        None
+    };
     // A click can navigate (links, SPA routing), so the pre-click target
-    // metadata may now describe the previous page. Refresh it.
+    // metadata may now describe the previous page. Refresh it, reusing the
+    // snapshot's document read when one was taken.
     let mut clicked_target = selected.target.clone();
     let mut warnings = selected.targets.warnings.clone();
     warnings.extend(selected.warnings.clone());
-    match refresh_target_document(&selected.target, timeout) {
+    match refresh_target_document(&selected.target, timeout, page.as_ref()) {
         Ok((title, current_url)) => {
             clicked_target.title = title;
             clicked_target.url = current_url;
@@ -1165,15 +1177,6 @@ pub(crate) fn workspace_browser_click_from_status(
             ));
         }
     }
-    let page = if snapshot {
-        Some(read_page_snapshot(
-            &selected.target,
-            max_text_chars.unwrap_or(12_000).min(200_000),
-            timeout,
-        )?)
-    } else {
-        None
-    };
     Ok(WorkspaceBrowserClick {
         ok: true,
         message: "workspace browser clicked through workspace-owned Chrome DevTools".to_string(),
@@ -1470,11 +1473,25 @@ fn cdp_timeout(timeout_ms: Option<u64>) -> Duration {
 /// Re-read `title`/`url` for a target after an action that changes the page.
 ///
 /// `/json/list` metadata is captured when the target is *selected*, which is
-/// before navigation happens. Returning that stale copy makes
+/// before the action runs. Returning that stale copy makes
 /// `target.url`/`target.title` describe the previous page while `page.*`
 /// describes the new one — callers that assert on `target` silently validate
-/// the wrong document. Cheap `Runtime.evaluate`, independent of `snapshot`.
-fn refresh_target_document(target: &BrowserTarget, timeout: Duration) -> Result<(String, String)> {
+/// the wrong document.
+///
+/// When a page snapshot was already taken it read `document.title` /
+/// `location.href` from the same live document, so reuse it rather than paying
+/// for a second CDP round-trip. Only fall back to an explicit
+/// `Runtime.evaluate` when no snapshot is available (`snapshot: false`).
+fn refresh_target_document(
+    target: &BrowserTarget,
+    timeout: Duration,
+    page: Option<&BrowserPageSnapshot>,
+) -> Result<(String, String)> {
+    if let Some(page) = page {
+        if !page.url.is_empty() {
+            return Ok((page.title.clone(), page.url.clone()));
+        }
+    }
     let value = cdp_request(
         target,
         "Runtime.evaluate",
@@ -2962,6 +2979,43 @@ mod tests {
         assert_eq!(detail["raw_result_text_omitted"], true);
         assert!(detail.get("results").is_none());
         assert!(detail.get("text_excerpt").is_none());
+    }
+
+    #[test]
+    fn refresh_target_document_reuses_snapshot_instead_of_a_second_round_trip() {
+        // A target with no webSocketDebuggerUrl cannot do CDP at all, so if this
+        // returns Ok the value must have come from the snapshot — proving the
+        // reuse path avoids a redundant Runtime.evaluate when snapshot=true.
+        let target = BrowserTarget {
+            id: "page-1".to_string(),
+            target_type: "page".to_string(),
+            title: "Stale Title".to_string(),
+            url: "http://127.0.0.1:8111/lesson/1".to_string(),
+            web_socket_debugger_url: None,
+        };
+        let page = BrowserPageSnapshot {
+            title: "Day 42 • ML Research".to_string(),
+            url: "http://127.0.0.1:8111/lesson/42".to_string(),
+            text: String::new(),
+            text_chars: 0,
+            text_truncated: false,
+            headings: Vec::new(),
+            links: Vec::new(),
+        };
+        let (title, url) =
+            refresh_target_document(&target, Duration::from_millis(500), Some(&page))
+                .expect("snapshot reuse must not require CDP");
+        assert_eq!(title, "Day 42 • ML Research");
+        assert_eq!(url, "http://127.0.0.1:8111/lesson/42");
+
+        // With no snapshot there is nothing to reuse, so it must attempt CDP and
+        // fail on the missing debugger URL rather than silently returning stale data.
+        let error = refresh_target_document(&target, Duration::from_millis(500), None)
+            .expect_err("without a snapshot it must attempt a real CDP read");
+        assert!(
+            error.to_string().contains("webSocketDebuggerUrl"),
+            "unexpected error: {error}"
+        );
     }
 
     #[test]
