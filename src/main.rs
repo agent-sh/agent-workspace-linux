@@ -398,7 +398,7 @@ fn handle_workspace(
 ) -> Result<()> {
     let Some(command) = args.first().map(String::as_str) else {
         bail!(
-            "missing workspace command. Expected: start, open-profile, list, cleanup, status, manifest, artifacts, ipc-info, env, launch, run, launch-profile-apps, apps, browser-targets, browser-snapshot, browser-search-results, browser-navigate, windows, active-window, pointer, observe, wait-window, screenshot, screenshot-window, focus-window, close-window, move-window, resize-window, raise-window, minimize-window, show-window, click, click-window, move-pointer, move-pointer-window, drag, drag-window, scroll, scroll-window, key, key-window, type, type-window, clipboard-set, clipboard-get, paste, paste-window, logs, wait-app, events, setup, kill-app, stop"
+            "missing workspace command. Expected: start, open-profile, list, cleanup, status, manifest, artifacts, ipc-info, env, launch, run, launch-profile-apps, apps, open-browser, browser-targets, browser-snapshot, browser-search-results, browser-navigate, windows, active-window, pointer, observe, wait-window, screenshot, screenshot-window, focus-window, close-window, move-window, resize-window, raise-window, minimize-window, show-window, click, click-window, move-pointer, move-pointer-window, drag, drag-window, scroll, scroll-window, key, key-window, type, type-window, clipboard-set, clipboard-get, paste, paste-window, logs, wait-app, events, setup, kill-app, stop"
         );
     };
     match command {
@@ -531,6 +531,36 @@ fn handle_workspace(
                 parsed.profile_id,
                 parsed.running,
             )?)
+        }
+        "open-browser" => {
+            let parsed = parse_open_browser_options(&args[1..])?;
+            let plan = browser::workspace_browser_open_plan(
+                &parsed.id,
+                parsed.browser_path,
+                parsed.user_data_dir,
+                parsed.url,
+            )?;
+            permissions.validate_launch_spec(&plan.spec)?;
+            if parsed.dry_run {
+                print_json(&serde_json::json!({
+                    "ok": true,
+                    "message": "workspace open-browser dry run; no browser launched",
+                    "id": parsed.id,
+                    "dry_run": true,
+                    "browser_path": plan.browser_path,
+                    "user_data_dir": plan.user_data_dir,
+                    "url": plan.url,
+                    "command": plan.spec.command,
+                }))
+            } else {
+                print_json(&browser::workspace_open_browser(
+                    &parsed.id,
+                    plan,
+                    parsed.wait_window,
+                    parsed.window_timeout_ms,
+                    parsed.timeout_ms,
+                )?)
+            }
         }
         "browser-targets" => {
             let parsed = parse_browser_targets_options(&args[1..])?;
@@ -998,7 +1028,7 @@ fn handle_workspace(
         unknown => {
             bail!(
                 "unknown workspace command '{unknown}'. Expected: {}",
-                "start, open-profile, list, cleanup, status, manifest, artifacts, ipc-info, env, launch, run, launch-profile-apps, apps, browser-targets, browser-snapshot, browser-search-results, browser-navigate, windows, active-window, pointer, observe, wait-window, screenshot, screenshot-window, focus-window, close-window, move-window, resize-window, raise-window, minimize-window, show-window, click, click-window, move-pointer, move-pointer-window, drag, drag-window, scroll, scroll-window, key, key-window, type, type-window, clipboard-set, clipboard-get, paste, paste-window, logs, wait-app, events, setup, kill-app, stop"
+                "start, open-profile, list, cleanup, status, manifest, artifacts, ipc-info, env, launch, run, launch-profile-apps, apps, open-browser, browser-targets, browser-snapshot, browser-search-results, browser-navigate, windows, active-window, pointer, observe, wait-window, screenshot, screenshot-window, focus-window, close-window, move-window, resize-window, raise-window, minimize-window, show-window, click, click-window, move-pointer, move-pointer-window, drag, drag-window, scroll, scroll-window, key, key-window, type, type-window, clipboard-set, clipboard-get, paste, paste-window, logs, wait-app, events, setup, kill-app, stop"
             )
         }
     }
@@ -1305,6 +1335,85 @@ struct ParsedBrowserNavigateOptions {
     snapshot: bool,
     max_text_chars: Option<usize>,
     timeout_ms: Option<u64>,
+}
+
+#[derive(Debug)]
+struct ParsedOpenBrowserOptions {
+    id: String,
+    browser_path: Option<PathBuf>,
+    user_data_dir: Option<PathBuf>,
+    url: Option<String>,
+    wait_window: bool,
+    window_timeout_ms: Option<u64>,
+    timeout_ms: Option<u64>,
+    dry_run: bool,
+}
+
+fn parse_open_browser_options(args: &[String]) -> Result<ParsedOpenBrowserOptions> {
+    let mut id = workspace::default_workspace_id();
+    let mut browser_path = None;
+    let mut user_data_dir = None;
+    let mut url = None;
+    let mut wait_window = true;
+    let mut window_timeout_ms = None;
+    let mut timeout_ms = None;
+    let mut dry_run = false;
+    let mut index = 0;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--id" => {
+                id = value_after(args, index, "--id")?.to_string();
+                index += 2;
+            }
+            "--browser" | "--browser-path" => {
+                browser_path = Some(PathBuf::from(value_after(args, index, "--browser")?));
+                index += 2;
+            }
+            "--user-data-dir" => {
+                user_data_dir = Some(PathBuf::from(value_after(args, index, "--user-data-dir")?));
+                index += 2;
+            }
+            "--no-wait-window" => {
+                wait_window = false;
+                index += 1;
+            }
+            "--window-timeout-ms" => {
+                window_timeout_ms = Some(
+                    value_after(args, index, "--window-timeout-ms")?
+                        .parse()
+                        .context("--window-timeout-ms must be a non-negative integer")?,
+                );
+                index += 2;
+            }
+            "--timeout-ms" => {
+                timeout_ms = Some(
+                    value_after(args, index, "--timeout-ms")?
+                        .parse()
+                        .context("--timeout-ms must be a non-negative integer")?,
+                );
+                index += 2;
+            }
+            "--dry-run" => {
+                dry_run = true;
+                index += 1;
+            }
+            value if !value.starts_with('-') && url.is_none() => {
+                url = Some(value.to_string());
+                index += 1;
+            }
+            flag => bail!("unknown workspace open-browser option '{flag}'"),
+        }
+    }
+    Ok(ParsedOpenBrowserOptions {
+        id,
+        browser_path,
+        user_data_dir,
+        url,
+        wait_window,
+        window_timeout_ms,
+        timeout_ms,
+        dry_run,
+    })
 }
 
 fn parse_browser_targets_options(args: &[String]) -> Result<ParsedBrowserTargetsOptions> {
@@ -4359,6 +4468,78 @@ them as ordinary controllable windows.
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn open_browser_options_take_url_positionally_with_defaults() {
+        let parsed = parse_open_browser_options(&args(&["http://127.0.0.1:8111/lesson/1"]))
+            .expect("parse open-browser options");
+        assert_eq!(
+            parsed.url.as_deref(),
+            Some("http://127.0.0.1:8111/lesson/1")
+        );
+        assert!(parsed.wait_window, "should wait for the window by default");
+        assert!(!parsed.dry_run);
+        assert!(parsed.browser_path.is_none());
+    }
+
+    #[test]
+    fn open_browser_options_accept_flags_and_dry_run() {
+        let parsed = parse_open_browser_options(&args(&[
+            "--id",
+            "qa",
+            "--browser",
+            "/usr/bin/chromium",
+            "--user-data-dir",
+            "/tmp/qa-profile",
+            "--no-wait-window",
+            "--timeout-ms",
+            "9000",
+            "--dry-run",
+            "about:blank",
+        ]))
+        .expect("parse open-browser options");
+        assert_eq!(parsed.id, "qa");
+        assert_eq!(
+            parsed.browser_path,
+            Some(PathBuf::from("/usr/bin/chromium"))
+        );
+        assert_eq!(parsed.user_data_dir, Some(PathBuf::from("/tmp/qa-profile")));
+        assert_eq!(parsed.url.as_deref(), Some("about:blank"));
+        assert!(!parsed.wait_window);
+        assert_eq!(parsed.timeout_ms, Some(9_000));
+        assert!(parsed.dry_run);
+    }
+
+    #[test]
+    fn open_browser_options_reject_unknown_flags() {
+        let error = parse_open_browser_options(&args(&["--bogus"]))
+            .expect_err("unknown flags must be rejected");
+        assert!(
+            error.to_string().contains("open-browser"),
+            "error should name the subcommand: {error}"
+        );
+    }
+
+    #[test]
+    fn unknown_workspace_command_advertises_open_browser() {
+        // The browser-attach failure hint tells callers to run
+        // `workspace open-browser`; it must appear in the dispatch command list
+        // so the suggestion is discoverable instead of looking unsupported.
+        let error = handle_workspace(
+            args(&["definitely-not-a-command"]),
+            &permissions::McpPermissionState::default(),
+        )
+        .expect_err("unknown workspace command must error");
+        let message = error.to_string();
+        assert!(
+            message.contains("open-browser"),
+            "unknown-command help must list open-browser: {message}"
+        );
+    }
 
     fn assert_open_mcp_permissions(state: &permissions::McpPermissionState) {
         assert!(!state.restricted);

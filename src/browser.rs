@@ -1028,8 +1028,24 @@ pub(crate) fn workspace_browser_navigate_from_status(
     } else {
         None
     };
+    // Target metadata was captured before navigating, so its title/url still
+    // describe the previous page. Refresh so `target` and `page` agree. When a
+    // snapshot was taken it already read document.title/location.href, so reuse
+    // it instead of paying for a second CDP round-trip.
+    let mut navigated_target = selected.target.clone();
     let mut warnings = selected.targets.warnings.clone();
     warnings.extend(selected.warnings.clone());
+    match refresh_target_document(&selected.target, timeout, page.as_ref()) {
+        Ok((title, current_url)) => {
+            navigated_target.title = title;
+            navigated_target.url = current_url;
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "could not refresh browser target metadata after navigation; target.title/target.url may describe the previous page: {error}"
+            ));
+        }
+    }
     let response = WorkspaceBrowserNavigate {
         ok: true,
         message: "workspace browser navigated through workspace-owned Chrome DevTools".to_string(),
@@ -1037,8 +1053,8 @@ pub(crate) fn workspace_browser_navigate_from_status(
         app_id: selected.targets.app_id.clone(),
         app_pid: selected.targets.app_pid,
         devtools_endpoint: selected.targets.devtools_endpoint.clone(),
-        target: Some(selected.target.clone()),
-        browser_target_id: Some(selected.target.id.clone()),
+        browser_target_id: Some(navigated_target.id.clone()),
+        target: Some(navigated_target),
         url,
         navigation: Some(navigation),
         page,
@@ -1144,8 +1160,23 @@ pub(crate) fn workspace_browser_click_from_status(
     } else {
         None
     };
+    // A click can navigate (links, SPA routing), so the pre-click target
+    // metadata may now describe the previous page. Refresh it, reusing the
+    // snapshot's document read when one was taken.
+    let mut clicked_target = selected.target.clone();
     let mut warnings = selected.targets.warnings.clone();
     warnings.extend(selected.warnings.clone());
+    match refresh_target_document(&selected.target, timeout, page.as_ref()) {
+        Ok((title, current_url)) => {
+            clicked_target.title = title;
+            clicked_target.url = current_url;
+        }
+        Err(error) => {
+            warnings.push(format!(
+                "could not refresh browser target metadata after click; target.title/target.url may describe the previous page: {error}"
+            ));
+        }
+    }
     Ok(WorkspaceBrowserClick {
         ok: true,
         message: "workspace browser clicked through workspace-owned Chrome DevTools".to_string(),
@@ -1153,8 +1184,8 @@ pub(crate) fn workspace_browser_click_from_status(
         app_id: selected.targets.app_id.clone(),
         app_pid: selected.targets.app_pid,
         devtools_endpoint: selected.targets.devtools_endpoint.clone(),
-        target: Some(selected.target.clone()),
-        browser_target_id: Some(selected.target.id.clone()),
+        browser_target_id: Some(clicked_target.id.clone()),
+        target: Some(clicked_target),
         click: Some(click),
         page,
         agent_mode: None,
@@ -1437,6 +1468,61 @@ fn page_target_candidates_summary(targets: &[BrowserTarget], limit: usize) -> St
 
 fn cdp_timeout(timeout_ms: Option<u64>) -> Duration {
     Duration::from_millis(timeout_ms.unwrap_or(5_000).clamp(100, 30_000))
+}
+
+/// Re-read `title`/`url` for a target after an action that changes the page.
+///
+/// `/json/list` metadata is captured when the target is *selected*, which is
+/// before the action runs. Returning that stale copy makes
+/// `target.url`/`target.title` describe the previous page while `page.*`
+/// describes the new one — callers that assert on `target` silently validate
+/// the wrong document.
+///
+/// When a page snapshot was already taken it read `document.title` /
+/// `location.href` from the same live document, so reuse it rather than paying
+/// for a second CDP round-trip. Only fall back to an explicit
+/// `Runtime.evaluate` when no snapshot is available (`snapshot: false`).
+fn refresh_target_document(
+    target: &BrowserTarget,
+    timeout: Duration,
+    page: Option<&BrowserPageSnapshot>,
+) -> Result<(String, String)> {
+    if let Some(page) = page {
+        if !page.url.is_empty() {
+            return Ok((page.title.clone(), page.url.clone()));
+        }
+    }
+    let value = cdp_request(
+        target,
+        "Runtime.evaluate",
+        json!({
+            "expression": "JSON.stringify({ title: document.title, url: location.href })",
+            "returnByValue": true,
+            "awaitPromise": true,
+        }),
+        timeout,
+    )?;
+    if let Some(exception) = value.get("exceptionDetails") {
+        bail!("browser target refresh Runtime.evaluate failed: {exception}");
+    }
+    let raw = value
+        .get("result")
+        .and_then(|result| result.get("value"))
+        .and_then(serde_json::Value::as_str)
+        .context("browser target refresh Runtime.evaluate did not return a JSON value")?;
+    let parsed: serde_json::Value =
+        serde_json::from_str(raw).context("browser target refresh returned invalid JSON")?;
+    let title = parsed
+        .get("title")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let url = parsed
+        .get("url")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    Ok((title, url))
 }
 
 fn read_page_snapshot(
@@ -2079,7 +2165,7 @@ fn select_browser_app(
             bail!("no running workspace browser app matched app id/name/pid {app_id:?}");
         }
         bail!(
-            "no running workspace browser app exposes --user-data-dir and Chrome DevTools; call workspace_open_browser or launch Chrome inside the workspace with --remote-debugging-address=127.0.0.1 --remote-debugging-port=0"
+            "no running workspace browser app exposes --user-data-dir and Chrome DevTools; call workspace_open_browser (MCP) or `agent-workspace-linux workspace open-browser` (CLI), or launch Chrome inside the workspace with --user-data-dir=DIR --remote-debugging-address=127.0.0.1 --remote-debugging-port=0. Note: the DevTools port is ephemeral, so external WebSocket clients must omit the Origin header (e.g. websocket-client's suppress_origin=True) rather than rely on --remote-allow-origins"
         );
     }
     if candidates.len() > 1 && app_id.is_none() && user_data_dir.is_none() {
@@ -2893,6 +2979,70 @@ mod tests {
         assert_eq!(detail["raw_result_text_omitted"], true);
         assert!(detail.get("results").is_none());
         assert!(detail.get("text_excerpt").is_none());
+    }
+
+    #[test]
+    fn refresh_target_document_reuses_snapshot_instead_of_a_second_round_trip() {
+        // A target with no webSocketDebuggerUrl cannot do CDP at all, so if this
+        // returns Ok the value must have come from the snapshot — proving the
+        // reuse path avoids a redundant Runtime.evaluate when snapshot=true.
+        let target = BrowserTarget {
+            id: "page-1".to_string(),
+            target_type: "page".to_string(),
+            title: "Stale Title".to_string(),
+            url: "http://127.0.0.1:8111/lesson/1".to_string(),
+            web_socket_debugger_url: None,
+        };
+        let page = BrowserPageSnapshot {
+            title: "Day 42 • ML Research".to_string(),
+            url: "http://127.0.0.1:8111/lesson/42".to_string(),
+            text: String::new(),
+            text_chars: 0,
+            text_truncated: false,
+            headings: Vec::new(),
+            links: Vec::new(),
+        };
+        let (title, url) =
+            refresh_target_document(&target, Duration::from_millis(500), Some(&page))
+                .expect("snapshot reuse must not require CDP");
+        assert_eq!(title, "Day 42 • ML Research");
+        assert_eq!(url, "http://127.0.0.1:8111/lesson/42");
+
+        // With no snapshot there is nothing to reuse, so it must attempt CDP and
+        // fail on the missing debugger URL rather than silently returning stale data.
+        let error = refresh_target_document(&target, Duration::from_millis(500), None)
+            .expect_err("without a snapshot it must attempt a real CDP read");
+        assert!(
+            error.to_string().contains("webSocketDebuggerUrl"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn workspace_browser_command_binds_devtools_to_loopback_without_widening_origins() {
+        // Chrome rejects DevTools WebSocket upgrades whose `Origin` header is not
+        // allow-listed, and it matches origins *including the port*. Because the
+        // endpoint uses `--remote-debugging-port=0` (ephemeral), no static
+        // `--remote-allow-origins` list can ever match — only `*` would, and that
+        // disables the CSRF protection guarding this endpoint. Verified: clients
+        // that omit `Origin` (the bundled CDP client, and any library with
+        // origin suppression) connect fine with no flag at all. So we bind to
+        // loopback and deliberately do NOT pass --remote-allow-origins.
+        let command = workspace_browser_command(
+            Path::new("/usr/bin/google-chrome"),
+            Path::new("/tmp/profile"),
+            "about:blank",
+        );
+        assert!(command
+            .iter()
+            .any(|arg| arg == "--remote-debugging-address=127.0.0.1"));
+        assert!(command.iter().any(|arg| arg == "--remote-debugging-port=0"));
+        assert!(
+            !command
+                .iter()
+                .any(|arg| arg.starts_with("--remote-allow-origins")),
+            "must not widen DevTools origins; document Origin suppression instead"
+        );
     }
 
     #[test]
