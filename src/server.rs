@@ -3046,6 +3046,70 @@ impl AgentWorkspaceLinux {
     }
 }
 
+/// schemars emits Rust-specific integer formats (`uint`, `uint8`, `uint32`,
+/// `uint64`) that strict JSON-Schema validators reject with a flood of
+/// "unknown format" warnings at client startup (opencode printed ~3.6k per
+/// launch). `format` is annotation-only in draft 2020-12 and schemars already
+/// emits the matching minimum/maximum bounds, so stripping the nonstandard
+/// values loses no information.
+fn drop_unknown_schema_formats(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(format) = map.get("format").and_then(|f| f.as_str()) {
+                let known = matches!(
+                    format,
+                    "int32"
+                        | "int64"
+                        | "float"
+                        | "double"
+                        | "date-time"
+                        | "date"
+                        | "time"
+                        | "email"
+                        | "idn-email"
+                        | "hostname"
+                        | "ipv4"
+                        | "ipv6"
+                        | "uri"
+                        | "uri-reference"
+                        | "uri-template"
+                        | "uuid"
+                        | "regex"
+                        | "json-pointer"
+                        | "relative-json-pointer"
+                );
+                if !known {
+                    map.remove("format");
+                }
+            }
+            for (_, v) in map.iter_mut() {
+                drop_unknown_schema_formats(v);
+            }
+        }
+        serde_json::Value::Array(items) => {
+            for v in items {
+                drop_unknown_schema_formats(v);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn sanitize_tool_schema(tool: &mut rmcp::model::Tool) {
+    let mut schema = serde_json::Value::Object(tool.input_schema.as_ref().clone());
+    drop_unknown_schema_formats(&mut schema);
+    if let serde_json::Value::Object(map) = schema {
+        tool.input_schema = std::sync::Arc::new(map);
+    }
+    if let Some(out) = tool.output_schema.take() {
+        let mut schema = serde_json::Value::Object(out.as_ref().clone());
+        drop_unknown_schema_formats(&mut schema);
+        if let serde_json::Value::Object(map) = schema {
+            tool.output_schema = Some(std::sync::Arc::new(map));
+        }
+    }
+}
+
 #[tool_handler(
     name = "agent-workspace-linux",
     instructions = "\
@@ -3056,7 +3120,27 @@ workspace_start and workspace_open_profile are host-visible/open-world by defaul
 Use workspace_open_browser to launch workspace-owned Chrome/Chromium with --user-data-dir and loopback DevTools flags before browser navigation, snapshots, search extraction, or browser clicks. Use workspace_browser_click for CSS selector, visible text, or page viewport-coordinate clicks. Use workspace_run_in_terminal for TUI apps, then workspace_terminal_read for exact pane text and workspace_terminal_input for batched focus-independent keys/text. \
 workspace_open_viewer is host-visible and open-world; it can launch the GPUI monitor unless this MCP process was started with --headless or workspace_doctor reports ready_for_host_viewer=false, in which case it must run without host-visible UI. Use workspace_list_viewers and workspace_close_viewer for repo-owned GPUI viewer lifecycle control when compositor/window automation cannot see or close the viewer; workspace_close_viewer only signals registered viewer pids whose command line still matches the registry entry, and dry_run=true previews the close. Use workspace_guardrails to inspect acknowledgement, dry-run, explicit override, timeout-termination, and workspace-scope rules for UI approval flows. Use workspace_doctor to check runtime readiness, viewer host-display readiness, and optional policy backend candidates. Use profile_list/profile_get/profile_check/profile_validate/profile_template/profile_put/profile_import/profile_export/profile_delete to manage saved environment profiles. Use profile_validate to preflight a local JSON profile file without saving it. Use profile_export to return a saved profile and optionally write it to output_path; set replace=true only when intentionally overwriting an existing file. Use profile_put with dry_run=true to preview whether a profile would be created, replaced, or rejected without writing. Use profile_import when the UI has a local JSON file path instead of an already parsed profile object. Use profile_delete with dry_run=true to return the saved profile without deleting it. profile_template can generate starter JSON such as project-dev, restricted-chrome, and browser-session before saving with profile_put; restricted-chrome and browser-session intentionally expose their --no-sandbox browser commands for bubblewrap namespace compatibility. browser-session requires user_data_dir and is intended only for explicitly user-approved browser data directories. profile_check preflights acknowledgement requirements and unenforced policy warnings before workspace_start. Preview scope matters: workspace_start dry_run=true and workspace_open_profile dry_run=true are pre-daemon approval previews that do not create runtime state; workspace_launch_app, workspace_run_app, workspace_run_profile_setup, and workspace_launch_profile_apps dry_run=true are daemon-attached previews and require an already running workspace. Dry-run preview responses include an approval bundle when acknowledgement UI data is available. workspace_start requires acknowledge_hidden_workspace=true before creating a new hidden agent-controlled environment. Pass purpose when a human-readable reason should be shown in workspace_status and the start event. If a profile requests policy that remains unenforced, workspace_start also requires acknowledge_unenforced_policy=true. Mount profiles, disabled-network profiles, and local_only network profiles are enforced with bubblewrap when bubblewrap is available; local_only uses a loopback-only sandbox namespace and does not bridge host localhost services. The current product network modes are closed/disabled, local/local_only, and open/inherit_host; allowlist network profiles are advanced/legacy declared intent only and are not enforced by the X11 runtime. workspace_status reports live daemon state, including the applied profile policy snapshot, discovered backend candidates from start time, and enforcement state. Use workspace_manifest to inspect saved manifest state from disk for live or stopped workspaces without contacting the workspace daemon. Use workspace_artifacts to inventory saved runtime files such as manifest, event log, daemon logs, app logs, and screenshots when present; set existing_only=true when only present paths are needed. Use workspace_ipc_info to verify daemon IPC protocol metadata, transport, framing, encoding, and socket path. Use workspace_env to get DISPLAY, XAUTHORITY, runtime directory, and control socket values for external tools that need to attach to the hidden workspace. Use workspace_list to discover known/running workspaces and workspace_cleanup_stale with dry_run=true to preview unreachable runtime directories and verified orphan process cleanup before deletion. Use workspace_list_apps to inspect launched apps, including named apps and running/stopped state; it can read the saved app snapshot after a workspace has stopped. Use workspace_browser_targets after launching Chrome/Chromium with --remote-debugging-port=0 to discover workspace-owned page targets, workspace_browser_snapshot to read page title/text/links, and workspace_browser_navigate to change the workspace browser page without using the host Chrome bridge or external browser automation. App action and log-read responses include the directly affected app in the top-level apps field when available. Use workspace_open_profile to start a profile-backed workspace, optionally wait for setup, and open startup apps after setup succeeds in one call. Use workspace_start before launching apps manually. workspace_launch_profile_apps opens startup apps declared by the selected profile. workspace_run_app is the preferred one-shot helper for QA commands that should return stdout/stderr; set kill_on_timeout=true to terminate timed-out commands. workspace_wait_app also accepts kill_on_timeout=true to terminate an already launched app when its wait timeout elapses. workspace_launch_app and workspace_run_app accept optional names, workspace_list_apps can filter by app name or running pid or app_id, and named apps can be referenced anywhere an app target is accepted, including logs, waits, kill dry-runs, kills, and window app_id filters. workspace_launch_app, workspace_run_profile_setup, workspace_focus_window, workspace_focus_matching_window, workspace_close_window, workspace_close_matching_window, workspace_move_window, workspace_resize_window, workspace_raise_window, workspace_minimize_window, workspace_show_window, workspace_click, workspace_click_window, workspace_move_pointer, workspace_move_pointer_window, workspace_drag, workspace_drag_window, workspace_scroll, workspace_scroll_window, workspace_key, workspace_key_window, workspace_type_text, workspace_type_window, workspace_set_clipboard, workspace_get_clipboard, workspace_paste_text, and workspace_paste_window run only inside the isolated agent workspace; they do not target the user's host desktop. Use workspace_wait_window, workspace_active_window, workspace_pointer, workspace_observe, workspace_focus_matching_window, workspace_move_window, workspace_resize_window, workspace_raise_window, workspace_minimize_window, workspace_show_window, workspace_click_window, workspace_move_pointer_window, workspace_drag_window, workspace_scroll_window, workspace_key_window, workspace_type_window, or workspace_paste_window after launching GUI apps. Prefer window-targeted tools when acting on a specific app window rather than the workspace root or current focus. Window match filters accept title_contains, class_contains, pid, or app_id; class_contains matches wm_class and wm_instance. Use workspace_move_window, workspace_resize_window, workspace_raise_window, workspace_minimize_window, and workspace_show_window to arrange app windows before screenshots or repeated QA interactions. workspace_show_window match filters include hidden windows, so it can restore minimized apps by title/class/pid/app without first listing its raw X11 id. Use workspace_list_windows with title_contains, class_contains, pid, or app_id filters to inspect specific current app windows. Use workspace_list_windows or workspace_observe with include_hidden=true when a minimized or hidden app needs to be found again; returned windows include wm_class, wm_instance, and app_id when X11/process metadata is available. Use workspace_paste_text or workspace_paste_window when inserting long text is more reliable than synthetic typing. Use workspace_run_profile_setup with wait=true when setup command completion matters; set kill_on_timeout=true to clean up timed-out setup commands. Use workspace_status or workspace_observe when a full live app snapshot is useful. Use workspace_observe, workspace_screenshot, workspace_screenshot_window, workspace_list_apps, workspace_browser_targets, workspace_browser_snapshot, workspace_list_windows, workspace_active_window, workspace_pointer, workspace_wait_app, workspace_read_app_log, workspace_get_clipboard, and workspace_events to inspect the workspace before acting. For incremental event polling, pass workspace_events since_sequence with the last seen event sequence. workspace_screenshot_window captures a specific app window by id/title/class/pid/app filters. workspace_read_app_log can read saved stdout/stderr after a workspace has stopped when its manifest remains on disk. workspace_events records IPC activity without storing raw typed text, raw clipboard-set text, or raw pasted text, and can read saved event history after a workspace has stopped. workspace_close_window, workspace_close_matching_window, workspace_kill_app, workspace_minimize_window, and workspace_show_window affect only workspace-local windows/apps. workspace_close_window and workspace_close_matching_window with dry_run=true resolve the targeted window without closing it. workspace_kill_app with dry_run=true resolves the matched app without terminating it. workspace_stop with dry_run=true previews currently running apps without stopping; without dry_run it terminates the workspace and apps launched inside it, then waits for the daemon IPC socket to close."
 )]
-impl ServerHandler for AgentWorkspaceLinux {}
+impl ServerHandler for AgentWorkspaceLinux {
+    // overridden so advertised tool schemas pass strict validators — the macro
+    // skips generating these when they are user-provided
+    async fn list_tools(
+        &self,
+        _request: Option<rmcp::model::PaginatedRequestParams>,
+        _context: rmcp::service::RequestContext<rmcp::RoleServer>,
+    ) -> Result<rmcp::model::ListToolsResult, rmcp::ErrorData> {
+        let mut tools = Self::tool_router().list_all();
+        for tool in &mut tools {
+            sanitize_tool_schema(tool);
+        }
+        Ok(rmcp::model::ListToolsResult::with_all_items(tools))
+    }
+
+    fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
+        let mut tool = Self::tool_router().get(name).cloned()?;
+        sanitize_tool_schema(&mut tool);
+        Some(tool)
+    }
+}
 
 pub async fn serve_mcp(permissions: McpPermissionState, headless: bool) -> Result<()> {
     AgentWorkspaceLinux::new(permissions, headless)
