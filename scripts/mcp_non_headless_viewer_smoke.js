@@ -15,6 +15,21 @@ if (!fs.existsSync(bin)) {
   throw new Error(`agent-workspace-linux binary not found at ${bin}; run cargo build first`);
 }
 
+// Everything below asserts the shape of a session that can open a host-visible
+// viewer: ready_for_host_viewer=true, viewer steps present in the task plan,
+// auto-open on workspace_start. On a machine with no host display the MCP is
+// right to report the viewer unavailable, so running these assertions there only
+// produces a failure that says nothing about the code — which is exactly what a
+// headless contributor hit on #69. mcp_no_host_display_viewer_smoke.js is the
+// smoke that covers that session shape. Empty is absent, matching the
+// non-empty-var check in host_display_check().
+if (!process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
+  console.log(
+    "non-headless mcp viewer smoke skipped: no DISPLAY or WAYLAND_DISPLAY (run it from a desktop session)",
+  );
+  process.exit(0);
+}
+
 const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-workspace-non-headless-mcp-smoke-"));
 const configDir = path.join(tempDir, "config");
 const runtimeDir = path.join(tempDir, "runtime");
