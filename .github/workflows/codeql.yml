@@ -1,0 +1,67 @@
+name: CodeQL
+
+# CodeQL *default* setup never produced an analysis for pull requests from
+# forks, so the `code_scanning` rule on `main` was unsatisfiable for external
+# contributions and every one of them needed an admin override to merge (#69).
+# A workflow in the repository does run for fork pull requests, so this
+# advanced setup gives the required check to contributors and maintainers
+# alike. Default setup is disabled; re-enabling it would make these uploads
+# conflict.
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+  schedule:
+    # Keep the weekly sweep default setup used to run, so newly published
+    # queries reach `main` without waiting for the next push.
+    - cron: "27 4 * * 1"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: codeql-${{ github.ref }}
+  # Superseded pull request runs are disposable; scheduled and `main` runs are
+  # the ones alerts are attributed to, so let those finish.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  analyze:
+    name: CodeQL (${{ matrix.language }})
+    runs-on: ubuntu-latest
+
+    permissions:
+      # Upload SARIF results to the code scanning API.
+      security-events: write
+      contents: read
+      actions: read
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # `none` keeps every analysis source-based, so no system packages, no
+          # gpui git checkout, and no full build per pull request.
+          - language: actions
+            build-mode: none
+          - language: javascript-typescript
+            build-mode: none
+          - language: rust
+            build-mode: none
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Initialize CodeQL
+        uses: github/codeql-action/init@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: ${{ matrix.build-mode }}
+          # Matches the suite default setup was configured with.
+          queries: security-extended
+
+      - name: Analyze
+        uses: github/codeql-action/analyze@ff2f1c621b7f889edc0d3c761ac2e6a3f8cdb0dd # v4.37.7
+        with:
+          category: "/language:${{ matrix.language }}"
