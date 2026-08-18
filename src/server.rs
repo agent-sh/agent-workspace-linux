@@ -3134,7 +3134,7 @@ impl ServerHandler for AgentWorkspaceLinux {
             sanitize_tool_schema(tool);
         }
         Ok(rmcp::model::ListToolsResult::with_all_items(tools)
-            .with_ttl_ms(0)
+            .with_ttl_ms(3_600_000)
             .with_cache_scope(CacheScope::Private))
     }
 
