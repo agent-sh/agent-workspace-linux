@@ -12,6 +12,7 @@ use crate::workspace::{
 use anyhow::{bail, Result};
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
+    model::CacheScope,
     schemars::JsonSchema,
     tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
@@ -3132,7 +3133,9 @@ impl ServerHandler for AgentWorkspaceLinux {
         for tool in &mut tools {
             sanitize_tool_schema(tool);
         }
-        Ok(rmcp::model::ListToolsResult::with_all_items(tools))
+        Ok(rmcp::model::ListToolsResult::with_all_items(tools)
+            .with_ttl_ms(0)
+            .with_cache_scope(CacheScope::Private))
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
