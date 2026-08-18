@@ -10068,6 +10068,7 @@ mod tests {
     use super::*;
     use rmcp::ServerHandler;
     use std::fs;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     #[test]
     fn mcp_server_version_matches_crate_version() {
@@ -10078,6 +10079,70 @@ mod tests {
         let info = AgentWorkspaceLinux::default().get_info();
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(info.server_info.name, "agent-workspace-linux");
+    }
+
+    #[tokio::test]
+    async fn tools_list_sets_required_cache_metadata() {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            AgentWorkspaceLinux::default()
+                .serve(server_transport)
+                .await
+                .expect("server should start")
+                .waiting()
+                .await
+                .expect("server should stop cleanly");
+        });
+
+        let (client_read, mut client_write) = tokio::io::split(client_transport);
+        let mut client_read = BufReader::new(client_read);
+        client_write
+            .write_all(
+                br#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2026-07-28","capabilities":{},"clientInfo":{"name":"test-client","version":"1"}}}
+"#,
+            )
+            .await
+            .expect("initialize request should be written");
+
+        let mut response = String::new();
+        client_read
+            .read_line(&mut response)
+            .await
+            .expect("initialize response should be read");
+        let response: serde_json::Value =
+            serde_json::from_str(&response).expect("initialize response should be JSON");
+        assert_eq!(response["id"], 1);
+
+        client_write
+            .write_all(
+                br#"{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+"#,
+            )
+            .await
+            .expect("tools/list request should be written");
+
+        let mut response = String::new();
+        client_read
+            .read_line(&mut response)
+            .await
+            .expect("tools/list response should be read");
+        let response: serde_json::Value =
+            serde_json::from_str(&response).expect("tools/list response should be JSON");
+
+        assert_eq!(response["id"], 2);
+        assert!(
+            response["result"].get("ttlMs").is_some(),
+            "tools/list should set ttlMs"
+        );
+        assert!(
+            response["result"].get("cacheScope").is_some(),
+            "tools/list should set cacheScope"
+        );
+
+        drop(client_read);
+        drop(client_write);
+        server_handle.await.expect("server task should finish");
     }
 
     fn catalog_tool<'a>(catalog: &'a McpActionCatalog, name: &str) -> &'a McpActionInfo {
