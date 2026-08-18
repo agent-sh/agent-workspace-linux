@@ -12,11 +12,19 @@ use crate::workspace::{
 use anyhow::{bail, Result};
 use rmcp::{
     handler::server::wrapper::{Json, Parameters},
+    model::CacheScope,
     schemars::JsonSchema,
     tool, tool_handler, tool_router, ServerHandler, ServiceExt,
 };
 use serde::{Deserialize, Serialize};
 use std::{collections::BTreeSet, path::PathBuf};
+
+/// How long clients may treat a `tools/list` result as fresh (SEP-2549).
+///
+/// The advertised tool set comes from the static `tool_router()`, and control
+/// mode and the permission ceiling are enforced when a tool is called rather
+/// than by filtering this list, so it cannot go stale while the process lives.
+const TOOLS_LIST_TTL_MS: u64 = 3_600_000;
 
 #[derive(Clone, Default)]
 pub struct AgentWorkspaceLinux {
@@ -3132,7 +3140,9 @@ impl ServerHandler for AgentWorkspaceLinux {
         for tool in &mut tools {
             sanitize_tool_schema(tool);
         }
-        Ok(rmcp::model::ListToolsResult::with_all_items(tools))
+        Ok(rmcp::model::ListToolsResult::with_all_items(tools)
+            .with_ttl_ms(TOOLS_LIST_TTL_MS)
+            .with_cache_scope(CacheScope::Private))
     }
 
     fn get_tool(&self, name: &str) -> Option<rmcp::model::Tool> {
@@ -10065,6 +10075,7 @@ mod tests {
     use super::*;
     use rmcp::ServerHandler;
     use std::fs;
+    use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     #[test]
     fn mcp_server_version_matches_crate_version() {
@@ -10075,6 +10086,112 @@ mod tests {
         let info = AgentWorkspaceLinux::default().get_info();
         assert_eq!(info.server_info.version, env!("CARGO_PKG_VERSION"));
         assert_eq!(info.server_info.name, "agent-workspace-linux");
+    }
+
+    /// Read frames until the response for `id` arrives, skipping notifications
+    /// and anything else the server may interleave ahead of it.
+    async fn read_response<R: AsyncBufRead + Unpin>(reader: &mut R, id: u64) -> serde_json::Value {
+        loop {
+            let mut line = String::new();
+            let read = reader
+                .read_line(&mut line)
+                .await
+                .expect("server frame should be read");
+            assert!(read > 0, "server closed before responding to id {id}");
+            let frame: serde_json::Value =
+                serde_json::from_str(&line).expect("server frame should be JSON");
+            if frame["id"].as_u64() == Some(id) {
+                return frame;
+            }
+        }
+    }
+
+    /// Drive initialize plus `tools/list` against an in-process server on the
+    /// given protocol version and return the `tools/list` result object.
+    async fn tools_list_result(protocol_version: &str) -> serde_json::Value {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            AgentWorkspaceLinux::default()
+                .serve(server_transport)
+                .await
+                .expect("server should start")
+                .waiting()
+                .await
+                .expect("server should stop cleanly");
+        });
+
+        let (client_read, mut client_write) = tokio::io::split(client_transport);
+        let mut client_read = BufReader::new(client_read);
+        client_write
+            .write_all(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{"protocolVersion":"{protocol_version}","capabilities":{{}},"clientInfo":{{"name":"test-client","version":"1"}}}}}}
+"#
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("initialize request should be written");
+        let initialized = read_response(&mut client_read, 1).await;
+        assert_eq!(
+            initialized["result"]["protocolVersion"], protocol_version,
+            "server should negotiate the requested protocol version"
+        );
+
+        client_write
+            .write_all(
+                br#"{"jsonrpc":"2.0","method":"notifications/initialized"}
+{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{}}
+"#,
+            )
+            .await
+            .expect("tools/list request should be written");
+        let listed = read_response(&mut client_read, 2).await;
+
+        drop(client_read);
+        drop(client_write);
+        // Bounded so a server that stops shutting down on client disconnect
+        // fails the test instead of hanging the run.
+        tokio::time::timeout(std::time::Duration::from_secs(10), server_handle)
+            .await
+            .expect("server task should finish after the client disconnects")
+            .expect("server task should not panic");
+
+        listed["result"].clone()
+    }
+
+    #[tokio::test]
+    async fn tools_list_sets_required_cache_metadata() {
+        let result = tools_list_result("2026-07-28").await;
+
+        // SEP-2549 requires both fields at 2026-07-28, and asserting the values
+        // rather than their presence keeps a `ttlMs: 0` regression — present on
+        // the wire but useless to a client — from passing this test.
+        assert_eq!(result["ttlMs"].as_u64(), Some(TOOLS_LIST_TTL_MS));
+        assert_eq!(result["cacheScope"], "private");
+        // SEP-2322.
+        assert_eq!(result["resultType"], "complete");
+        assert!(
+            !result["tools"]
+                .as_array()
+                .expect("tools should be an array")
+                .is_empty(),
+            "tools/list should advertise the tool set"
+        );
+    }
+
+    #[tokio::test]
+    async fn tools_list_keeps_legacy_wire_shape() {
+        let result = tools_list_result("2025-06-18").await;
+
+        // Peers older than 2026-07-28 keep the legacy shape: rmcp strips
+        // `resultType`, while the cache fields stay as ignorable extras.
+        assert!(
+            result.get("resultType").is_none(),
+            "legacy peers should not receive resultType: {result}"
+        );
+        assert_eq!(result["ttlMs"].as_u64(), Some(TOOLS_LIST_TTL_MS));
+        assert_eq!(result["cacheScope"], "private");
     }
 
     fn catalog_tool<'a>(catalog: &'a McpActionCatalog, name: &str) -> &'a McpActionInfo {
