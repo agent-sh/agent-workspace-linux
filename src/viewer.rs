@@ -4360,7 +4360,7 @@ fn capture_screenshot(id: &str) -> Result<ViewerFrame> {
     let img = image::load_from_memory(&bytes)?.to_rgba8();
     let (width, height) = img.dimensions();
     let mut bgra = img.into_raw();
-    for pixel in bgra.chunks_exact_mut(4) {
+    for pixel in bgra.as_chunks_mut::<4>().0 {
         pixel.swap(0, 2);
     }
     let buffer: ImageBuffer<image::Rgba<u8>, _> =
