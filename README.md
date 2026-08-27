@@ -12,6 +12,8 @@
 </p>
 <p align="center"><em>The floating viewer (right) shows the agent doing live website QA inside the hidden workspace, while a Claude Code session (left) drives it. Your real desktop stays yours.</em></p>
 
+> ⚡ Running this agent 24/7? [**tiyuvta inference**](https://inference.tiyuvta.ai) — hosted LLM inference built for always-on agents, OpenAI/Anthropic-compatible APIs.
+
 Agents that "use a computer" normally take over *your* screen — they move your mouse, steal focus, and drive your logged-in browser. `agent-workspace-linux` gives the agent its **own** desktop instead: a headless X11 display with its own window manager, apps, clipboard, and browser. The agent launches apps, types, clicks, screenshots, and browses there; you can watch (and pause) through a small floating viewer. It speaks [MCP](https://modelcontextprotocol.io) over stdio, so it drops into Claude Code, Codex, and other MCP hosts.
 
 ## Why this project
