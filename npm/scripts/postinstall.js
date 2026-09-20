@@ -117,80 +117,147 @@ function sweepStaleStagingDirs() {
 
 // ── Download helper (follows redirects, max 5 hops) ─────────────────────────
 
+// Fail a download after a full minute without useful network progress. This
+// catches missing headers and stalled response bodies without penalizing a slow
+// connection that is still delivering bytes. Keep a separate generous ceiling
+// so a pathological transfer cannot keep npm install alive forever.
+const DOWNLOAD_IDLE_TIMEOUT_MS = 60 * 1000;
+const DOWNLOAD_MAX_DURATION_MS = 30 * 60 * 1000;
+
 /**
  * Download `url` to `tmpFile`, following up to `maxRedirects` 3xx responses.
- * Resolves when the file is fully written, rejects on error or bad status.
+ * Resolves when the file is fully written. Rejects on transport/status errors,
+ * after DOWNLOAD_IDLE_TIMEOUT_MS without headers/body progress, or when the
+ * generous DOWNLOAD_MAX_DURATION_MS hard ceiling is reached.
  */
 function download(url, tmpFile, maxRedirects = 5) {
   return new Promise((resolve, reject) => {
-    function get(currentUrl, hopsLeft) {
-      try {
-        https
-          .get(currentUrl, { headers: { "User-Agent": "node-fetch/postinstall" } }, (res) => {
-            const { statusCode, headers } = res;
+    let settled = false;
+    let out = null;
+    let idleTimer = null;
+    let maxDurationTimer = null;
+    const requests = new Set();
+    const responses = new Set();
 
-            // Follow redirects (GitHub releases always redirect to S3).
-            if (statusCode >= 300 && statusCode < 400 && headers.location) {
-              if (hopsLeft === 0) {
-                res.resume();
-                return reject(new Error(`Too many redirects downloading ${url}`));
-              }
-              res.resume(); // drain and ignore body
+    function settle(err) {
+      if (settled) return;
+      settled = true;
+      clearTimeout(idleTimer);
+      clearTimeout(maxDurationTimer);
+      if (!err) return resolve();
 
-              // Location may be relative, query-only or protocol-relative
-              // (RFC 7231 allows all three), so resolve it against the URL we
-              // just requested instead of handing it to https.get verbatim.
-              let nextUrl;
-              try {
-                nextUrl = new URL(headers.location, currentUrl);
-              } catch (_) {
-                return reject(
-                  new Error(`Invalid redirect location downloading ${url}`)
-                );
-              }
-              if (nextUrl.protocol !== "https:") {
-                return reject(
-                  new Error(`Refusing non-HTTPS redirect downloading ${url}`)
-                );
-              }
-              return get(nextUrl.href, hopsLeft - 1);
-            }
+      for (const req of requests) req.destroy();
+      for (const res of responses) res.destroy();
 
-            if (statusCode !== 200) {
-              res.resume();
-              return reject(
-                new Error(
-                  `Failed to download ${url}: HTTP ${statusCode}. ` +
-                    "Check that the release exists, includes the binary and .sha256 sidecar, " +
-                    "and the version in package.json matches."
-                )
-              );
-            }
-
-            const out = fs.createWriteStream(tmpFile);
-            res.pipe(out);
-            out.on("finish", () => out.close(resolve));
-            out.on("error", (err) => {
-              fs.unlink(tmpFile, () => {}); // best-effort cleanup
-              reject(err);
-            });
-            res.on("error", (err) => {
-              fs.unlink(tmpFile, () => {});
-              reject(err);
-            });
-          })
-          .on("error", (err) => {
-            fs.unlink(tmpFile, () => {});
-            reject(err);
-          });
-      } catch (err) {
-        // https.get throws synchronously on an unusable target; from inside a
-        // response callback that would be an uncaught exception, so reject.
-        fs.unlink(tmpFile, () => {});
-        reject(err);
+      const removePartial = () => fs.unlink(tmpFile, () => reject(err));
+      if (out && !out.closed) {
+        out.once("close", removePartial);
+        out.destroy();
+      } else {
+        removePartial();
       }
     }
 
+    function resetIdleTimer() {
+      if (settled) return;
+      clearTimeout(idleTimer);
+      idleTimer = setTimeout(
+        () =>
+          settle(
+            new Error(
+              `No download progress for ${DOWNLOAD_IDLE_TIMEOUT_MS} ms downloading ${url}`
+            )
+          ),
+        DOWNLOAD_IDLE_TIMEOUT_MS
+      );
+    }
+
+    function get(currentUrl, hopsLeft) {
+      if (settled) return;
+      try {
+        const req = https.get(
+          currentUrl,
+          { headers: { "User-Agent": "node-fetch/postinstall" } },
+          (res) => {
+            responses.add(res);
+            res.once("close", () => responses.delete(res));
+            res.on("error", settle);
+            if (settled) {
+              res.destroy();
+              return;
+            }
+
+            // Response headers are progress. A successful body must continue to
+            // reset this timer whenever bytes arrive.
+            resetIdleTimer();
+
+            try {
+              const { statusCode, headers } = res;
+
+              if (statusCode >= 300 && statusCode < 400 && headers.location) {
+                res.resume();
+                if (hopsLeft === 0) {
+                  settle(new Error(`Too many redirects downloading ${url}`));
+                  return;
+                }
+
+                // Keep #98 intact: resolve relative redirects against the
+                // current URL and never permit a downgrade away from HTTPS.
+                let nextUrl;
+                try {
+                  nextUrl = new URL(headers.location, currentUrl);
+                } catch (_) {
+                  settle(new Error(`Invalid redirect location downloading ${url}`));
+                  return;
+                }
+                if (nextUrl.protocol !== "https:") {
+                  settle(new Error(`Refusing non-HTTPS redirect downloading ${url}`));
+                  return;
+                }
+                get(nextUrl.href, hopsLeft - 1);
+                return;
+              }
+
+              if (statusCode !== 200) {
+                res.resume();
+                settle(
+                  new Error(
+                    `Failed to download ${url}: HTTP ${statusCode}. ` +
+                      "Check that the release exists, includes the binary and .sha256 sidecar, " +
+                      "and the version in package.json matches."
+                  )
+                );
+                return;
+              }
+
+              out = fs.createWriteStream(tmpFile);
+              out.on("error", settle);
+              out.on("finish", () => out.close((err) => settle(err || null)));
+              res.on("data", resetIdleTimer);
+              res.pipe(out);
+            } catch (err) {
+              settle(err);
+            }
+          }
+        );
+        requests.add(req);
+        req.once("close", () => requests.delete(req));
+        req.on("error", settle);
+      } catch (err) {
+        settle(err);
+      }
+    }
+
+    maxDurationTimer = setTimeout(
+      () =>
+        settle(
+          new Error(
+            `Download exceeded ${DOWNLOAD_MAX_DURATION_MS} ms downloading ${url}`
+          )
+        ),
+      DOWNLOAD_MAX_DURATION_MS
+    );
+    resetIdleTimer();
     get(url, maxRedirects);
   });
 }

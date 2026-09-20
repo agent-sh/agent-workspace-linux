@@ -23,6 +23,12 @@ Release downloads accept absolute or relative HTTPS redirect locations, with
 a maximum of five redirect hops. Malformed URLs and non-HTTPS redirect targets
 fail the download; redirects do not bypass the required checksum verification.
 
+Each binary or checksum download has a 60-second inactivity timeout while waiting
+for response headers or body progress. The timer resets whenever bytes arrive, so
+a slow transfer that is still making progress can continue. A separate 30-minute
+hard ceiling only bounds pathological transfers. Timeout failures close the active
+output and remove its partial file before a retry can begin.
+
 Checksum sidecars must contain a valid 64-hex-digit SHA-256 digest and name the
 expected release asset. Space and tab separators are accepted. A bare digest or
 an entry naming a different asset is rejected.
