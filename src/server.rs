@@ -10184,12 +10184,14 @@ mod tests {
         assert_eq!(result["cacheScope"], "private");
         // SEP-2322. rmcp >= 3.2 negotiates a 2026-07-28 `initialize` down to
         // the newest legacy version (2026-07-28 is discovery-only) and strips
-        // `resultType` for legacy peers, so it is absent here by design. If a
-        // future rmcp negotiates 2026-07-28 over `initialize` again, it must
-        // come back as "complete".
-        if let Some(result_type) = result.get("resultType") {
-            assert_eq!(result_type, "complete");
-        }
+        // `resultType` for legacy peers, so it must be absent here. If a future
+        // rmcp negotiates 2026-07-28 over `initialize` again this assertion
+        // will fail and should flip back to `== "complete"`.
+        assert!(
+            result.get("resultType").is_none(),
+            "resultType must be stripped for a legacy-negotiated peer, got {:?}",
+            result.get("resultType")
+        );
         assert!(
             !result["tools"]
                 .as_array()
