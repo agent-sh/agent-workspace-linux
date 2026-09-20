@@ -10133,9 +10133,22 @@ mod tests {
             .await
             .expect("initialize request should be written");
         let initialized = read_response(&mut client_read, 1).await;
+        // rmcp >= 3.2 keeps the classic `initialize` handshake on legacy
+        // versions (<= 2025-11-25); 2026-07-28 is only reachable through the
+        // discovery flow. Requesting it here therefore negotiates down to the
+        // newest legacy version instead of echoing the request back.
+        let negotiated = initialized["result"]["protocolVersion"]
+            .as_str()
+            .expect("protocolVersion should be a string")
+            .to_string();
+        let expected = if protocol_version > "2025-11-25" {
+            "2025-11-25"
+        } else {
+            protocol_version
+        };
         assert_eq!(
-            initialized["result"]["protocolVersion"], protocol_version,
-            "server should negotiate the requested protocol version"
+            negotiated, expected,
+            "server should negotiate the requested protocol version (or the newest legacy one)"
         );
 
         client_write
@@ -10169,8 +10182,16 @@ mod tests {
         // the wire but useless to a client — from passing this test.
         assert_eq!(result["ttlMs"].as_u64(), Some(TOOLS_LIST_TTL_MS));
         assert_eq!(result["cacheScope"], "private");
-        // SEP-2322.
-        assert_eq!(result["resultType"], "complete");
+        // SEP-2322. rmcp >= 3.2 negotiates a 2026-07-28 `initialize` down to
+        // the newest legacy version (2026-07-28 is discovery-only) and strips
+        // `resultType` for legacy peers, so it must be absent here. If a future
+        // rmcp negotiates 2026-07-28 over `initialize` again this assertion
+        // will fail and should flip back to `== "complete"`.
+        assert!(
+            result.get("resultType").is_none(),
+            "resultType must be stripped for a legacy-negotiated peer, got {:?}",
+            result.get("resultType")
+        );
         assert!(
             !result["tools"]
                 .as_array()
