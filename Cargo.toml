@@ -28,6 +28,9 @@ serde_json = "1.0"
 tokio = { version = "1.51", features = ["macros", "rt"] }
 x11rb = { version = "0.14.0", features = ["xtest"] }
 
+[dev-dependencies]
+rmcp = { version = "3.0.0", features = ["client"] }
+
 [profile.release]
 codegen-units = 1
 opt-level = 3

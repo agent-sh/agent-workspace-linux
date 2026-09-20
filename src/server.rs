@@ -10073,7 +10073,14 @@ fn push_unique(values: &mut Vec<String>, value: String) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rmcp::ServerHandler;
+    use rmcp::{
+        model::{
+            CacheScope, ClientConfig, InitializeResult, ListToolsResult, ProtocolVersion,
+            ResultType,
+        },
+        service::serve_directly,
+        ClientHandler, RoleClient, RoleServer, ServerHandler,
+    };
     use std::fs;
     use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 
@@ -10173,6 +10180,60 @@ mod tests {
         listed["result"].clone()
     }
 
+    #[derive(Debug, Clone)]
+    struct VersionedClient {
+        protocol_version: ProtocolVersion,
+    }
+
+    impl ClientHandler for VersionedClient {
+        fn get_info(&self) -> ClientConfig {
+            let mut info = ClientConfig::default();
+            info.protocol_version = self.protocol_version.clone();
+            info
+        }
+    }
+
+    /// Exercise the post-discovery lifecycle with the protocol version already
+    /// selected, matching the path used by 2026-07-28 clients.
+    async fn discovered_tools_list_result() -> ListToolsResult {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let protocol_version = ProtocolVersion::V_2026_07_28;
+        let client_handler = VersionedClient {
+            protocol_version: protocol_version.clone(),
+        };
+        let mut server_peer_info = InitializeResult::default();
+        server_peer_info.protocol_version = protocol_version;
+
+        let server = serve_directly::<RoleServer, _, _, _, _>(
+            AgentWorkspaceLinux::default(),
+            server_transport,
+            Some(client_handler.get_info()),
+        );
+        let server_handle = tokio::spawn(async move {
+            server.waiting().await.expect("server should stop cleanly");
+        });
+        let client = serve_directly::<RoleClient, _, _, _, _>(
+            client_handler,
+            client_transport,
+            Some(server_peer_info.into()),
+        );
+
+        let result =
+            tokio::time::timeout(std::time::Duration::from_secs(10), client.list_tools(None))
+                .await
+                .expect("tools/list should complete")
+                .expect("tools/list should succeed after discovery");
+        tokio::time::timeout(std::time::Duration::from_secs(10), client.cancel())
+            .await
+            .expect("client cancellation should complete")
+            .expect("client should cancel");
+        tokio::time::timeout(std::time::Duration::from_secs(10), server_handle)
+            .await
+            .expect("server task should finish after client cancellation")
+            .expect("server task should not panic");
+        result
+    }
+
     #[tokio::test]
     async fn tools_list_sets_required_cache_metadata() {
         let result = tools_list_result("2026-07-28").await;
@@ -10213,6 +10274,14 @@ mod tests {
         );
         assert_eq!(result["ttlMs"].as_u64(), Some(TOOLS_LIST_TTL_MS));
         assert_eq!(result["cacheScope"], "private");
+    }
+
+    #[tokio::test]
+    async fn tools_list_sets_complete_for_discovered_2026_07_28_peer() {
+        let result = discovered_tools_list_result().await;
+        assert_eq!(result.result_type, Some(ResultType::COMPLETE));
+        assert_eq!(result.ttl_ms, Some(TOOLS_LIST_TTL_MS));
+        assert_eq!(result.cache_scope, Some(CacheScope::Private));
     }
 
     fn catalog_tool<'a>(catalog: &'a McpActionCatalog, name: &str) -> &'a McpActionInfo {
