@@ -10160,16 +10160,77 @@ mod tests {
         listed["result"].clone()
     }
 
+    /// Drive the 2026-07-28 discovery lifecycle. That revision is stateless,
+    /// so both discovery and the subsequent request carry their own metadata.
+    async fn modern_tools_list_result() -> serde_json::Value {
+        let (server_transport, client_transport) = tokio::io::duplex(64 * 1024);
+        let server_handle = tokio::spawn(async move {
+            AgentWorkspaceLinux::default()
+                .serve(server_transport)
+                .await
+                .expect("server should start")
+                .waiting()
+                .await
+                .expect("server should stop cleanly");
+        });
+
+        let (client_read, mut client_write) = tokio::io::split(client_transport);
+        let mut client_read = BufReader::new(client_read);
+        let meta = r#"{"io.modelcontextprotocol/protocolVersion":"2026-07-28","io.modelcontextprotocol/clientInfo":{"name":"test-client","version":"1"},"io.modelcontextprotocol/clientCapabilities":{}}"#;
+        client_write
+            .write_all(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":1,"method":"server/discover","params":{{"_meta":{meta}}}}}
+"#
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("discovery request should be written");
+        let discovery = read_response(&mut client_read, 1).await;
+        assert_eq!(discovery["result"]["resultType"], "complete");
+        assert!(
+            discovery["result"]["supportedVersions"]
+                .as_array()
+                .expect("discovery should list supported versions")
+                .iter()
+                .any(|version| version == "2026-07-28"),
+            "discovery should advertise the modern protocol: {discovery}"
+        );
+
+        client_write
+            .write_all(
+                format!(
+                    r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{"_meta":{meta}}}}}
+"#
+                )
+                .as_bytes(),
+            )
+            .await
+            .expect("modern tools/list request should be written");
+        let listed = read_response(&mut client_read, 2).await;
+
+        drop(client_read);
+        drop(client_write);
+        tokio::time::timeout(std::time::Duration::from_secs(10), server_handle)
+            .await
+            .expect("server task should finish after the client disconnects")
+            .expect("server task should not panic");
+
+        listed["result"].clone()
+    }
+
     #[tokio::test]
     async fn tools_list_sets_required_cache_metadata() {
-        let result = tools_list_result("2026-07-28").await;
+        let result = modern_tools_list_result().await;
 
         // SEP-2549 requires both fields at 2026-07-28, and asserting the values
         // rather than their presence keeps a `ttlMs: 0` regression — present on
         // the wire but useless to a client — from passing this test.
         assert_eq!(result["ttlMs"].as_u64(), Some(TOOLS_LIST_TTL_MS));
         assert_eq!(result["cacheScope"], "private");
-        // SEP-2322.
+        // SEP-2322. This exercises the actual 2026-07-28 discovery lifecycle,
+        // not an initialize request that rmcp correctly negotiates down.
         assert_eq!(result["resultType"], "complete");
         assert!(
             !result["tools"]
