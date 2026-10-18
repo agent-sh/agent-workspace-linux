@@ -102,3 +102,5 @@ checks the default and opt-in always-on-top window states, compact sizing,
 duplicate-launch reuse, and target-bound viewer teardown. It needs an X11 or
 Xwayland display plus `xclock`, `xdotool`, `xwininfo`, `xprop`, `xwd`, and
 ImageMagick (`convert`/`identify`).
+
+The X11 active-window fallback accepts visible application windows and their mapped input children. An empty workspace, including one whose last app has closed, does not expose Openbox support windows as application focus.

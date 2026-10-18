@@ -32,6 +32,7 @@ const BUTTON_RELEASE: u8 = 5;
 ///   drag  X1 Y1 X2 Y2 BUTTON
 ///   focus WINDOW_ID
 ///   focus-check WINDOW_ID
+///   content-check WINDOW_ID [VISIBLE_WORKSPACE_WINDOW_ID ...]
 pub fn run(args: &[String]) -> Result<()> {
     let (conn, screen_num) = x11rb::connect(None).context("XTEST: connect to workspace display")?;
     let root = conn.setup().roots[screen_num].root;
@@ -75,6 +76,26 @@ pub fn run(args: &[String]) -> Result<()> {
     };
 
     match args.first().map(String::as_str) {
+        Some("content-check") if args.len() >= 2 => {
+            let window: u32 = args[1].parse().context("invalid X11 window id")?;
+            let visible = args[2..]
+                .iter()
+                .map(|id| id.parse::<u32>())
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            let attributes = conn.get_window_attributes(window)?.reply()?;
+            let mut current = window;
+            let mut content = false;
+            if attributes.map_state == x11rb::protocol::xproto::MapState::VIEWABLE {
+                while current != 0 && current != root {
+                    if visible.contains(&current) {
+                        content = true;
+                        break;
+                    }
+                    current = conn.query_tree(current)?.reply()?.parent;
+                }
+            }
+            println!("{content}");
+        }
         Some("focus-check") if args.len() == 2 => {
             let window: u32 = args[1].parse().context("invalid X11 focus window id")?;
             println!("{}", focus_request_kind(&conn, window)?);

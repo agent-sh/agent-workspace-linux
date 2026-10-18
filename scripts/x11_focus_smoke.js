@@ -42,11 +42,19 @@ function waitForFile(file) {
     if (fs.existsSync(file)) { clearTimeout(timer); watcher.close(); resolve(); }
   });
 }
+function assertNoApplicationFocus() {
+  const empty = JSON.parse(run(bin, ["workspace", "active-window", "--id", id]));
+  assert.equal(empty.ok, false, "empty workspace has no application focus");
+  assert.equal(empty.message, "workspace active window not found");
+  assert.equal(empty.active_window ?? null, null);
+  assert.equal(cli("observe", "--id", id).active_window ?? null, null, "empty observation excludes WM internals");
+}
 async function main() {
 let primaryError;
 try {
   status = cli("start", "--id", id, "--ack-hidden-workspace", "--purpose", "Native focus regression smoke").status;
   const display = { DISPLAY: status.display, XAUTHORITY: status.xauthority_path };
+  assertNoApplicationFocus();
   const inputApp = cli("launch", "--id", id, "--name", "input", "--",
     "wish", path.join(__dirname, "fixtures", "focus-popup.tcl"), marker, childIdFile);
   const windowId = run("xdotool", ["search", "--sync", "--name", "^Focus smoke$"], display).trim().split("\n")[0];
@@ -78,7 +86,7 @@ try {
   }
 
   const managedMarker = path.join(root, "managed-received");
-  cli("launch", "--id", id, "--name", "managed-input", "--", "wish",
+  const managedApp = cli("launch", "--id", id, "--name", "managed-input", "--", "wish",
     path.join(__dirname, "fixtures", "focus-popup.tcl"), managedMarker, path.join(root, "managed-child"), "managed");
   const managedId = run("xdotool", ["search", "--sync", "--name", "^Managed focus smoke$"], display).trim().split("\n")[0];
   cli("focus-window", "--id", id, windowId);
@@ -87,6 +95,9 @@ try {
   cli("key", "--id", id, "Return");
   await waitForFile(managedMarker);
   assert.equal(fs.readFileSync(managedMarker, "utf8").trim(), "MANAGED_FOCUS_OK");
+  cli("kill-app", "--id", id, inputApp.apps[0].id);
+  cli("kill-app", "--id", id, managedApp.apps.find(app => app.name === "managed-input").id);
+  assertNoApplicationFocus();
   passed = true;
  } catch (error) {
   primaryError = error;
@@ -104,6 +115,6 @@ try {
   }
  }
  if (primaryError) throw primaryError;
- console.log(JSON.stringify({ ok: true, unmanaged_keyboard_input: true, managed_keyboard_input: true, descendant_focus_preserved: true, stale_active_window: true, cleanup: true }));
+ console.log(JSON.stringify({ ok: true, unmanaged_keyboard_input: true, managed_keyboard_input: true, descendant_focus_preserved: true, stale_active_window: true, empty_workspace: true, last_window_closed: true, cleanup: true }));
 }
 main().catch((error) => { console.error(error); process.exitCode = 1; });

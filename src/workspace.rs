@@ -7445,7 +7445,28 @@ fn active_workspace_window(status: &WorkspaceStatus) -> Result<Option<WorkspaceW
             continue;
         }
         match window_info(status, window_id) {
-            Ok(window) => return Ok(Some(window)),
+            Ok(window) => {
+                if query == "getwindowfocus" && !window.visible {
+                    // Openbox focuses an internal support window when no application
+                    // is active. An unnamed input child must belong to listed content.
+                    let exe = daemon_executable_path()
+                        .context("resolve executable for native visibility")?;
+                    let output = workspace_command(status, &exe)
+                        .args(["__xtest", "content-check", window_id])
+                        .args(search_workspace_window_ids(status, true)?)
+                        .output()
+                        .context("failed to query native workspace visibility")?;
+                    let viewable = match output_text(output, "native workspace visibility") {
+                        Ok(value) => value,
+                        Err(error) if format!("{error:#}").contains("BadWindow") => continue,
+                        Err(error) => return Err(error),
+                    };
+                    if viewable.trim() != "true" {
+                        continue;
+                    }
+                }
+                return Ok(Some(window));
+            }
             Err(error) if format!("{error:#}").contains("BadWindow") => continue,
             Err(error) => return Err(error),
         }
