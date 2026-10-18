@@ -1,4 +1,4 @@
-//! Synthetic pointer input via the XTEST extension.
+//! Native X11 input and focus.
 //!
 //! `xdotool mousemove` positions the pointer with `XWarpPointer`, a server-side
 //! warp that XInput2 clients (winit/egui, GTK4, …) do not observe as a
@@ -30,6 +30,8 @@ const BUTTON_RELEASE: u8 = 5;
 ///   click X Y BUTTON [COUNT]
 ///   scroll X Y BUTTON [COUNT]
 ///   drag  X1 Y1 X2 Y2 BUTTON
+///   focus WINDOW_ID
+///   focus-check WINDOW_ID
 pub fn run(args: &[String]) -> Result<()> {
     let (conn, screen_num) = x11rb::connect(None).context("XTEST: connect to workspace display")?;
     let root = conn.setup().roots[screen_num].root;
@@ -73,6 +75,14 @@ pub fn run(args: &[String]) -> Result<()> {
     };
 
     match args.first().map(String::as_str) {
+        Some("focus-check") if args.len() == 2 => {
+            let window: u32 = args[1].parse().context("invalid X11 focus window id")?;
+            println!("{}", focus_request_kind(&conn, window)?);
+        }
+        Some("focus") if args.len() == 2 => {
+            let window: u32 = args[1].parse().context("invalid X11 focus window id")?;
+            focus_window_on_connection(&conn, window)?;
+        }
         Some("move") if args.len() >= 3 => {
             motion(parse(&args[1], "x")?, parse(&args[2], "y")?)?;
         }
@@ -126,4 +136,80 @@ pub fn run(args: &[String]) -> Result<()> {
     // Round-trip so every faked event is processed before we exit.
     conn.get_input_focus()?.reply()?;
     Ok(())
+}
+
+// Only WM-managed top-level windows need an activation request. Popups and
+// input children use direct focus; sending EWMH for them can steal child focus.
+fn focus_request_kind(
+    conn: &x11rb::rust_connection::RustConnection,
+    target: u32,
+) -> Result<&'static str> {
+    if focus_is_within(conn, target)? {
+        return Ok("focused");
+    }
+    if conn
+        .get_window_attributes(target)?
+        .reply()?
+        .override_redirect
+    {
+        return Ok("direct");
+    }
+    let state = conn.intern_atom(true, b"WM_STATE")?.reply()?.atom;
+    if state == 0
+        || conn
+            .get_property(
+                false,
+                target,
+                state,
+                x11rb::protocol::xproto::AtomEnum::ANY,
+                0,
+                0,
+            )?
+            .reply()?
+            .type_
+            == 0
+    {
+        return Ok("direct");
+    }
+    Ok("managed")
+}
+
+// Focus is queried through X11, never inferred from window-manager text or titles.
+fn focus_is_within(conn: &x11rb::rust_connection::RustConnection, target: u32) -> Result<bool> {
+    let mut current = conn.get_input_focus()?.reply()?.focus;
+    while current > 1 {
+        if current == target {
+            return Ok(true);
+        }
+        let parent = conn.query_tree(current)?.reply()?.parent;
+        if parent == 0 || parent == current {
+            return Ok(false);
+        }
+        current = parent;
+    }
+    Ok(false)
+}
+
+fn focus_window_on_connection(
+    conn: &x11rb::rust_connection::RustConnection,
+    target: u32,
+) -> Result<()> {
+    if !focus_is_within(conn, target)? {
+        conn.set_input_focus(
+            x11rb::protocol::xproto::InputFocus::PARENT,
+            target,
+            x11rb::CURRENT_TIME,
+        )?
+        .check()?;
+        conn.flush()?;
+    }
+    if !focus_is_within(conn, target)? {
+        bail!("X11 did not assign keyboard focus to window {target}");
+    }
+    Ok(())
+}
+
+pub fn focus_window(target: u32) -> Result<()> {
+    let (conn, _) = x11rb::connect(None).context("connect to viewer X11 display")?;
+    focus_window_on_connection(&conn, target)
 }

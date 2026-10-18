@@ -64,7 +64,11 @@ viewer still starts with forwarding off. When enabled, the viewer maps panel
 coordinates back through the rendered screenshot's `ObjectFit::Cover` crop/scale
 using the source screenshot dimensions before dispatching `click`,
 `move_pointer`, `drag`, `scroll`, `key`, `type_text`, or `paste_text` IPC
-actions.
+actions. On X11, an armed click in the preview also assigns native keyboard
+focus to the viewer. Opening the monitor or leaving forwarding off does not
+claim keyboard focus. Workspace focus requests verify actual keyboard focus,
+including focused child windows, before reporting success. Stale window-manager
+active-window metadata falls back to actual input focus.
 
 ## Agent Boundary
 

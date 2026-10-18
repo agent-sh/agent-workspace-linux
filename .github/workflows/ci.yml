@@ -45,7 +45,8 @@ jobs:
             xauth \
             xclip \
             xdotool \
-            xvfb
+            xvfb \
+            tk
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
@@ -69,6 +70,9 @@ jobs:
 
       - name: Test
         run: cargo test --locked
+
+      - name: Native X11 focus regression
+        run: node scripts/x11_focus_smoke.js
 
       - name: JavaScript syntax
         run: |
