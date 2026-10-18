@@ -7429,19 +7429,49 @@ fn search_workspace_window_ids(
 }
 
 fn active_workspace_window(status: &WorkspaceStatus) -> Result<Option<WorkspaceWindow>> {
-    let output = workspace_command(status, "xdotool")
-        .arg("getactivewindow")
-        .output()
-        .context("failed to run xdotool getactivewindow")?;
-    if !output.status.success() {
-        return Ok(None);
+    // A destroyed popup can remain in _NET_ACTIVE_WINDOW. Actual input focus
+    // remains usable when the window manager's active-window metadata is stale.
+    for query in ["getactivewindow", "getwindowfocus"] {
+        let output = workspace_command(status, "xdotool")
+            .arg(query)
+            .output()
+            .with_context(|| format!("failed to run xdotool {query}"))?;
+        if !output.status.success() {
+            continue;
+        }
+        let text = output_text(output, query)?;
+        let window_id = text.trim();
+        if window_id.is_empty() || window_id == "0" || window_id == "1" {
+            continue;
+        }
+        match window_info(status, window_id) {
+            Ok(window) => {
+                if query == "getwindowfocus" && !window.visible {
+                    // Openbox focuses an internal support window when no application
+                    // is active. An unnamed input child must belong to listed content.
+                    let exe = daemon_executable_path()
+                        .context("resolve executable for native visibility")?;
+                    let output = workspace_command(status, &exe)
+                        .args(["__xtest", "content-check", window_id])
+                        .args(search_workspace_window_ids(status, true)?)
+                        .output()
+                        .context("failed to query native workspace visibility")?;
+                    let viewable = match output_text(output, "native workspace visibility") {
+                        Ok(value) => value,
+                        Err(error) if format!("{error:#}").contains("BadWindow") => continue,
+                        Err(error) => return Err(error),
+                    };
+                    if viewable.trim() != "true" {
+                        continue;
+                    }
+                }
+                return Ok(Some(window));
+            }
+            Err(error) if format!("{error:#}").contains("BadWindow") => continue,
+            Err(error) => return Err(error),
+        }
     }
-    let text = output_text(output, "xdotool getactivewindow")?;
-    let window_id = text.trim();
-    if window_id.is_empty() {
-        return Ok(None);
-    }
-    Ok(Some(window_info(status, window_id)?))
+    Ok(None)
 }
 
 fn active_workspace_window_for_state(state: &DaemonState) -> Result<Option<WorkspaceWindow>> {
@@ -8576,11 +8606,32 @@ fn resolve_window_screenshot_path(
 
 fn focus_workspace_window(status: &WorkspaceStatus, window_id: &str) -> Result<()> {
     let window_id = sanitize_x11_id(window_id, "window id")?;
-    let output = workspace_command(status, "xdotool")
-        .args(["windowactivate", "--sync", &window_id])
+    window_info(status, &window_id)?;
+    let exe = daemon_executable_path().context("resolve executable for native focus")?;
+    let output = workspace_command(status, &exe)
+        .args(["__xtest", "focus-check", &window_id])
         .output()
-        .context("failed to run xdotool windowactivate")?;
-    output_text(output, "xdotool windowactivate")?;
+        .context("failed to query native workspace focus")?;
+    match output_text(output, "native workspace input focus")?.trim() {
+        "focused" => return Ok(()),
+        "direct" => {}
+        "managed" => {
+            // Let the window manager restore or activate its own top-level window.
+            // Native focus is still verified below instead of trusting EWMH alone.
+            workspace_command(status, "xdotool")
+                .args(["windowactivate", "--sync", &window_id])
+                .output()
+                .context("failed to run xdotool windowactivate")?;
+        }
+        _ => bail!("invalid native workspace focus response"),
+    }
+    // The child inherits this workspace's DISPLAY and XAUTHORITY, avoiding
+    // process-global environment changes in the daemon.
+    let output = workspace_command(status, exe)
+        .args(["__xtest", "focus", &window_id])
+        .output()
+        .context("failed to run native workspace focus helper")?;
+    output_text(output, "native workspace input focus")?;
     Ok(())
 }
 

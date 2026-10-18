@@ -1609,6 +1609,13 @@ impl AgentWorkspaceViewer {
         let Some(button) = x11_button_for_mouse_button(event.button) else {
             return;
         };
+        if self.input_forwarding_ready() {
+            if let Err(error) = focus_native_viewer_input(window) {
+                self.error = Some(format!("Could not focus viewer for input: {error:#}"));
+                cx.notify();
+                return;
+            }
+        }
         self.focus_handle.focus(window, cx);
         self.input_forwarding_drag = Some(InputForwardingDrag {
             start: point,
@@ -4627,6 +4634,18 @@ impl X11DragSession {
             height: u32::from(geometry.height),
         })
     }
+}
+
+// X11 popups bypass the window manager. EWMH activation does not assign
+// keyboard focus, so an armed viewport click must focus its own native window.
+fn focus_native_viewer_input(window: &Window) -> Result<()> {
+    let handle = raw_window_handle::HasWindowHandle::window_handle(window)?;
+    let id = match handle.as_raw() {
+        raw_window_handle::RawWindowHandle::Xcb(handle) => handle.window.get(),
+        raw_window_handle::RawWindowHandle::Xlib(handle) => u32::try_from(handle.window)?,
+        _ => return Ok(()),
+    };
+    crate::xtest_input::focus_window(id)
 }
 
 fn x11_drag_session() -> Option<X11DragSession> {

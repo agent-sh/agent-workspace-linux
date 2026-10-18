@@ -64,7 +64,11 @@ viewer still starts with forwarding off. When enabled, the viewer maps panel
 coordinates back through the rendered screenshot's `ObjectFit::Cover` crop/scale
 using the source screenshot dimensions before dispatching `click`,
 `move_pointer`, `drag`, `scroll`, `key`, `type_text`, or `paste_text` IPC
-actions.
+actions. On X11, an armed click in the preview also assigns native keyboard
+focus to the viewer. Opening the monitor or leaving forwarding off does not
+claim keyboard focus. Workspace focus requests verify actual keyboard focus,
+including focused child windows, before reporting success. Stale window-manager
+active-window metadata falls back to actual input focus.
 
 ## Agent Boundary
 
@@ -98,3 +102,5 @@ checks the default and opt-in always-on-top window states, compact sizing,
 duplicate-launch reuse, and target-bound viewer teardown. It needs an X11 or
 Xwayland display plus `xclock`, `xdotool`, `xwininfo`, `xprop`, `xwd`, and
 ImageMagick (`convert`/`identify`).
+
+The X11 active-window fallback accepts visible application windows and their mapped input children. An empty workspace, including one whose last app has closed, does not expose Openbox support windows as application focus.
