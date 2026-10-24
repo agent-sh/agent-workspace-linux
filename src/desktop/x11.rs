@@ -165,7 +165,8 @@ impl DesktopControl for X11DesktopControl<'_> {
         // A destroyed popup can remain in _NET_ACTIVE_WINDOW. Actual input focus
         // remains usable when the window manager's active-window metadata is stale.
         for query in ["getactivewindow", "getwindowfocus"] {
-            let output = self.command("xdotool")
+            let output = self
+                .command("xdotool")
                 .arg(query)
                 .output()
                 .with_context(|| format!("failed to run xdotool {query}"))?;
@@ -184,7 +185,8 @@ impl DesktopControl for X11DesktopControl<'_> {
                         // is active. An unnamed input child must belong to listed content.
                         let exe = daemon_executable_path()
                             .context("resolve executable for native visibility")?;
-                        let output = self.command(&exe)
+                        let output = self
+                            .command(&exe)
                             .args(["__xtest", "content-check", window_id])
                             .args(self.search_window_ids(true)?)
                             .output()
@@ -373,7 +375,8 @@ impl DesktopControl for X11DesktopControl<'_> {
         let window_id = sanitize_x11_id(window_id, "window id")?;
         self.window_info(&window_id)?;
         let exe = daemon_executable_path().context("resolve executable for native focus")?;
-        let output = self.command(&exe)
+        let output = self
+            .command(&exe)
             .args(["__xtest", "focus-check", &window_id])
             .output()
             .context("failed to query native workspace focus")?;
@@ -392,7 +395,8 @@ impl DesktopControl for X11DesktopControl<'_> {
         }
         // The child inherits this workspace's DISPLAY and XAUTHORITY, avoiding
         // process-global environment changes in the daemon.
-        let output = self.command(exe)
+        let output = self
+            .command(exe)
             .args(["__xtest", "focus", &window_id])
             .output()
             .context("failed to run native workspace focus helper")?;
@@ -658,6 +662,7 @@ pub(crate) fn workspace_command(status: &WorkspaceStatus, program: impl AsRef<Os
         &mut command,
         &status.display,
         &status.xauthority_path,
+        &status.runtime_dir,
     );
     command.stdin(Stdio::null());
     command

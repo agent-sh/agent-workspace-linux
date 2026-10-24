@@ -47,14 +47,14 @@ const HOST_SESSION_ENV_VARS: &[&str] = &[
     "GPG_AGENT_INFO",
 ];
 
-fn scrub_host_session_environment(command: &mut Command) {
+pub(crate) fn scrub_host_session_environment(command: &mut Command) {
     for name in HOST_SESSION_ENV_VARS {
         command.env_remove(name);
     }
 }
 
 pub(crate) fn workspace_environment_variables(status: &WorkspaceStatus) -> Vec<EnvVar> {
-    vec![
+    let mut variables = vec![
         EnvVar {
             name: "DISPLAY".to_string(),
             value: status.display.clone(),
@@ -79,7 +79,25 @@ pub(crate) fn workspace_environment_variables(status: &WorkspaceStatus) -> Vec<E
             name: "AGENT_WORKSPACE_SOCKET".to_string(),
             value: status.socket_path.display().to_string(),
         },
-    ]
+    ];
+    let mut command = Command::new("true");
+    status.session.configure_process_environment(
+        &mut command,
+        &status.display,
+        &status.xauthority_path,
+        &status.runtime_dir,
+    );
+    for (name, value) in command.get_envs() {
+        let name = name.to_string_lossy().to_string();
+        variables.retain(|entry| entry.name != name);
+        if let Some(value) = value {
+            variables.push(EnvVar {
+                name,
+                value: value.to_string_lossy().to_string(),
+            });
+        }
+    }
+    variables
 }
 
 pub(crate) fn configure_launch_environment(
@@ -95,9 +113,12 @@ pub(crate) fn configure_launch_environment(
     for env_var in workspace_environment_variables(status) {
         command.env(env_var.name, env_var.value);
     }
-    status
-        .session
-        .configure_process_environment(command, &status.display, &status.xauthority_path);
+    status.session.configure_process_environment(
+        command,
+        &status.display,
+        &status.xauthority_path,
+        &status.runtime_dir,
+    );
 }
 
 pub(crate) struct SessionSandboxResources {
@@ -243,7 +264,9 @@ pub(crate) fn restricted_mount_namespace_args(
     cwd: Option<&Path>,
     network: LaunchNetworkPlan,
 ) -> Result<Vec<String>> {
-    let resources = status.session.sandbox_resources(&status.xauthority_path);
+    let resources = status
+        .session
+        .sandbox_resources(&status.xauthority_path, &status.runtime_dir);
     restricted_mount_namespace_args_with_resources(policy, cwd, network, resources)
 }
 

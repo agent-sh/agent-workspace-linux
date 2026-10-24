@@ -36,6 +36,17 @@ async fn main() -> Result<()> {
     if args.first().map(String::as_str) == Some("__xtest") {
         return xtest_input::run(&args[1..]);
     }
+    if args.first().map(String::as_str) == Some("__kwin-client-env") {
+        let path = args
+            .get(1)
+            .context("missing KWin client environment path")?;
+        let value = serde_json::json!({"DISPLAY": std::env::var("DISPLAY").unwrap_or_default(), "XAUTHORITY": std::env::var("XAUTHORITY").unwrap_or_default()});
+        let path = std::path::Path::new(path);
+        let staging = path.with_extension("staging");
+        std::fs::write(&staging, serde_json::to_vec(&value)?)?;
+        std::fs::rename(staging, path)?;
+        return Ok(());
+    }
     let permissions = parse_global_options(&mut args)?;
     match args.first().map(String::as_str) {
         Some("doctor") => {
@@ -1051,6 +1062,7 @@ fn parse_start_options(args: &[String]) -> Result<ParsedStartOptions> {
     let mut dry_run = false;
     let mut profile_id = None;
     let mut session = None;
+    let mut scale = None;
     let mut width_explicit = false;
     let mut height_explicit = false;
     let mut index = 0;
@@ -1078,6 +1090,14 @@ fn parse_start_options(args: &[String]) -> Result<ParsedStartOptions> {
             }
             "--session" => {
                 session = Some(value_after(args, index, "--session")?.parse()?);
+                index += 2;
+            }
+            "--scale" => {
+                scale = Some(
+                    value_after(args, index, "--scale")?
+                        .parse::<f64>()
+                        .context("--scale must be a number")?,
+                );
                 index += 2;
             }
             "--id" => {
@@ -1114,6 +1134,10 @@ fn parse_start_options(args: &[String]) -> Result<ParsedStartOptions> {
         )?;
     }
     options.session = SessionSpec::resolve(session, Some(options.session));
+    if let Some(scale) = scale {
+        options.session.scale = scale;
+    }
+    options.session.validate()?;
     Ok(ParsedStartOptions {
         options,
         profile_id,
@@ -1132,6 +1156,7 @@ fn parse_open_profile_options(
     let mut options = WorkspaceStartOptions::default();
     let mut profile_id = None;
     let mut session = None;
+    let mut scale = None;
     let mut width_explicit = false;
     let mut height_explicit = false;
     let mut open_options = profile::ProfileWorkspaceOpenOptions::default();
@@ -1159,6 +1184,14 @@ fn parse_open_profile_options(
             }
             "--session" => {
                 session = Some(value_after(args, index, "--session")?.parse()?);
+                index += 2;
+            }
+            "--scale" => {
+                scale = Some(
+                    value_after(args, index, "--scale")?
+                        .parse::<f64>()
+                        .context("--scale must be a number")?,
+                );
                 index += 2;
             }
             "--id" => {
@@ -1233,6 +1266,10 @@ fn parse_open_profile_options(
         height_explicit,
     )?;
     options.session = SessionSpec::resolve(session, Some(options.session));
+    if let Some(scale) = scale {
+        options.session.scale = scale;
+    }
+    options.session.validate()?;
     Ok((
         ParsedStartOptions {
             options,
@@ -4188,6 +4225,7 @@ fn parse_id_and_args(args: &[String]) -> Result<(String, Vec<String>)> {
 fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
     let mut id = None;
     let mut session = SessionSpec::default();
+    let mut scale = None;
     let mut session_id = None;
     let mut purpose = None;
     let mut profile_id = None;
@@ -4217,6 +4255,14 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
             }
             "--session" => {
                 session = value_after(&args, index, "--session")?.parse()?;
+                index += 2;
+            }
+            "--scale" => {
+                scale = Some(
+                    value_after(&args, index, "--scale")?
+                        .parse::<f64>()
+                        .context("--scale must be a number")?,
+                );
                 index += 2;
             }
             "--profile" => {
@@ -4296,6 +4342,10 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
     let id = id.context("daemon missing --id")?;
     let session_id = session_id.unwrap_or_else(|| workspace::new_session_id(&id));
 
+    if let Some(scale) = scale {
+        session.scale = scale;
+    }
+    session.validate()?;
     Ok(DaemonOptions {
         id,
         session,
@@ -4374,8 +4424,8 @@ Usage:
   agent-workspace-linux profile template project-dev [--id ID] [--host-path PATH]
   agent-workspace-linux profile template restricted-chrome [--id ID] [--browser-path PATH]
   agent-workspace-linux profile template browser-session [--id ID] [--browser-path PATH] --user-data-dir PATH
-  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--ack-unenforced-policy] [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11] [--width PX] [--height PX]
-  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] [--ack-unenforced-policy] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11] [--width PX] [--height PX]
+  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--ack-unenforced-policy] [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11|kwin] [--scale N] [--width PX] [--height PX]
+  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] [--ack-unenforced-policy] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11|kwin] [--scale N] [--width PX] [--height PX]
   agent-workspace-linux workspace list
   agent-workspace-linux workspace cleanup [--id ID] [--dry-run]
   agent-workspace-linux workspace status [--id ID]
@@ -4507,7 +4557,7 @@ mod tests {
 
     #[test]
     fn start_options_reject_unimplemented_session_backend() {
-        let error = match parse_start_options(&args(&["--session", "kwin"])) {
+        let error = match parse_start_options(&args(&["--session", "gnome"])) {
             Ok(_) => panic!("unimplemented backend must be rejected"),
             Err(error) => error,
         };

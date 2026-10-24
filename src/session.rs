@@ -1,3 +1,4 @@
+pub(crate) mod kwin;
 pub(crate) mod x11;
 
 use crate::desktop::DesktopControl;
@@ -7,10 +8,12 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{fmt, path::Path, process::Command, str::FromStr};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, JsonSchema)]
 pub struct SessionSpec {
     #[serde(default)]
     pub backend: SessionBackend,
+    #[serde(default = "default_scale", skip_serializing_if = "is_default_scale")]
+    pub scale: f64,
 }
 
 impl SessionSpec {
@@ -18,9 +21,28 @@ impl SessionSpec {
         explicit.or(profile).unwrap_or_default()
     }
 
-    pub(crate) fn start(self, options: &DaemonOptions) -> Result<x11::X11Session> {
+    pub fn validate(self) -> Result<()> {
+        if !self.scale.is_finite() || self.scale <= 0.0 {
+            bail!("session scale must be finite and positive");
+        }
+        if self.backend == SessionBackend::X11 && self.scale != 1.0 {
+            bail!("X11 sessions use scale 1; choose kwin for output scaling");
+        }
+        Ok(())
+    }
+
+    pub fn blockers(self) -> Vec<String> {
         match self.backend {
-            SessionBackend::X11 => x11::X11Session::start(options),
+            SessionBackend::X11 => crate::workspace::doctor_report().blockers,
+            SessionBackend::Kwin => kwin::blockers(),
+        }
+    }
+
+    pub(crate) fn start(self, options: &mut DaemonOptions) -> Result<Session> {
+        self.validate()?;
+        match self.backend {
+            SessionBackend::X11 => x11::X11Session::start(options).map(Session::X11),
+            SessionBackend::Kwin => kwin::KwinSession::start(options).map(Session::Kwin),
         }
     }
 
@@ -30,6 +52,7 @@ impl SessionSpec {
     ) -> Box<dyn DesktopControl + 'a> {
         match self.backend {
             SessionBackend::X11 => Box::new(crate::desktop::x11::X11DesktopControl::new(status)),
+            SessionBackend::Kwin => Box::new(crate::desktop::kwin::KwinDesktopControl::new(status)),
         }
     }
 
@@ -38,10 +61,14 @@ impl SessionSpec {
         command: &mut Command,
         display: &str,
         xauthority: &Path,
+        runtime_dir: &Path,
     ) {
         match self.backend {
             SessionBackend::X11 => {
                 x11::configure_process_environment(command, display, xauthority);
+            }
+            SessionBackend::Kwin => {
+                kwin::configure_process_environment(command, runtime_dir, display, xauthority)
             }
         }
     }
@@ -49,15 +76,18 @@ impl SessionSpec {
     pub(crate) fn sandbox_resources(
         self,
         xauthority_path: &Path,
+        runtime_dir: &Path,
     ) -> crate::launch::SessionSandboxResources {
         match self.backend {
             SessionBackend::X11 => x11::sandbox_resources(xauthority_path),
+            SessionBackend::Kwin => kwin::sandbox_resources(runtime_dir, xauthority_path),
         }
     }
 
     pub(crate) fn chrome_ozone_platform(self) -> &'static str {
         match self.backend {
             SessionBackend::X11 => x11::CHROME_OZONE_PLATFORM,
+            SessionBackend::Kwin => "wayland",
         }
     }
 
@@ -72,6 +102,9 @@ impl SessionSpec {
             SessionBackend::X11 => {
                 x11::cleanup_stale_processes(window_manager_pid, x_server_pid, dry_run, actions);
             }
+            SessionBackend::Kwin => {
+                kwin::cleanup_stale_processes(window_manager_pid, dry_run, actions)
+            }
         }
     }
 }
@@ -80,6 +113,7 @@ impl Default for SessionSpec {
     fn default() -> Self {
         Self {
             backend: SessionBackend::X11,
+            scale: default_scale(),
         }
     }
 }
@@ -90,6 +124,7 @@ impl FromStr for SessionSpec {
     fn from_str(value: &str) -> Result<Self> {
         Ok(Self {
             backend: value.parse()?,
+            scale: default_scale(),
         })
     }
 }
@@ -105,12 +140,14 @@ impl fmt::Display for SessionSpec {
 pub enum SessionBackend {
     #[default]
     X11,
+    Kwin,
 }
 
 impl SessionBackend {
     fn as_str(self) -> &'static str {
         match self {
             Self::X11 => "x11",
+            Self::Kwin => "kwin",
         }
     }
 }
@@ -121,14 +158,62 @@ impl FromStr for SessionBackend {
     fn from_str(value: &str) -> Result<Self> {
         match value.trim().to_ascii_lowercase().as_str() {
             "x11" => Ok(Self::X11),
-            _ => bail!("session backend must be x11 (Xvfb with Openbox)"),
+            "kwin" => Ok(Self::Kwin),
+            _ => bail!("session backend must be x11 (Xvfb with Openbox) or kwin (native Wayland)"),
         }
     }
+}
+
+fn default_scale() -> f64 {
+    1.0
+}
+
+pub(crate) enum Session {
+    X11(x11::X11Session),
+    Kwin(kwin::KwinSession),
+}
+impl Session {
+    pub fn x_server_pid(&self) -> u32 {
+        match self {
+            Self::X11(s) => s.x_server_pid(),
+            Self::Kwin(_) => 0,
+        }
+    }
+    pub fn window_manager_pid(&self) -> Option<u32> {
+        match self {
+            Self::X11(s) => s.window_manager_pid(),
+            Self::Kwin(s) => s.pid(),
+        }
+    }
+    pub fn shutdown(&mut self) {
+        match self {
+            Self::X11(s) => s.shutdown(),
+            Self::Kwin(s) => s.shutdown(),
+        }
+    }
+}
+
+fn is_default_scale(scale: &f64) -> bool {
+    *scale == 1.0
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scale_requires_a_positive_finite_native_output() {
+        let mut session: SessionSpec = "kwin".parse().unwrap();
+        session.scale = 1.5;
+        assert!(session.validate().is_ok());
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY] {
+            session.scale = scale;
+            assert!(session.validate().is_err());
+        }
+        session.backend = SessionBackend::X11;
+        session.scale = 1.5;
+        assert!(session.validate().is_err());
+    }
 
     #[test]
     fn missing_session_fields_default_to_x11() {
@@ -156,7 +241,7 @@ mod tests {
 
     #[test]
     fn unimplemented_session_backends_are_rejected() {
-        assert!("kwin".parse::<SessionSpec>().is_err());
+        assert!("kwin".parse::<SessionSpec>().is_ok());
         assert!(serde_json::from_str::<SessionSpec>(r#"{"backend":"gnome"}"#).is_err());
     }
 }

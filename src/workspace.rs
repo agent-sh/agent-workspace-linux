@@ -124,6 +124,8 @@ pub struct DoctorReport {
     pub runtime: RuntimeReport,
     pub viewer: ViewerRuntimeReport,
     pub ready_for_x11_workspace: bool,
+    pub ready_for_kwin_workspace: bool,
+    pub kwin_blockers: Vec<String>,
     pub ready_for_host_viewer: bool,
     pub blockers: Vec<String>,
     pub viewer_blockers: Vec<String>,
@@ -1163,7 +1165,10 @@ pub fn doctor_report() -> DoctorReport {
             .to_string()
     };
 
+    let kwin_blockers = crate::session::kwin::blockers();
     DoctorReport {
+        ready_for_kwin_workspace: kwin_blockers.is_empty(),
+        kwin_blockers,
         runtime,
         viewer,
         ready_for_x11_workspace,
@@ -1211,7 +1216,14 @@ pub fn start_workspace(options: WorkspaceStartOptions) -> Result<IpcResponse> {
         }),
         WorkspaceStartPlan::Start(daemon_options) => {
             spawn_detached_daemon(&daemon_options)?;
-            wait_for_socket(&daemon_options.socket_path)?;
+            wait_for_socket(
+                &daemon_options.socket_path,
+                if daemon_options.session.backend == crate::session::SessionBackend::Kwin {
+                    Duration::from_secs(30)
+                } else {
+                    Duration::from_secs(5)
+                },
+            )?;
             request(&daemon_options.socket_path, IpcRequest::Status)
         }
     }
@@ -3265,7 +3277,7 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
         Some("initialize missing live control state for workspace daemon".to_string()),
     )?;
 
-    let mut session = options.session.start(&options)?;
+    let mut session = options.session.start(&mut options)?;
 
     let listener = UnixListener::bind(&options.socket_path)
         .with_context(|| format!("failed to bind {}", options.socket_path.display()))?;
@@ -3370,16 +3382,16 @@ fn workspace_start_preview(options: WorkspaceStartOptions) -> Result<WorkspaceSt
     let session_mismatch = running_status
         .as_ref()
         .is_some_and(|status| status.session != options.session);
-    let runtime = doctor_report();
+    options.session.validate()?;
     let socket_path = workspace_socket_path(&id);
     let socket_path_error = validate_unix_socket_path(&socket_path)
         .err()
         .map(|error| error.to_string());
-    let mut runtime_blockers = runtime.blockers;
+    let mut runtime_blockers = options.session.blockers();
     if let Some(error) = &socket_path_error {
         runtime_blockers.push(error.clone());
     }
-    let runtime_ready = runtime.ready_for_x11_workspace && socket_path_error.is_none();
+    let runtime_ready = runtime_blockers.is_empty();
     let applied_policy = options.applied_policy.clone();
     let blocks_unenforced_policy = applied_policy
         .as_ref()
@@ -3519,12 +3531,10 @@ fn prepare_workspace_start(options: WorkspaceStartOptions) -> Result<WorkspaceSt
         )?;
     }
 
-    let runtime = doctor_report();
-    if !runtime.ready_for_x11_workspace {
-        bail!(
-            "workspace runtime is not ready: {}",
-            runtime.blockers.join("; ")
-        );
+    options.session.validate()?;
+    let blockers = options.session.blockers();
+    if !blockers.is_empty() {
+        bail!("workspace runtime is not ready: {}", blockers.join("; "));
     }
 
     let runtime_dir = workspace_dir(&id);
@@ -3533,8 +3543,13 @@ fn prepare_workspace_start(options: WorkspaceStartOptions) -> Result<WorkspaceSt
     create_private_runtime_dir(&runtime_dir)?;
     remove_stale_socket(&socket_path)?;
     let xauthority_path = runtime_dir.join("Xauthority");
-    let display = pick_display()?;
-    create_xauthority(&display, &xauthority_path)?;
+    let display = if options.session.backend == crate::session::SessionBackend::X11 {
+        let display = pick_display()?;
+        create_xauthority(&display, &xauthority_path)?;
+        display
+    } else {
+        String::new()
+    };
     let session_id = new_session_id(&id);
 
     Ok(WorkspaceStartPlan::Start(DaemonOptions {
@@ -3571,6 +3586,7 @@ fn spawn_detached_daemon(options: &DaemonOptions) -> Result<()> {
         .arg(&options.id);
     daemon.arg("--session-id").arg(&options.session_id);
     daemon.arg("--session").arg(options.session.to_string());
+    daemon.arg("--scale").arg(options.session.scale.to_string());
     if let Some(purpose) = &options.purpose {
         daemon.arg("--purpose").arg(purpose);
     }
@@ -8384,8 +8400,8 @@ fn request(socket_path: &Path, request: IpcRequest) -> Result<IpcResponse> {
     Ok(response)
 }
 
-fn wait_for_socket(socket_path: &Path) -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<()> {
+    let deadline = std::time::Instant::now() + timeout;
     while std::time::Instant::now() < deadline {
         if socket_path.exists() {
             return Ok(());
@@ -8544,6 +8560,24 @@ fn workspace_dir(id: &str) -> PathBuf {
 }
 
 fn runtime_base_dir() -> PathBuf {
+    // Apps now have a session-private XDG_RUNTIME_DIR. Preserve their ability
+    // to address the owning daemon (including `workspace stop` from an app)
+    // through the attachment context the daemon exported at launch.
+    if let (Ok(id), Some(runtime), Some(socket)) = (
+        env::var("AGENT_WORKSPACE_ID"),
+        env::var_os("AGENT_WORKSPACE_RUNTIME_DIR"),
+        env::var_os("AGENT_WORKSPACE_SOCKET"),
+    ) {
+        let runtime = PathBuf::from(runtime);
+        if runtime.is_absolute()
+            && runtime.file_name().and_then(|name| name.to_str()) == Some(id.as_str())
+            && PathBuf::from(socket) == runtime.join("control.sock")
+        {
+            if let Some(parent) = runtime.parent() {
+                return parent.to_path_buf();
+            }
+        }
+    }
     runtime_base_dir_from_candidates(
         env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from),
         discover_systemd_runtime_dir(),

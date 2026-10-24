@@ -1,3 +1,4 @@
+pub(crate) mod kwin;
 pub(crate) mod x11;
 
 use crate::workspace::{

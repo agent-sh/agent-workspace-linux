@@ -99,11 +99,26 @@ agent-workspace-linux workspace observe --screenshot --output /tmp/ws.png
 agent-workspace-linux workspace stop
 ```
 
-`workspace start` and `workspace open-profile` accept `--session x11` for the
-current X11 (`Xvfb` + Openbox) backend. A profile can declare the same setting as
-`"session": {"backend":"x11"}`. Explicit CLI/MCP input overrides the profile;
-when both are omitted, the session remains pinned to `{"backend":"x11"}`.
-Unsupported session values are rejected.
+`workspace start` and `workspace open-profile` accept `--session x11` or
+`--session kwin`. MCP and saved profiles accept `"session": {"backend":"kwin"}`.
+Explicit CLI/MCP input overrides the profile. Omitting both keeps the pinned
+Xvfb + Openbox default (`{"backend":"x11"}`).
+
+KWin sessions run a native Wayland virtual compositor directly. There is no
+Xvfb underneath KWin. Each workspace owns its Wayland socket, session D-Bus,
+settings, input and clipboard. KWin 6.6 or newer (including `kwin-common`),
+`wl-clipboard`, and access to a DRM render node are required;
+`doctor` reports their readiness separately from X11. This is KWin, not a full
+Plasma desktop shell. GNOME and COSMIC session names remain unsupported.
+
+Use `--session kwin --scale 1.5` for a 150% output, or
+`"session": {"backend":"kwin", "scale":1.5}` in a profile or MCP call. Width,
+height, window geometry and pointer coordinates stay in screenshot pixels.
+The adapter converts between these pixels and KWin's logical coordinates.
+KWin aligns output sizes to logical pixels; status reports the effective size.
+Apps use native Wayland by default; rootless XWayland remains available for
+legacy clients. The existing viewer, IPC, permission ceiling and explicit
+Chrome profile import rules apply to both backends.
 
 ### Browser automation
 

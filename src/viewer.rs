@@ -2476,8 +2476,18 @@ fn compute_viewer_refresh(
             let snapshot = ViewerSnapshot {
                 workspaces: list.workspaces,
                 profiles: profiles.profiles,
-                doctor_ready: doctor.ready_for_x11_workspace,
-                doctor_blockers: doctor.blockers,
+                doctor_ready: doctor.ready_for_x11_workspace || doctor.ready_for_kwin_workspace,
+                doctor_blockers: if doctor.ready_for_x11_workspace
+                    || doctor.ready_for_kwin_workspace
+                {
+                    Vec::new()
+                } else {
+                    doctor
+                        .blockers
+                        .into_iter()
+                        .chain(doctor.kwin_blockers)
+                        .collect()
+                },
             };
 
             let (active_window, frame_update, error) = if running {

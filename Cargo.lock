@@ -127,6 +127,7 @@ dependencies = [
  "gpui",
  "gpui_platform",
  "image",
+ "libc",
  "mimalloc",
  "raw-window-handle",
  "rmcp",
@@ -134,7 +135,12 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "wayland-backend",
+ "wayland-client",
+ "wayland-scanner",
  "x11rb 0.14.0",
+ "xkbcommon",
+ "zbus",
 ]
 
 [[package]]

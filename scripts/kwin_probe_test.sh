@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TEST_DIR="$(mktemp -d)"
+TEST_DIR="$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/kwin-probe-test.XXXXXXXX")"
 trap 'rm -rf "$TEST_DIR"' EXIT
 
 bash -n "$ROOT_DIR/scripts/kwin_probe.sh"
@@ -24,7 +24,7 @@ case "${1:-}" in
     echo 'image_id=test'
     ;;
   run)
-    exit 0
+    exit "${KWIN_PROBE_TEST_EXIT:-0}"
     ;;
   *)
     echo "unexpected docker command: $*" >&2
@@ -37,6 +37,7 @@ chmod +x "$TEST_DIR/bin/docker"
 export KWIN_PROBE_TEST_LOG="$TEST_DIR/docker.log"
 PATH="$TEST_DIR/bin:$PATH" \
 KWIN_PROBE_ARTIFACT_DIR="$TEST_DIR/artifacts" \
+KWIN_PROBE_BIN="/usr/bin/true" KWIN_PROBE_RENDER_NODE=/dev/null \
   "$ROOT_DIR/scripts/kwin_probe.sh" >/dev/null
 
 mapfile -t calls < "$KWIN_PROBE_TEST_LOG"
@@ -53,7 +54,7 @@ run_call="${calls[3]}"
 [[ "$run_call" == *"--cap-drop ALL"* ]]
 [[ "$run_call" == *"--security-opt no-new-privileges"* ]]
 [[ "$run_call" == *"--user 65534:65534"* ]]
-[[ "$run_call" == *"--tmpfs /tmp:rw,nosuid,nodev,size=512m"* ]]
+[[ "$run_call" == *"--tmpfs /tmp:rw,nosuid,nodev,size=1g"* ]]
 [[ "$run_call" == *"type=bind,src=$TEST_DIR/artifacts,dst=/artifacts"* ]]
 
 for forbidden in \
@@ -72,8 +73,20 @@ for forbidden in \
 done
 
 mount_count="$(printf '%s\n' "$run_call" | grep -o -- '--mount' | wc -l)"
-[[ "$mount_count" -eq 1 ]]
+[[ "$mount_count" -eq 2 ]]
+[[ "$run_call" == *"dst=/opt/agent-workspace-linux,readonly"* ]]
 test -s "$TEST_DIR/artifacts/environment.txt"
 test -f "$TEST_DIR/artifacts/console.log"
 
 echo "KWin probe isolation tests ok"
+
+# The runner must propagate failures from the container instead of publishing a
+# successful test result after a failed native operation.
+set +e
+PATH="$TEST_DIR/bin:$PATH" KWIN_PROBE_BIN=/usr/bin/true KWIN_PROBE_RENDER_NODE=/dev/null \
+KWIN_PROBE_ARTIFACT_DIR="$TEST_DIR/artifacts" KWIN_PROBE_TEST_EXIT=23 \
+  "$ROOT_DIR/scripts/kwin_probe.sh" >/dev/null
+status=$?
+set -e
+[[ "$status" -eq 23 ]]
+echo "KWin probe failure propagation ok"

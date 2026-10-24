@@ -2,8 +2,9 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-IMAGE="${KWIN_PROBE_IMAGE:-agent-workspace-linux-kwin-probe:ubuntu-24.04}"
-ARTIFACT_DIR="${KWIN_PROBE_ARTIFACT_DIR:-$(mktemp -d "${TMPDIR:-/tmp}/kwin-probe.XXXXXXXX")}"
+BIN="${KWIN_PROBE_BIN:-$ROOT_DIR/target/debug/agent-workspace-linux}"
+IMAGE="${KWIN_PROBE_IMAGE:-agent-workspace-linux-kwin-probe:ubuntu-26.04}"
+ARTIFACT_DIR="${KWIN_PROBE_ARTIFACT_DIR:-$(mktemp -d "${XDG_CACHE_HOME:-$HOME/.cache}/kwin-probe.XXXXXXXX")}"
 
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -16,6 +17,18 @@ need docker
 need mktemp
 need tee
 
+if [[ ! -x "$BIN" ]]; then
+  echo "Build agent-workspace-linux first, or set KWIN_PROBE_BIN to the binary path" >&2
+  exit 1
+fi
+BIN="$(realpath "$BIN")"
+RENDER_NODE="${KWIN_PROBE_RENDER_NODE:-}"
+if [[ -z "$RENDER_NODE" ]]; then
+  for candidate in /dev/dri/renderD*; do
+    if [[ -r "$candidate" && -w "$candidate" ]]; then RENDER_NODE="$candidate"; break; fi
+  done
+fi
+if [[ -z "$RENDER_NODE" ]]; then echo "KWin native capture needs an accessible DRM render node" >&2; exit 1; fi
 mkdir -p "$ARTIFACT_DIR"
 chmod 0777 "$ARTIFACT_DIR"
 ARTIFACT_DIR="$(cd "$ARTIFACT_DIR" && pwd)"
@@ -32,21 +45,25 @@ docker build \
   docker image inspect "$IMAGE" --format 'image_id={{.Id}}'
 } > "$ARTIFACT_DIR/environment.txt"
 
-echo "== probe virtual QPainter and nested private Xvfb backends =="
+echo "== test native KWin at 100% and 150% through workspace IPC =="
 set +e
 docker run \
   --rm \
   --name "agent-workspace-kwin-probe-$$" \
   --network none \
   --ipc private \
+  --env LP_NUM_THREADS=2 \
   --read-only \
   --cap-drop ALL \
   --security-opt no-new-privileges \
   --user 65534:65534 \
+  --group-add "$(stat -c %g "$RENDER_NODE")" \
+  --device "$RENDER_NODE" \
   --pids-limit 256 \
   --stop-timeout 5 \
-  --tmpfs /tmp:rw,nosuid,nodev,size=512m \
+  --tmpfs /tmp:rw,nosuid,nodev,size=1g \
   --mount "type=bind,src=$ARTIFACT_DIR,dst=/artifacts" \
+  --mount "type=bind,src=$BIN,dst=/opt/agent-workspace-linux,readonly" \
   "$IMAGE" "$@" 2>&1 | tee "$ARTIFACT_DIR/console.log"
 probe_status=${PIPESTATUS[0]}
 set -e
