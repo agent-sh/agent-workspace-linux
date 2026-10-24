@@ -666,7 +666,12 @@ impl X11DesktopControl<'_> {
                     .and_then(|output| String::from_utf8(output.stdout).ok())
                     .and_then(|value| value.trim().parse::<u32>().ok())
             })
-            .or_else(|| self.window_pid_from_xprop(&id));
+            .or_else(|| {
+                xprop_fallback_pid(
+                    self.window_pid_from_xprop(&id),
+                    !self.status.apps.is_empty(),
+                )
+            });
         let geometry_output = self
             .command("xdotool")
             .args(["getwindowgeometry", "--shell", &id])
@@ -713,6 +718,14 @@ fn output_text(output: std::process::Output, description: &str) -> Result<String
         let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
         let detail = if !stderr.is_empty() { stderr } else { stdout };
         bail!("{description} failed: {detail}");
+    }
+}
+
+fn xprop_fallback_pid(xprop_pid: Option<u32>, has_managed_apps: bool) -> Option<u32> {
+    if has_managed_apps {
+        None
+    } else {
+        xprop_pid
     }
 }
 
@@ -820,6 +833,19 @@ mod tests {
         );
         assert!(sanitize_x11_id("kwin:4194307", "window id").is_err());
         assert!(sanitize_x11_id("0x400003", "window id").is_err());
+    }
+
+    #[test]
+    fn xres_failure_withholds_colliding_managed_app_pid() {
+        let other_app_host_pid = 4242;
+        let namespace_local_pid = other_app_host_pid;
+
+        assert_eq!(xprop_fallback_pid(Some(namespace_local_pid), true), None);
+    }
+
+    #[test]
+    fn xres_failure_preserves_unmanaged_only_pid_fallback() {
+        assert_eq!(xprop_fallback_pid(Some(4242), false), Some(4242));
     }
 
     #[test]
