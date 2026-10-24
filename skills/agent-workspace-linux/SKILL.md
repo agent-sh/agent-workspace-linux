@@ -102,6 +102,16 @@ schemas for later phases until the plan reaches them.
 6. Stop: use `workspace_stop` when finished; use `workspace_cleanup_stale` for
    orphaned runtimes.
 
+Session selection supports X11 (`Xvfb` + Openbox) and native KWin Wayland.
+MCP callers can pass `session: {"backend":"kwin", "scale":1.5}` for 150%
+output scaling. Explicit MCP input overrides the profile session; omitting
+both keeps the pinned X11 default. CLI start/open-profile accepts
+`--session kwin --scale 1.5`. KWin needs version 6.6 or newer, kwin-common, kscreen-doctor, wl-clipboard,
+and an accessible DRM render node.
+It runs directly, without a parent Xvfb, and is not a full Plasma shell.
+Pointer and window coordinates use screenshot pixels on either backend.
+Unsupported session names are rejected.
+
 Skip unless: each step's precondition is visible in the previous tool result
 (workspace id, app id, target window, browser target, or explicit user approval).
 

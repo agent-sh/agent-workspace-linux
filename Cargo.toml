@@ -1,6 +1,6 @@
 [package]
 name = "agent-workspace-linux"
-version = "0.3.3"
+version = "0.4.0"
 edition = "2021"
 license = "MIT"
 description = "Isolated Linux desktop workspaces for AI agents."
@@ -28,6 +28,13 @@ serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tokio = { version = "1.51", features = ["macros", "rt"] }
 x11rb = { version = "0.14.0", features = ["xtest"] }
+
+zbus = "5.15"
+wayland-client = "0.31"
+wayland-scanner = "0.31"
+wayland-backend = "0.3"
+xkbcommon = "0.8"
+libc = "0.2"
 
 [profile.release]
 codegen-units = 1

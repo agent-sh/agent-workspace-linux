@@ -99,6 +99,49 @@ agent-workspace-linux workspace observe --screenshot --output /tmp/ws.png
 agent-workspace-linux workspace stop
 ```
 
+`workspace start` and `workspace open-profile` accept `--session x11` or
+`--session kwin`. MCP and saved profiles accept `"session": {"backend":"kwin"}`.
+Explicit CLI/MCP input overrides the profile. Omitting both keeps the pinned
+Xvfb + Openbox default (`{"backend":"x11"}`).
+
+KWin sessions run a native Wayland virtual compositor directly. There is no
+Xvfb underneath KWin. Each workspace owns its Wayland socket, session D-Bus,
+settings, input and clipboard. KWin 6.6 or newer (including `kwin-common`),
+`libkscreen-bin` (`kscreen-doctor`), `wl-clipboard`, and access to a DRM render node are required;
+`doctor` reports their readiness separately from X11. This is KWin, not a full
+Plasma desktop shell. GNOME and COSMIC session names remain unsupported.
+
+Use `--session kwin --scale 1.5` for a 150% output, or
+`"session": {"backend":"kwin", "scale":1.5}` in a profile or MCP call. Width,
+height, window geometry and pointer coordinates stay in screenshot pixels.
+The adapter converts between these pixels and KWin's logical coordinates.
+KWin aligns output sizes to logical pixels; status reports the effective size.
+Apps use native Wayland by default; rootless XWayland remains available for
+legacy clients. The existing viewer, IPC, permission ceiling and explicit
+Chrome profile import rules apply to both backends.
+
+### Native KWin checks
+
+Build the binary, then run `scripts/kwin_probe.sh`. The disposable Ubuntu 26.04
+container checks actual 100% and 150% scaling, native Qt input and capture, MCP
+startup, viewer frames, denied desktop-service activation, and a legacy terminal
+with enforced mount and network isolation. It exposes one DRM render node and
+no host display, input device or session runtime. The container permits nested
+user namespaces so the bubblewrap checks can run.
+
+To test Computer Use Linux against the same desktop, build both projects and run:
+
+```bash
+KWIN_PROBE_BIN=/path/to/agent-workspace-linux \
+COMPUTER_USE_LINUX_BIN=/path/to/computer-use-linux \
+scripts/kwin_cul_probe.sh
+```
+
+This verifies native AT-SPI activation, global logical-coordinate clicks and
+client-local element fallback against a Qt window at actual 150% scale. Portal
+consent applies only to the disposable workspace. Both runners print their
+artifact directory and return nonzero on failure.
+
 ### Browser automation
 
 Browser commands need a workspace-owned Chrome with loopback DevTools. `open-browser`

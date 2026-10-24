@@ -1,4 +1,6 @@
+use crate::launch::resolve_executable_path;
 use crate::policy::ProfileMount;
+use crate::session::SessionSpec;
 use crate::workspace::{self, WorkspaceApp, WorkspaceStatus};
 use anyhow::{anyhow, bail, Context, Result};
 use schemars::JsonSchema;
@@ -553,7 +555,7 @@ pub fn workspace_browser_open_plan(
     let user_data_dir = user_data_dir.unwrap_or_else(|| status.runtime_dir.join("browser-profile"));
     let url = url.unwrap_or_else(|| DEFAULT_BROWSER_URL.to_string());
     validate_navigation_url(&url)?;
-    let command = workspace_browser_command(&browser_path, &user_data_dir, &url);
+    let command = workspace_browser_command(&browser_path, &user_data_dir, &url, status.session);
     Ok(WorkspaceBrowserOpenPlan {
         spec: workspace::LaunchSpec {
             command,
@@ -2224,7 +2226,12 @@ fn map_mount_path(mounts: &[ProfileMount], workspace_path: &Path) -> Option<Path
     })
 }
 
-fn workspace_browser_command(browser_path: &Path, user_data_dir: &Path, url: &str) -> Vec<String> {
+fn workspace_browser_command(
+    browser_path: &Path,
+    user_data_dir: &Path,
+    url: &str,
+    session: SessionSpec,
+) -> Vec<String> {
     vec![
         browser_path.display().to_string(),
         format!("--user-data-dir={}", user_data_dir.display()),
@@ -2234,7 +2241,7 @@ fn workspace_browser_command(browser_path: &Path, user_data_dir: &Path, url: &st
         "--remote-debugging-port=0".to_string(),
         "--no-first-run".to_string(),
         "--no-default-browser-check".to_string(),
-        "--ozone-platform=x11".to_string(),
+        format!("--ozone-platform={}", session.chrome_ozone_platform()),
         "--new-window".to_string(),
         url.to_string(),
     ]
@@ -2247,41 +2254,11 @@ fn find_browser_executable() -> Option<PathBuf> {
         "chromium",
         "chromium-browser",
     ] {
-        if let Some(path) = resolve_executable(candidate) {
+        if let Some(path) = resolve_executable_path(candidate) {
             return Some(path);
         }
     }
     None
-}
-
-fn resolve_executable(program: &str) -> Option<PathBuf> {
-    if program.contains('/') {
-        let path = PathBuf::from(program);
-        return is_executable_file(&path).then_some(path);
-    }
-    env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .map(|dir| dir.join(program))
-            .find(|candidate| is_executable_file(candidate))
-    })
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
 }
 
 fn command_user_data_dir(command: &[String]) -> Option<PathBuf> {
@@ -2695,6 +2672,7 @@ mod tests {
     fn browser_status_for_test() -> WorkspaceStatus {
         WorkspaceStatus {
             id: "browser-dogfood".to_string(),
+            session: Default::default(),
             session_id: "session-browser-dogfood".to_string(),
             purpose: None,
             profile_id: None,
@@ -3030,9 +3008,19 @@ mod tests {
         // loopback and deliberately do NOT pass --remote-allow-origins.
         let command = workspace_browser_command(
             Path::new("/usr/bin/google-chrome"),
-            Path::new("/tmp/profile"),
+            Path::new("/tmp/approved-profile"),
             "about:blank",
+            SessionSpec::default(),
         );
+        assert_eq!(command[1], "--user-data-dir=/tmp/approved-profile");
+        assert_eq!(
+            command
+                .iter()
+                .filter(|arg| arg.starts_with("--user-data-dir="))
+                .count(),
+            1
+        );
+        assert!(command.iter().any(|arg| arg == "--ozone-platform=x11"));
         assert!(command
             .iter()
             .any(|arg| arg == "--remote-debugging-address=127.0.0.1"));

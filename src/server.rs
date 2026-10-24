@@ -4,6 +4,7 @@ use crate::control::{self, McpControlMode};
 use crate::guardrails;
 use crate::permissions::McpPermissionState;
 use crate::profile::{self, WorkspaceProfile};
+use crate::session::SessionSpec;
 use crate::viewer;
 use crate::workspace::{
     self, EnvVar, IpcResponse, LaunchSpec, ScrollDirection, WorkspaceStartOptions, WorkspaceStatus,
@@ -486,6 +487,7 @@ impl AgentWorkspaceLinux {
                 profiles: vec![WorkspaceProfile {
                     id: "error".to_string(),
                     description: Some(error.to_string()),
+                    session: SessionSpec::default(),
                     width: None,
                     height: None,
                     cwd: None,
@@ -806,7 +808,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_start",
-        description = "Start an isolated X11 agent workspace with its own display and control IPC socket. By default, when this MCP process is not --headless and workspace_doctor.ready_for_host_viewer=true, the tool also opens the small host-visible GPUI viewer immediately; set open_viewer=false to explicitly opt out. Set dry_run=true for a pre-daemon approval preview: it checks acknowledgement, runtime, and policy requirements without creating a runtime directory, daemon, display, viewer, or apps. Dry-run responses include an approval bundle for UI confirmation. Set acknowledge_hidden_workspace=true to confirm the user knows this creates a separate agent-controlled environment. Optional purpose records a human-readable reason in status and the start event. If the selected profile requests currently unenforced mount or network restrictions, also set acknowledge_unenforced_policy=true. Mount, disabled-network, and local_only network profiles are enforced with bubblewrap when available; local_only uses a loopback-only namespace and does not bridge host localhost services. The current product network modes are closed/disabled, local/local_only, and open/inherit_host; allowlist network profiles are advanced/legacy declared intent only. Profiles with require_enforced_policy=true reject unenforced policy instead of accepting acknowledgement.",
+        description = "Start an isolated agent workspace with its own display and control IPC socket. By default, when this MCP process is not --headless and workspace_doctor.ready_for_host_viewer=true, the tool also opens the small host-visible GPUI viewer immediately; set open_viewer=false to explicitly opt out. Set dry_run=true for a pre-daemon approval preview: it checks acknowledgement, runtime, and policy requirements without creating a runtime directory, daemon, display, viewer, or apps. Dry-run responses include an approval bundle for UI confirmation. Set acknowledge_hidden_workspace=true to confirm the user knows this creates a separate agent-controlled environment. Optional purpose records a human-readable reason in status and the start event. Optional session selects x11 (Xvfb with Openbox) or kwin (native Wayland, KWin 6.6+), with optional positive scale for KWin; an explicit session overrides the profile, which overrides the default. If the selected profile requests currently unenforced mount or network restrictions, also set acknowledge_unenforced_policy=true. Mount, disabled-network, and local_only network profiles are enforced with bubblewrap when available; local_only uses a loopback-only namespace and does not bridge host localhost services. The current product network modes are closed/disabled, local/local_only, and open/inherit_host; allowlist network profiles are advanced/legacy declared intent only. Profiles with require_enforced_policy=true reject unenforced policy instead of accepting acknowledgement.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -856,7 +858,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_open_profile",
-        description = "Start a profile-backed isolated workspace, optionally record a human-readable purpose, optionally wait for profile setup, optionally kill timed-out setup commands, and launch that profile's startup apps in one operation after setup succeeds. By default, when this MCP process is not --headless and workspace_doctor.ready_for_host_viewer=true, the small host-visible GPUI viewer opens immediately after the workspace starts and before setup/startup apps run; set open_viewer=false to explicitly opt out. Set dry_run=true for a pre-daemon approval preview: it returns the start preview plus setup/startup declarations without creating a runtime directory, daemon, display, viewer, or apps. The preview approval bundle merges all required acknowledgements. Setup/startup entries in this pre-daemon preview are declarations; daemon-attached launch previews are available only after a workspace is running. Set startup_wait_window=true to wait for each startup app's first visible window, or startup_screenshot_window=true to also capture each first startup window.",
+        description = "Start a profile-backed isolated workspace, optionally record a human-readable purpose, optionally wait for profile setup, optionally kill timed-out setup commands, and launch that profile's startup apps in one operation after setup succeeds. By default, when this MCP process is not --headless and workspace_doctor.ready_for_host_viewer=true, the small host-visible GPUI viewer opens immediately after the workspace starts and before setup/startup apps run; set open_viewer=false to explicitly opt out. Set dry_run=true for a pre-daemon approval preview: it returns the start preview plus setup/startup declarations without creating a runtime directory, daemon, display, viewer, or apps. The preview approval bundle merges all required acknowledgements. Setup/startup entries in this pre-daemon preview are declarations; daemon-attached launch previews are available only after a workspace is running. Optional session selects x11 (Xvfb with Openbox) or kwin (native Wayland, KWin 6.6+), with optional positive scale for KWin; an explicit session overrides the profile, which overrides the default. Set startup_wait_window=true to wait for each startup app's first visible window, or startup_screenshot_window=true to also capture each first startup window.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -3511,6 +3513,7 @@ struct McpSessionControlBrief {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 struct McpSessionDoctorBrief {
     ready_for_x11_workspace: bool,
+    ready_for_kwin_workspace: bool,
     ready_for_host_viewer: bool,
     recommended_next_step: String,
     blockers: Vec<String>,
@@ -5214,6 +5217,7 @@ fn build_agent_mode_summary(headless: bool) -> AgentModeSummary {
         allows_agent_mutation,
         headless,
         ready_for_x11_workspace: doctor.ready_for_x11_workspace,
+        ready_for_kwin_workspace: doctor.ready_for_kwin_workspace,
         ready_for_host_viewer: doctor.ready_for_host_viewer,
         viewer_available,
         viewer_unavailable_reason,
@@ -6490,6 +6494,7 @@ fn build_mcp_session_brief(permissions: &McpPermissionState, headless: bool) -> 
         control,
         doctor: McpSessionDoctorBrief {
             ready_for_x11_workspace: doctor.ready_for_x11_workspace,
+            ready_for_kwin_workspace: doctor.ready_for_kwin_workspace,
             ready_for_host_viewer: doctor.ready_for_host_viewer,
             recommended_next_step: doctor.recommended_next_step,
             blockers: doctor.blockers,
@@ -7489,6 +7494,13 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 "Use as the approval surface before hidden-workspace creation.",
             )
             .with_parameter_note(
+                "session",
+                "set explicitly, provided by a profile, or omitted",
+                "Explicit input overrides the profile session, which overrides the pinned X11/Xvfb+Openbox default; unsupported session values are rejected.",
+                "Session selection does not change live-control or permission enforcement.",
+                "Use {\"backend\":\"x11\"}; no additional approval mode is introduced.",
+            )
+            .with_parameter_note(
                 "open_viewer",
                 "false",
                 "Explicitly suppresses the default host-visible viewer auto-open.",
@@ -7519,6 +7531,13 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 "Preview start/setup/startup requirements without creating a workspace, viewer, or launching apps.",
                 "Allowed while live control is read_only or paused.",
                 "Use as the combined approval surface before running the profile.",
+            )
+            .with_parameter_note(
+                "session",
+                "set explicitly, provided by a profile, or omitted",
+                "Explicit input overrides the profile session, which overrides the pinned X11/Xvfb+Openbox default; unsupported session values are rejected.",
+                "Session selection does not change live-control or permission enforcement.",
+                "Use {\"backend\":\"x11\"}; no additional approval mode is introduced.",
             )
             .with_parameter_note(
                 "open_viewer",
@@ -8787,6 +8806,8 @@ struct WorkspaceStartParams {
     #[serde(default)]
     profile: Option<String>,
     #[serde(default)]
+    session: Option<SessionSpec>,
+    #[serde(default)]
     acknowledge_hidden_workspace: bool,
     #[serde(default)]
     acknowledge_unenforced_policy: bool,
@@ -8825,6 +8846,7 @@ impl WorkspaceStartParams {
         if let Some(height) = self.height {
             options.height = height;
         }
+        options.session = SessionSpec::resolve(self.session, Some(options.session));
         options.user_acknowledged_hidden_workspace = self.acknowledge_hidden_workspace;
         options.user_acknowledged_unenforced_policy = self.acknowledge_unenforced_policy;
         Ok(options)
@@ -8838,6 +8860,8 @@ struct WorkspaceOpenProfileParams {
     #[serde(default)]
     purpose: Option<String>,
     profile: String,
+    #[serde(default)]
+    session: Option<SessionSpec>,
     #[serde(default)]
     acknowledge_hidden_workspace: bool,
     #[serde(default)]
@@ -8888,6 +8912,7 @@ impl WorkspaceOpenProfileParams {
         if let Some(height) = self.height {
             options.height = height;
         }
+        options.session = SessionSpec::resolve(self.session, Some(options.session));
         options.user_acknowledged_hidden_workspace = self.acknowledge_hidden_workspace;
         options.user_acknowledged_unenforced_policy = self.acknowledge_unenforced_policy;
         Ok((options, profile_id))
@@ -10305,6 +10330,7 @@ mod tests {
     fn sample_workspace_status(id: &str, apps: Vec<workspace::WorkspaceApp>) -> WorkspaceStatus {
         WorkspaceStatus {
             id: id.to_string(),
+            session: SessionSpec::default(),
             session_id: "session-1".to_string(),
             purpose: Some("Project QA".to_string()),
             profile_id: Some("project-dev".to_string()),
@@ -10335,6 +10361,7 @@ mod tests {
     ) -> workspace::WorkspaceManifest {
         workspace::WorkspaceManifest {
             id: id.to_string(),
+            session: SessionSpec::default(),
             session_id: "session-2".to_string(),
             purpose: Some("Stopped browser task".to_string()),
             profile_id: Some("browser-session".to_string()),
@@ -10694,6 +10721,40 @@ mod tests {
                 tool.name
             );
         }
+    }
+
+    #[test]
+    fn action_catalog_session_notes_preserve_start_risk_and_enforcement() {
+        let catalog = mcp_action_catalog();
+        let start = catalog_tool(&catalog, "workspace_start");
+        let open_profile = catalog_tool(&catalog, "workspace_open_profile");
+
+        for tool in [start, open_profile] {
+            assert!(has_parameter_note(
+                tool,
+                "session",
+                "Explicit input overrides"
+            ));
+            assert!(has_parameter_note(tool, "session", "pinned X11"));
+            assert!(has_parameter_note(
+                tool,
+                "session",
+                "unsupported session values"
+            ));
+            assert!(has_parameter_note(
+                tool,
+                "session",
+                "does not change live-control or permission enforcement"
+            ));
+            assert_eq!(
+                tool.control_behavior,
+                "blocked_when_not_active_unless_dry_run"
+            );
+            assert!(!tool.read_only && tool.mutating && !tool.destructive);
+            assert!(tool.open_world);
+        }
+        assert!(start.idempotent);
+        assert!(!open_profile.idempotent);
     }
 
     #[test]

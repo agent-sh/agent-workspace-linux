@@ -8,6 +8,7 @@ pub struct AgentModeSummary {
     pub allows_agent_mutation: bool,
     pub headless: bool,
     pub ready_for_x11_workspace: bool,
+    pub ready_for_kwin_workspace: bool,
     pub ready_for_host_viewer: bool,
     pub viewer_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
