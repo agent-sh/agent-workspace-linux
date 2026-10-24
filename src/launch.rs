@@ -39,6 +39,11 @@ const HOST_SESSION_ENV_VARS: &[&str] = &[
     "XDG_RUNTIME_DIR",
     "PULSE_SERVER",
     "PULSE_COOKIE",
+    "PULSE_RUNTIME_PATH",
+    "PIPEWIRE_REMOTE",
+    "PIPEWIRE_RUNTIME_DIR",
+    "LIBEI_SOCKET",
+    "EIS_SOCKET",
     "SSH_AUTH_SOCK",
     "SSH_AGENT_PID",
     "DESKTOP_SESSION",
@@ -264,9 +269,11 @@ pub(crate) fn restricted_mount_namespace_args(
     cwd: Option<&Path>,
     network: LaunchNetworkPlan,
 ) -> Result<Vec<String>> {
-    let resources = status
-        .session
-        .sandbox_resources(&status.xauthority_path, &status.runtime_dir);
+    let resources = status.session.sandbox_resources(
+        &status.xauthority_path,
+        &status.runtime_dir,
+        &status.display,
+    );
     restricted_mount_namespace_args_with_resources(policy, cwd, network, resources)
 }
 

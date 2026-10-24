@@ -7,6 +7,8 @@ import socket
 import struct
 import subprocess
 import time
+import shutil
+from kwin_mcp import Mcp
 
 BIN = os.environ.get("KWIN_PROBE_BIN", "/opt/agent-workspace-linux")
 ARTIFACTS = Path(os.environ.get("KWIN_PROBE_ARTIFACT_DIR", "/artifacts"))
@@ -64,14 +66,30 @@ for scale in (1, 1.5):
     id = f"kwin-{int(scale * 100)}"
     note = Path(f"/tmp/kwin-note-{scale}.txt")
     note.write_text("")
+    mcp = None
     runtime = Path(os.environ["XDG_RUNTIME_DIR"]) / "agent-workspace-linux" / id
+    # Standard service activation would execute this outside app namespaces.
+    standard_services = runtime / "session-data/dbus-1/services"
+    standard_services.mkdir(parents=True, exist_ok=True)
+    marker = Path(f"/tmp/forbidden-service-{id}")
+    (standard_services / "org.agent_sh.Forbidden.service").write_text(
+        f"[D-BUS Service]\nName=org.agent_sh.Forbidden\nExec=/usr/bin/touch {marker}\n")
     status = None
     try:
-        start = workspace(id, "start", "--session", "kwin", "--scale", scale, "--width", 960, "--height", 720,
-                          "--ack-hidden-workspace", "--purpose", "Native KWin acceptance test")
+        if scale == 1.5:
+            mcp = Mcp(BIN, ARTIFACTS / f"{id}-mcp.log", headless=True)
+            start = mcp.tool("workspace_start", {"id": id, "session": {"backend":"kwin", "scale":scale},
+                "width":960, "height":720, "acknowledge_hidden_workspace":True,
+                "purpose":"Native MCP acceptance", "open_viewer":False})
+            assert start["ok"], start
+        else:
+            start = workspace(id, "start", "--session", "kwin", "--scale", scale, "--width", 960, "--height", 720,
+                              "--ack-hidden-workspace", "--purpose", "Native KWin acceptance test")
         status = workspace(id, "status")
         assert status["session"]["backend"] == "kwin"
         assert status["session"].get("scale", 1) == scale
+        output=json.loads((runtime/"output-config.json").read_text())
+        assert output["outputs"][0]["scale"] == scale, output
         assert status["x_server_pid"] == 0
         assert status["window_manager_pid"]
         initial_x_sockets = set(Path("/tmp/.X11-unix").iterdir())
@@ -83,6 +101,17 @@ for scale in (1, 1.5):
         assert env["DBUS_SESSION_BUS_ADDRESS"].endswith(f"/{id}/session-bus")
         assert env["WAYLAND_DISPLAY"] == "workspace-wayland"
         assert env["QT_QPA_PLATFORM"] == "wayland"
+        bus_env = dict(os.environ, **env)
+        forbidden = subprocess.run(["dbus-send", "--session", "--print-reply", "--reply-timeout=1000",
+            "--dest=org.agent_sh.Forbidden", "/org/agent_sh/Forbidden", "org.agent_sh.Forbidden.Ping"],
+            env=bus_env, capture_output=True, text=True, timeout=3)
+        assert not marker.exists(), "standard desktop service escaped launch control"
+        assert forbidden.returncode != 0 and "ServiceUnknown" in forbidden.stderr, forbidden
+        update = subprocess.run(["dbus-send", "--session", "--print-reply", "--reply-timeout=1000",
+            "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.UpdateActivationEnvironment", "dict:string:string:DISPLAY,:999"],
+            env=bus_env, capture_output=True, text=True, timeout=3)
+        assert update.returncode != 0 and "AccessDenied" in update.stderr, update
         # A real Qt Wayland client, controlled through the same public IPC as MCP.
         launch = workspace(id, "launch", "--wait-window", "--window-timeout-ms", 10000, "--", "kwrite", note)
         windows = workspace(id, "windows")["windows"]
@@ -102,9 +131,18 @@ for scale in (1, 1.5):
         workspace(id, "key", "ctrl+End")
         workspace(id, "paste", "\nPasted via private Wayland clipboard")
         workspace(id, "key", "ctrl+s")
-        wait_for(lambda: "Pasted via private Wayland clipboard" in note.read_text(), "clipboard paste")
-        workspace(id, "move-window", wid, 30, 45)
+        def pasted():
+            # Qt receives clipboard data asynchronously after the paste chord.
+            workspace(id,"key","ctrl+s")
+            return "Pasted via private Wayland clipboard" in note.read_text()
+        wait_for(pasted, "clipboard paste")
+        moved = workspace(id, "move-window", wid, 30, 45)
+        assert (moved["windows"][0]["geometry"]["x"], moved["windows"][0]["geometry"]["y"]) == (30,45), moved
         workspace(id, "resize-window", wid, 600, 450)
+        def resized():
+            current = next(w for w in workspace(id,"windows")["windows"] if w["id"]==wid)
+            return current["geometry"]["width"]==600 and current["geometry"]["height"]==450
+        wait_for(resized, "native asynchronous resize")
         workspace(id, "raise-window", wid)
         workspace(id, "minimize-window", wid)
         assert not next(w for w in workspace(id, "windows", "--all")["windows"] if w["id"] == wid)["visible"]
@@ -118,9 +156,11 @@ for scale in (1, 1.5):
         workspace(id, "scroll", 180, 220, "down")
         shot = workspace(id, "screenshot")["screenshot"]
         assert check_png(shot["path"]) == (960, 720), shot
+        shutil.copy2(shot["path"],ARTIFACTS/f"{id}-desktop.png")
         shot = workspace(id, "screenshot-window", "--window", wid)["screenshot"]
         assert shot["target"] == "window" and shot["window_id"] == wid
-        check_png(shot["path"])
+        assert check_png(shot["path"]) == (600,450), shot
+        shutil.copy2(shot["path"],ARTIFACTS/f"{id}-window.png")
         # Exactly the request the GPUI viewer uses, including its frame metadata.
         with socket.socket(socket.AF_UNIX) as client:
             client.settimeout(10)
@@ -135,6 +175,8 @@ for scale in (1, 1.5):
         workspace(id, "close-window", wid)
         print(f"KWin {scale}: native Qt, Unicode input, clipboard, window control, pointer, capture and viewer frames passed", flush=True)
     finally:
+        if mcp:
+            mcp.close()
         for path in runtime.glob("*.log"):
             (ARTIFACTS / f"{id}-{path.name}").write_bytes(path.read_bytes())
         if status is None:
@@ -146,4 +188,25 @@ for scale in (1, 1.5):
             wait_for(lambda: not Path(f"/proc/{status['window_manager_pid']}").exists(), "compositor process cleanup")
             assert not (runtime / "workspace-wayland").exists(), "Wayland socket survived clean stop"
             assert not any(path.exists() for path in initial_x_sockets), "XWayland socket survived clean stop"
+# Enforced mounts + network namespace must retain the owning XWayland socket.
+project = Path("/tmp/legacy-project")
+project.mkdir()
+profile = Path("/tmp/legacy-profile.json")
+profile.write_text(json.dumps({"id":"kwin-restricted", "session":{"backend":"kwin"},
+    "cwd":"/workspace/project", "require_enforced_policy":True,
+    "network":{"mode":"disabled"}, "mounts":[{"host_path":str(project),
+    "workspace_path":"/workspace/project", "mode":"read_write"}]}))
+command("profile","import","--json",profile)
+id="kwin-restricted"
+try:
+    workspace(id,"start","--profile","kwin-restricted","--ack-hidden-workspace", "--purpose","Legacy XWayland sandbox acceptance")
+    launch=workspace(id,"launch","--wait-window","--window-timeout-ms",10000,"--","xterm","-fa","monospace","-e","sh","-c","printf ready > /workspace/project/ready; exec tail -f /dev/null")
+    assert launch["windows"], launch
+    wait_for(lambda:(project/"ready").exists(),"XWayland terminal in enforced sandbox")
+    app=launch["apps"][0]
+    assert app["mount_isolation"]=="bubblewrap_mount_namespace",app
+    assert app["network_isolation"]=="bubblewrap_unshare_net",app
+    print("KWin restricted XWayland terminal passed",flush=True)
+finally:
+    workspace(id,"stop")
 print("KWin native acceptance passed", flush=True)

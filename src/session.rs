@@ -21,6 +21,29 @@ impl SessionSpec {
         explicit.or(profile).unwrap_or_default()
     }
 
+    pub fn describe_policy(self, policy: &mut crate::policy::AppliedWorkspacePolicy) {
+        let (backend, detail) = match self.backend {
+            SessionBackend::Kwin => (
+                "kwin_wayland_runtime",
+                "workspace apps use a private KWin Wayland display and session bus",
+            ),
+            SessionBackend::X11 => (
+                "xvfb_xauth_display",
+                "workspace apps run on a private X11 DISPLAY with a scoped XAUTHORITY",
+            ),
+        };
+        policy.enforcement.display_isolation.backend = Some(backend.to_owned());
+        policy.enforcement.display_isolation.detail = detail.to_owned();
+    }
+    pub fn matches(self, other: Self) -> bool {
+        self.backend == other.backend
+            && (self.scale - other.scale).abs()
+                <= if self.backend == SessionBackend::Kwin {
+                    0.5 / 256.0
+                } else {
+                    0.0
+                }
+    }
     pub fn validate(self) -> Result<()> {
         if !self.scale.is_finite() || self.scale <= 0.0 {
             bail!("session scale must be finite and positive");
@@ -77,10 +100,11 @@ impl SessionSpec {
         self,
         xauthority_path: &Path,
         runtime_dir: &Path,
+        display: &str,
     ) -> crate::launch::SessionSandboxResources {
         match self.backend {
             SessionBackend::X11 => x11::sandbox_resources(xauthority_path),
-            SessionBackend::Kwin => kwin::sandbox_resources(runtime_dir, xauthority_path),
+            SessionBackend::Kwin => kwin::sandbox_resources(runtime_dir, xauthority_path, display),
         }
     }
 
@@ -202,6 +226,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_scale_identity_allows_only_fixed_point_rounding() {
+        let requested = SessionSpec {
+            backend: SessionBackend::Kwin,
+            scale: 1.3,
+        };
+        assert!(requested.matches(SessionSpec {
+            scale: 1.30078125,
+            ..requested
+        }));
+        assert!(!requested.matches(SessionSpec {
+            scale: 1.5,
+            ..requested
+        }));
+        assert!(!requested.matches(SessionSpec::default()));
+    }
+
+    #[test]
     fn scale_requires_a_positive_finite_native_output() {
         let mut session: SessionSpec = "kwin".parse().unwrap();
         session.scale = 1.5;
@@ -229,7 +270,7 @@ mod tests {
     #[test]
     fn explicit_session_precedes_profile_and_default() {
         let explicit = SessionSpec::default();
-        let profile = SessionSpec::default();
+        let profile = "kwin".parse::<SessionSpec>().expect("native profile");
 
         assert_eq!(
             SessionSpec::resolve(Some(explicit), Some(profile)),

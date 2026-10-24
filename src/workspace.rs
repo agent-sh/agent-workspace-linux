@@ -3258,6 +3258,9 @@ pub fn stop_workspace(id: &str, timeout_ms: Option<u64>, dry_run: bool) -> Resul
 }
 
 pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
+    if let Some(policy) = options.applied_policy.as_mut() {
+        options.session.describe_policy(policy);
+    }
     let id = sanitize_workspace_id(&options.id)?;
     let session_id = normalize_session_id(&options.session_id)?;
     options.purpose = normalize_workspace_purpose(options.purpose)?;
@@ -3374,14 +3377,17 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
     Ok(())
 }
 
-fn workspace_start_preview(options: WorkspaceStartOptions) -> Result<WorkspaceStartPreview> {
+fn workspace_start_preview(mut options: WorkspaceStartOptions) -> Result<WorkspaceStartPreview> {
+    if let Some(policy) = options.applied_policy.as_mut() {
+        options.session.describe_policy(policy);
+    }
     let id = sanitize_workspace_id(&options.id)?;
     let purpose = normalize_workspace_purpose(options.purpose)?;
     let running_status = status_workspace(&id).ok();
     let already_running = running_status.is_some();
     let session_mismatch = running_status
         .as_ref()
-        .is_some_and(|status| status.session != options.session);
+        .is_some_and(|status| !status.session.matches(options.session));
     options.session.validate()?;
     let socket_path = workspace_socket_path(&id);
     let socket_path_error = validate_unix_socket_path(&socket_path)
@@ -3500,7 +3506,7 @@ fn session_mismatch_message(id: &str, requested: &SessionSpec, existing: &Sessio
 }
 
 fn ensure_session_matches(id: &str, requested: &SessionSpec, existing: &SessionSpec) -> Result<()> {
-    if requested != existing {
+    if !requested.matches(*existing) {
         bail!("{}", session_mismatch_message(id, requested, existing));
     }
     Ok(())
@@ -3511,7 +3517,10 @@ enum WorkspaceStartPlan {
     Start(DaemonOptions),
 }
 
-fn prepare_workspace_start(options: WorkspaceStartOptions) -> Result<WorkspaceStartPlan> {
+fn prepare_workspace_start(mut options: WorkspaceStartOptions) -> Result<WorkspaceStartPlan> {
+    if let Some(policy) = options.applied_policy.as_mut() {
+        options.session.describe_policy(policy);
+    }
     let id = sanitize_workspace_id(&options.id)?;
     let purpose = normalize_workspace_purpose(options.purpose)?;
     if let Ok(status) = status_workspace(&id) {
@@ -8406,6 +8415,13 @@ fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<()> {
         if socket_path.exists() {
             return Ok(());
         }
+        if let Some(parent) = socket_path.parent() {
+            if let Ok(error) = fs::read_to_string(parent.join("daemon.err.log")) {
+                if error.starts_with("Error:") {
+                    bail!("workspace startup failed: {}", error.trim());
+                }
+            }
+        }
         thread::sleep(Duration::from_millis(100));
     }
     bail!("timed out waiting for workspace IPC socket");
@@ -8571,7 +8587,7 @@ fn runtime_base_dir() -> PathBuf {
         let runtime = PathBuf::from(runtime);
         if runtime.is_absolute()
             && runtime.file_name().and_then(|name| name.to_str()) == Some(id.as_str())
-            && PathBuf::from(socket) == runtime.join("control.sock")
+            && socket == runtime.join("control.sock")
         {
             if let Some(parent) = runtime.parent() {
                 return parent.to_path_buf();

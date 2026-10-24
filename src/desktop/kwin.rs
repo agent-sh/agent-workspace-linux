@@ -157,11 +157,26 @@ catch(e) {{ callDBus({unique}, {path}, {interface}, 'Result', JSON.stringify({{o
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let (width, height, pixels) =
+        let (mut width, mut height, pixels) =
             read_frame(&self.status.runtime_dir, window.map(|w| w.id.as_str()))?;
-        image::RgbaImage::from_raw(width, height, pixels)
-            .context("invalid KWin image dimensions")?
-            .save(&path)?;
+        let mut image = image::RgbaImage::from_raw(width, height, pixels)
+            .context("invalid KWin image dimensions")?;
+        // CaptureWindow uses client target scale, which can differ from the
+        // fractional output scale. Normalize onto the workspace pixel grid.
+        if let Some(window) = window {
+            let target = &window.geometry;
+            if (width, height) != (target.width, target.height) {
+                image = image::imageops::resize(
+                    &image,
+                    target.width,
+                    target.height,
+                    image::imageops::FilterType::Triangle,
+                );
+                width = target.width;
+                height = target.height;
+            }
+        }
+        image.save(&path)?;
         workspace_screenshot_result(
             path,
             width,
@@ -174,6 +189,27 @@ catch(e) {{ callDBus({unique}, {path}, {interface}, 'Result', JSON.stringify({{o
             },
             window.map(|w| w.id.clone()),
         )
+    }
+    fn wait_geometry(
+        &self,
+        id: &str,
+        matches: impl Fn(&crate::workspace::WindowGeometry) -> bool,
+        action: &str,
+    ) -> Result<WorkspaceWindow> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let window = self.window_info(id)?;
+            if matches(&window.geometry) {
+                return Ok(window);
+            }
+            if std::time::Instant::now() >= deadline {
+                bail!(
+                    "KWin did not apply {action}; actual geometry: {:?}",
+                    window.geometry
+                );
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
     }
     fn input(&self) -> Result<input::Input> {
         input::Input::connect(&self.status.runtime_dir)
@@ -232,24 +268,28 @@ impl DesktopControl for KwinDesktopControl<'_> {
         self.mutate(
             id,
             &format!(
-                "var g=w.frameGeometry; g.x={};g.y={};w.frameGeometry=g",
+                "var g=w.frameGeometry; w.frameGeometry={{x:{},y:{},width:g.width,height:g.height}}",
                 x as f64 / self.status.session.scale,
                 y as f64 / self.status.session.scale
             ),
         )?;
-        self.window_info(id)
+        self.wait_geometry(id, |g| (g.x - x).abs() <= 1 && (g.y - y).abs() <= 1, "move")
     }
     fn resize_window(&self, id: &str, width: u32, height: u32) -> Result<WorkspaceWindow> {
         validate_window_size_for_workspace(self.status, width, height)?;
         self.mutate(
             id,
             &format!(
-                "var g=w.frameGeometry;g.width={};g.height={};w.frameGeometry=g",
+                "var g=w.frameGeometry;w.frameGeometry={{x:g.x,y:g.y,width:{},height:{}}}",
                 width as f64 / self.status.session.scale,
                 height as f64 / self.status.session.scale
             ),
         )?;
-        self.window_info(id)
+        self.wait_geometry(
+            id,
+            |g| g.width.abs_diff(width) <= 1 && g.height.abs_diff(height) <= 1,
+            "resize",
+        )
     }
     fn raise_window(&self, id: &str) -> Result<WorkspaceWindow> {
         self.mutate(id, "workspace.raiseWindow(w)")?;

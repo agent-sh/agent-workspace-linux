@@ -44,7 +44,9 @@ RUN apt-get update \
     && setcap -r /usr/bin/kwin_wayland \
     && rm -rf /var/lib/apt/lists/*
 
-COPY kwin_probe_guest.sh kwin_smoke.py /opt/kwin-probe/
+RUN apt-get update && apt-get install -y --no-install-recommends xterm libkscreen-bin && rm -rf /var/lib/apt/lists/*
+
+COPY kwin_probe_guest.sh kwin_smoke.py kwin_mcp.py /opt/kwin-probe/
 RUN chmod 0755 /opt/kwin-probe/kwin_probe_guest.sh
 
 ENTRYPOINT ["/opt/kwin-probe/kwin_probe_guest.sh"]

@@ -56,6 +56,8 @@ docker run \
   --read-only \
   --cap-drop ALL \
   --security-opt no-new-privileges \
+  --security-opt seccomp=unconfined \
+  --security-opt apparmor=unconfined \
   --user 65534:65534 \
   --group-add "$(stat -c %g "$RENDER_NODE")" \
   --device "$RENDER_NODE" \

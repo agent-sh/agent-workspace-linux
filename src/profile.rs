@@ -929,14 +929,16 @@ pub fn apply_profile_to_start_options(
 }
 
 pub fn applied_policy(profile: &WorkspaceProfile) -> AppliedWorkspacePolicy {
-    AppliedWorkspacePolicy::new_with_capabilities(
+    let mut policy = AppliedWorkspacePolicy::new_with_capabilities(
         profile.id.clone(),
         profile.mounts.clone(),
         profile.network.clone(),
         profile.require_enforced_policy,
         profile.setup_commands.len(),
         workspace::policy_runtime_capabilities(),
-    )
+    );
+    profile.session.describe_policy(&mut policy);
+    policy
 }
 
 fn policy_warnings(policy: &AppliedWorkspacePolicy) -> Vec<String> {

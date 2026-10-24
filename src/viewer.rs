@@ -2726,6 +2726,15 @@ impl Render for AgentWorkspaceViewer {
             .map(|status| status.display.as_str())
             .or_else(|| manifest.map(|manifest| manifest.display.as_str()))
             .unwrap_or("-");
+        let session = status
+            .map(|s| s.session)
+            .or_else(|| manifest.map(|m| m.session))
+            .unwrap_or_default();
+        let display_label = if session.backend == crate::session::SessionBackend::Kwin {
+            format!("KWin Wayland | {:.0}%", session.scale * 100.0)
+        } else {
+            display.to_string()
+        };
         let app_count = status
             .map(|status| status.apps.len())
             .or_else(|| manifest.map(|manifest| manifest.apps.len()))
@@ -2792,7 +2801,7 @@ impl Render for AgentWorkspaceViewer {
         } else if let Some(error) = &self.error {
             error.clone()
         } else if running {
-            format!("{display} | {app_count} app(s) | {activity_label}")
+            format!("{display_label} | {app_count} app(s) | {activity_label}")
         } else if self.snapshot.doctor_ready {
             format!("Ready | Profile: {selected_profile_label}")
         } else {

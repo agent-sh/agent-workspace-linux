@@ -52,7 +52,16 @@ pub(crate) fn blockers() -> Vec<String> {
 }
 
 pub(crate) fn bus_address(runtime: &Path) -> String {
-    format!("unix:path={}", runtime.join("session-bus").display())
+    use std::{fmt::Write as _, os::unix::ffi::OsStrExt};
+    let mut address = String::from("unix:path=");
+    for byte in runtime.join("session-bus").as_os_str().as_bytes() {
+        if byte.is_ascii_alphanumeric() || b"_-/.\\".contains(byte) {
+            address.push(*byte as char);
+        } else {
+            write!(address, "%{byte:02X}").expect("write to String");
+        }
+    }
+    address
 }
 
 pub(crate) fn configure_process_environment(
@@ -64,6 +73,8 @@ pub(crate) fn configure_process_environment(
     crate::launch::scrub_host_session_environment(command);
     command
         .env("XDG_RUNTIME_DIR", runtime)
+        .env("PIPEWIRE_RUNTIME_DIR", runtime)
+        .env("PIPEWIRE_REMOTE", "pipewire-0")
         .env("DBUS_SESSION_BUS_ADDRESS", bus_address(runtime))
         .env("WAYLAND_DISPLAY", WAYLAND_SOCKET)
         .env_remove("WAYLAND_SOCKET")
@@ -72,6 +83,8 @@ pub(crate) fn configure_process_environment(
         .env("XDG_SESSION_DESKTOP", "KDE")
         .env("XDG_MENU_PREFIX", "agent-workspace-")
         .env("KDE_FULL_SESSION", "true")
+        .env("QT_LINUX_ACCESSIBILITY_ALWAYS_ON", "1")
+        .env("NO_AT_BRIDGE", "0")
         .env("GDK_BACKEND", "wayland")
         .env("QT_QPA_PLATFORM", "wayland")
         .env("SDL_VIDEODRIVER", "wayland")
@@ -81,6 +94,9 @@ pub(crate) fn configure_process_environment(
         .env("XDG_CONFIG_HOME", runtime.join("session-config"))
         .env("XDG_CACHE_HOME", runtime.join("session-cache"))
         .env("XDG_DATA_HOME", runtime.join("session-data"));
+    if let Ok(address) = fs::read_to_string(runtime.join("atspi-address")) {
+        command.env("AT_SPI_BUS_ADDRESS", address.trim());
+    }
     if display.is_empty() {
         command.env_remove("DISPLAY").env_remove("XAUTHORITY");
     } else {
@@ -90,14 +106,33 @@ pub(crate) fn configure_process_environment(
     }
 }
 
-pub(crate) fn sandbox_resources(runtime: &Path, xauthority: &Path) -> SessionSandboxResources {
+pub(crate) fn sandbox_resources(
+    runtime: &Path,
+    xauthority: &Path,
+    display: &str,
+) -> SessionSandboxResources {
     let mut read_only_binds = Vec::new();
     if xauthority.is_file() {
         read_only_binds.push(xauthority.to_path_buf());
     }
+    let mut read_write_binds = vec![runtime.join(WAYLAND_SOCKET), runtime.join("session-bus")];
+    if let Some(number) = display
+        .strip_prefix(':')
+        .and_then(|s| s.split('.').next())
+        .filter(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
+    {
+        let socket = std::path::PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
+        if socket.exists() {
+            read_write_binds.push(socket);
+        }
+    }
+    let atspi = runtime.join("at-spi/bus");
+    if atspi.exists() {
+        read_write_binds.push(atspi);
+    }
     SessionSandboxResources {
         read_only_binds,
-        read_write_binds: [runtime.join(WAYLAND_SOCKET), runtime.join("session-bus")].into(),
+        read_write_binds,
     }
 }
 
@@ -107,6 +142,9 @@ pub(crate) struct KwinSession {
 }
 impl KwinSession {
     pub(crate) fn start(options: &mut DaemonOptions) -> Result<Self> {
+        if options.width == 0 || options.height == 0 {
+            bail!("workspace dimensions must be positive");
+        }
         let runtime = &options.runtime_dir;
         for directory in [
             "session-config",
@@ -154,10 +192,47 @@ impl KwinSession {
             compositor: None,
             bus: None,
         };
+        let service_dir = runtime.join("session-services");
+        fs::create_dir_all(&service_dir)?;
+        // Only this narrowly scoped accessibility service may auto-activate.
+        // Standard desktop services would execute outside app launch sandboxes.
+        let accessibility = Path::new("/usr/share/dbus-1/services/org.a11y.Bus.service");
+        if accessibility.is_file() {
+            fs::copy(accessibility, service_dir.join("org.a11y.Bus.service"))?;
+        }
+        let escape = |path: &Path| {
+            path.to_string_lossy()
+                .replace('&', "&amp;")
+                .replace('<', "&lt;")
+                .replace('>', "&gt;")
+                .replace('"', "&quot;")
+        };
+        let bus_config = runtime.join("session-bus.conf");
+        fs::write(
+            &bus_config,
+            format!(
+                r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig><type>session</type><auth>EXTERNAL</auth><listen>{bus}</listen>
+<servicedir>{}</servicedir>
+<policy context="default">
+<allow user="{uid}"/><allow own="*"/><allow send_destination="*"/><allow receive_sender="*"/>
+<deny send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus" send_member="UpdateActivationEnvironment"/>
+<deny send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus" send_member="ReloadConfig"/>
+</policy></busconfig>"#,
+                escape(&service_dir),
+                bus = bus_address(runtime),
+                uid = unsafe { libc::geteuid() }
+            ),
+        )?;
         let mut bus = Command::new("dbus-daemon");
         configure_process_environment(&mut bus, runtime, "", &options.xauthority_path);
-        bus.env("HOME", runtime.join("session-home"));
-        bus.args(["--session", "--nofork", "--nopidfile", "--address"])
+        // The allowed AT-SPI launcher stores only session-local accessibility
+        // state. Its GSettings writes must not require an unconfined dconf service.
+        bus.env("HOME", runtime.join("session-home"))
+            .env("GSETTINGS_BACKEND", "memory");
+        bus.arg("--config-file")
+            .arg(&bus_config)
+            .args(["--nofork", "--nopidfile", "--address"])
             .arg(bus_address(runtime));
         prepare_child(&mut bus);
         bus.stdout(Stdio::null())
@@ -170,6 +245,27 @@ impl KwinSession {
             || Ok(bus_path.exists()),
             "private KWin bus",
         )?;
+        if accessibility.is_file() {
+            let connection =
+                zbus::blocking::connection::Builder::address(bus_address(runtime).as_str())?
+                    .method_timeout(Duration::from_secs(5))
+                    .build()?;
+            let bus = zbus::blocking::Proxy::new(
+                &connection,
+                "org.a11y.Bus",
+                "/org/a11y/bus",
+                "org.a11y.Bus",
+            )?;
+            let address: String = bus.call("GetAddress", &())?;
+            let status = zbus::blocking::Proxy::new(
+                &connection,
+                "org.a11y.Bus",
+                "/org/a11y/bus",
+                "org.a11y.Status",
+            )?;
+            status.set_property("IsEnabled", true)?;
+            fs::write(runtime.join("atspi-address"), address)?;
+        }
         let client_env = runtime.join("kwin-client.json");
         if client_env.exists() {
             fs::remove_file(&client_env)?;
@@ -247,9 +343,82 @@ impl KwinSession {
         )?;
         let env: serde_json::Value = serde_json::from_slice(&fs::read(&client_env)?)?;
         options.display = env["DISPLAY"].as_str().unwrap_or_default().to_string();
+        if options.display.is_empty() {
+            bail!("KWin did not provide its XWayland display; check the private X11 socket setup in kwin.log");
+        }
         if let Some(path) = env["XAUTHORITY"].as_str().filter(|s| !s.is_empty()) {
             options.xauthority_path = path.into();
         }
+        // KWin's output configuration store can replace --scale after virtual
+        // output creation. Apply and verify scale through the native output API.
+        let mut query = Command::new("timeout");
+        configure_process_environment(
+            &mut query,
+            runtime,
+            &options.display,
+            &options.xauthority_path,
+        );
+        let output = query.args(["5s", "kscreen-doctor", "--json"]).output()?;
+        if !output.status.success() {
+            bail!(
+                "query KWin output configuration: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let config: serde_json::Value =
+            serde_json::from_slice(&output.stdout).context("decode KWin output configuration")?;
+        let outputs = config["outputs"]
+            .as_array()
+            .context("KWin output list missing")?;
+        if outputs.len() != 1 {
+            bail!("private KWin session must have exactly one output");
+        }
+        let id = outputs[0]["id"]
+            .as_u64()
+            .context("KWin output id missing")?;
+        let mut apply = Command::new("timeout");
+        configure_process_environment(
+            &mut apply,
+            runtime,
+            &options.display,
+            &options.xauthority_path,
+        );
+        let output = apply
+            .args(["5s", "kscreen-doctor"])
+            .arg(format!("output.{id}.scale.{}", options.session.scale))
+            .output()?;
+        fs::write(runtime.join("output-config.log"), &output.stderr)?;
+        if !output.status.success() {
+            bail!(
+                "apply KWin output scale: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let verified = query.output()?;
+        if !verified.status.success() {
+            bail!(
+                "verify KWin output scale: {}",
+                String::from_utf8_lossy(&verified.stderr)
+            );
+        }
+        fs::write(runtime.join("output-config.json"), &verified.stdout)?;
+        let verified: serde_json::Value = serde_json::from_slice(&verified.stdout)?;
+        let actual_scale = verified["outputs"][0]["scale"]
+            .as_f64()
+            .context("KWin output scale missing")?;
+        let actual = crate::session::SessionSpec {
+            backend: crate::session::SessionBackend::Kwin,
+            scale: actual_scale,
+        };
+        actual.validate()?;
+        // KDE output-management sends scale as Wayland 24.8 fixed point.
+        if !options.session.matches(actual) {
+            bail!(
+                "KWin output scale is {actual_scale}, requested {}",
+                options.session.scale
+            );
+        }
+        options.session = actual;
         let (width, height) = crate::desktop::kwin::probe(&options.runtime_dir)?;
         options.width = width;
         options.height = height;
@@ -296,6 +465,12 @@ fn prepare_child(command: &mut Command) {
     // server if its workspace daemon crashes, including the fork/prctl race.
     unsafe {
         command.pre_exec(move || {
+            // Ignore executable file capabilities in this private session.
+            // This also keeps the parent-death signal across compositor exec.
+            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
