@@ -30,6 +30,7 @@ use zbus::{
 };
 #[path = "kwin_input.rs"]
 mod input;
+pub(super) use input::keysyms;
 
 static SCRIPT_ID: AtomicU64 = AtomicU64::new(0);
 const CALLBACK_PATH: &str = "/org/agent_sh/Workspace/KWin";

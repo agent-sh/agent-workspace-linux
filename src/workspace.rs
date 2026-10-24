@@ -128,6 +128,8 @@ pub struct DoctorReport {
     pub viewer: ViewerRuntimeReport,
     pub ready_for_x11_workspace: bool,
     pub ready_for_kwin_workspace: bool,
+    pub ready_for_gnome_workspace: bool,
+    pub gnome_blockers: Vec<String>,
     pub kwin_blockers: Vec<String>,
     pub ready_for_host_viewer: bool,
     pub blockers: Vec<String>,
@@ -1168,8 +1170,11 @@ pub fn doctor_report() -> DoctorReport {
             .to_string()
     };
 
+    let gnome_blockers = crate::session::gnome::blockers();
     let kwin_blockers = crate::session::kwin::blockers();
     DoctorReport {
+        ready_for_gnome_workspace: gnome_blockers.is_empty(),
+        gnome_blockers,
         ready_for_kwin_workspace: kwin_blockers.is_empty(),
         kwin_blockers,
         runtime,
@@ -1221,7 +1226,7 @@ pub fn start_workspace(options: WorkspaceStartOptions) -> Result<IpcResponse> {
             spawn_detached_daemon(&daemon_options)?;
             wait_for_socket(
                 &daemon_options.socket_path,
-                if daemon_options.session.backend == crate::session::SessionBackend::Kwin {
+                if daemon_options.session.backend != crate::session::SessionBackend::X11 {
                     Duration::from_secs(30)
                 } else {
                     Duration::from_secs(5)

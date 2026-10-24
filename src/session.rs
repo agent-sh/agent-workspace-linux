@@ -1,5 +1,6 @@
-pub(crate) mod private;
+pub(crate) mod gnome;
 pub(crate) mod kwin;
+pub(crate) mod private;
 pub(crate) mod x11;
 
 use crate::desktop::DesktopControl;
@@ -24,6 +25,10 @@ impl SessionSpec {
 
     pub fn describe_policy(self, policy: &mut crate::policy::AppliedWorkspacePolicy) {
         let (backend, detail) = match self.backend {
+            SessionBackend::Gnome => (
+                "gnome_wayland_runtime",
+                "workspace apps use a private GNOME Wayland display and session bus",
+            ),
             SessionBackend::Kwin => (
                 "kwin_wayland_runtime",
                 "workspace apps use a private KWin Wayland display and session bus",
@@ -39,10 +44,11 @@ impl SessionSpec {
     pub fn matches(self, other: Self) -> bool {
         self.backend == other.backend
             && (self.scale - other.scale).abs()
-                <= if self.backend == SessionBackend::Kwin {
-                    0.5 / 256.0
-                } else {
-                    0.0
+                <= match self.backend {
+                    SessionBackend::Kwin => 0.5 / 256.0,
+                    // Mutter exposes monitor scale as a single-precision float.
+                    SessionBackend::Gnome => 1e-6,
+                    SessionBackend::X11 => 0.0,
                 }
     }
     pub fn validate(self) -> Result<()> {
@@ -50,7 +56,7 @@ impl SessionSpec {
             bail!("session scale must be finite and positive");
         }
         if self.backend == SessionBackend::X11 && self.scale != 1.0 {
-            bail!("X11 sessions use scale 1; choose kwin for output scaling");
+            bail!("X11 sessions use scale 1; choose a native Wayland backend for output scaling");
         }
         Ok(())
     }
@@ -59,6 +65,7 @@ impl SessionSpec {
         match self.backend {
             SessionBackend::X11 => crate::workspace::doctor_report().blockers,
             SessionBackend::Kwin => kwin::blockers(),
+            SessionBackend::Gnome => gnome::blockers(),
         }
     }
 
@@ -67,6 +74,7 @@ impl SessionSpec {
         match self.backend {
             SessionBackend::X11 => x11::X11Session::start(options).map(Session::X11),
             SessionBackend::Kwin => kwin::KwinSession::start(options).map(Session::Kwin),
+            SessionBackend::Gnome => gnome::GnomeSession::start(options).map(Session::Gnome),
         }
     }
 
@@ -76,6 +84,9 @@ impl SessionSpec {
     ) -> Box<dyn DesktopControl + 'a> {
         match self.backend {
             SessionBackend::X11 => Box::new(crate::desktop::x11::X11DesktopControl::new(status)),
+            SessionBackend::Gnome => {
+                Box::new(crate::desktop::gnome::GnomeDesktopControl::new(status))
+            }
             SessionBackend::Kwin => Box::new(crate::desktop::kwin::KwinDesktopControl::new(status)),
         }
     }
@@ -91,6 +102,9 @@ impl SessionSpec {
             SessionBackend::X11 => {
                 x11::configure_process_environment(command, display, xauthority);
             }
+            SessionBackend::Gnome => {
+                gnome::configure_process_environment(command, runtime_dir, display, xauthority)
+            }
             SessionBackend::Kwin => {
                 kwin::configure_process_environment(command, runtime_dir, display, xauthority)
             }
@@ -105,6 +119,9 @@ impl SessionSpec {
     ) -> crate::launch::SessionSandboxResources {
         match self.backend {
             SessionBackend::X11 => x11::sandbox_resources(xauthority_path),
+            SessionBackend::Gnome => {
+                gnome::sandbox_resources(runtime_dir, xauthority_path, display)
+            }
             SessionBackend::Kwin => kwin::sandbox_resources(runtime_dir, xauthority_path, display),
         }
     }
@@ -112,7 +129,7 @@ impl SessionSpec {
     pub(crate) fn chrome_ozone_platform(self) -> &'static str {
         match self.backend {
             SessionBackend::X11 => x11::CHROME_OZONE_PLATFORM,
-            SessionBackend::Kwin => "wayland",
+            SessionBackend::Kwin | SessionBackend::Gnome => "wayland",
         }
     }
 
@@ -126,6 +143,9 @@ impl SessionSpec {
         match self.backend {
             SessionBackend::X11 => {
                 x11::cleanup_stale_processes(window_manager_pid, x_server_pid, dry_run, actions);
+            }
+            SessionBackend::Gnome => {
+                gnome::cleanup_stale_processes(window_manager_pid, dry_run, actions)
             }
             SessionBackend::Kwin => {
                 kwin::cleanup_stale_processes(window_manager_pid, dry_run, actions)
@@ -166,6 +186,7 @@ pub enum SessionBackend {
     #[default]
     X11,
     Kwin,
+    Gnome,
 }
 
 impl SessionBackend {
@@ -173,6 +194,7 @@ impl SessionBackend {
         match self {
             Self::X11 => "x11",
             Self::Kwin => "kwin",
+            Self::Gnome => "gnome",
         }
     }
 }
@@ -184,7 +206,10 @@ impl FromStr for SessionBackend {
         match value.trim().to_ascii_lowercase().as_str() {
             "x11" => Ok(Self::X11),
             "kwin" => Ok(Self::Kwin),
-            _ => bail!("session backend must be x11 (Xvfb with Openbox) or kwin (native Wayland)"),
+            "gnome" => Ok(Self::Gnome),
+            _ => bail!(
+                "session backend must be x11 (Xvfb with Openbox), kwin or gnome (native Wayland)"
+            ),
         }
     }
 }
@@ -196,24 +221,27 @@ fn default_scale() -> f64 {
 pub(crate) enum Session {
     X11(x11::X11Session),
     Kwin(kwin::KwinSession),
+    Gnome(gnome::GnomeSession),
 }
 impl Session {
     pub fn x_server_pid(&self) -> u32 {
         match self {
             Self::X11(s) => s.x_server_pid(),
-            Self::Kwin(_) => 0,
+            Self::Kwin(_) | Self::Gnome(_) => 0,
         }
     }
     pub fn window_manager_pid(&self) -> Option<u32> {
         match self {
             Self::X11(s) => s.window_manager_pid(),
             Self::Kwin(s) => s.pid(),
+            Self::Gnome(s) => s.pid(),
         }
     }
     pub fn shutdown(&mut self) {
         match self {
             Self::X11(s) => s.shutdown(),
             Self::Kwin(s) => s.shutdown(),
+            Self::Gnome(s) => s.shutdown(),
         }
     }
 }
@@ -241,6 +269,18 @@ mod tests {
             ..requested
         }));
         assert!(!requested.matches(SessionSpec::default()));
+        let gnome = SessionSpec {
+            backend: SessionBackend::Gnome,
+            scale: 4.0 / 3.0,
+        };
+        assert!(gnome.matches(SessionSpec {
+            scale: 1.3333333730697632,
+            ..gnome
+        }));
+        assert!(!gnome.matches(SessionSpec {
+            scale: 1.5,
+            ..gnome
+        }));
     }
 
     #[test]
@@ -284,6 +324,7 @@ mod tests {
     #[test]
     fn unimplemented_session_backends_are_rejected() {
         assert!("kwin".parse::<SessionSpec>().is_ok());
-        assert!(serde_json::from_str::<SessionSpec>(r#"{"backend":"gnome"}"#).is_err());
+        assert!(serde_json::from_str::<SessionSpec>(r#"{"backend":"gnome"}"#).is_ok());
+        assert!(serde_json::from_str::<SessionSpec>(r#"{"backend":"unknown"}"#).is_err());
     }
 }

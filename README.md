@@ -99,8 +99,8 @@ agent-workspace-linux workspace observe --screenshot --output /tmp/ws.png
 agent-workspace-linux workspace stop
 ```
 
-`workspace start` and `workspace open-profile` accept `--session x11` or
-`--session kwin`. MCP and saved profiles accept `"session": {"backend":"kwin"}`.
+`workspace start` and `workspace open-profile` accept `--session x11`,
+`--session kwin`, or `--session gnome`. MCP and saved profiles accept `"session": {"backend":"kwin"}`.
 Explicit CLI/MCP input overrides the profile. Omitting both keeps the pinned
 Xvfb + Openbox default (`{"backend":"x11"}`).
 
@@ -109,7 +109,7 @@ Xvfb underneath KWin. Each workspace owns its Wayland socket, session D-Bus,
 settings, input and clipboard. KWin 6.6 or newer (including `kwin-common`),
 `libkscreen-bin` (`kscreen-doctor`), `wl-clipboard`, and access to a DRM render node are required;
 `doctor` reports their readiness separately from X11. This is KWin, not a full
-Plasma desktop shell. GNOME and COSMIC session names remain unsupported.
+Plasma desktop shell.
 
 Use `--session kwin --scale 1.5` for a 150% output, or
 `"session": {"backend":"kwin", "scale":1.5}` in a profile or MCP call. Width,
@@ -118,7 +118,7 @@ The adapter converts between these pixels and KWin's logical coordinates.
 KWin aligns output sizes to logical pixels; status reports the effective size.
 Apps use native Wayland by default; rootless XWayland remains available for
 legacy clients. The existing viewer, IPC, permission ceiling and explicit
-Chrome profile import rules apply to both backends.
+Chrome profile import rules apply to every backend.
 
 Managed terminal sessions end when their workspace stops, even after the terminal
 window has closed. Stale cleanup uses the saved launch and session identity.
@@ -126,6 +126,40 @@ Verified terminal cleanup uses Linux pidfds. Older kernels without `SO_PEERPIDFD
 use `pidfd_open` with process, session and exact socket-argument verification.
 If ownership cannot be verified, stop and cleanup preserve the runtime and report
 an error instead of signaling an unrelated process.
+
+### Native GNOME sessions
+
+`--session gnome` starts GNOME Shell and Mutter with a private headless output.
+GNOME Shell 50 or 51, matching Mutter libraries, `Xwayland`, `xdotool`, `dbus-daemon`,
+`gsettings`, `bubblewrap`, and `timeout` are required. `doctor` reports GNOME readiness
+separately. Software rendering works without a GPU or parent compositor.
+
+```bash
+agent-workspace-linux workspace start --ack-hidden-workspace \
+    --session gnome --scale 1.5 --width 1200 --height 900
+```
+
+MCP and profiles accept `"session": {"backend":"gnome", "scale":1.5}`.
+Mutter validates scale against the chosen physical output mode. For example,
+1200x900 supports 150%; 960x720 does not. Unsupported combinations fail at
+startup. Geometry, input and screenshots use physical pixels throughout.
+GTK clients may use a larger integer buffer scale on fractional outputs.
+
+The session has a private session bus, accessibility bus and empty system bus.
+A bundled Shell extension exposes fixed native controls only to the workspace
+daemon. The Shell mode disables the overview, run dialog, settings launchers and
+unrelated extensions. Shell Eval and extension installation are denied on its
+bus. Apps launch through workspace policy; native Wayland and private XWayland
+clients retain the same permission ceiling, browser-profile consent and viewer
+controls.
+
+Build the binary and run `scripts/gnome_probe.sh` for the disposable Ubuntu 26.04
+acceptance checks. It uses software rendering with no host display, input device,
+system bus or GPU. It checks real GTK input at 100% and 150%, clipboard, window
+operations, physical screenshot dimensions, MCP and viewer IPC, private-bus
+restrictions, managed terminal cleanup, and native/XWayland apps under enforced
+mount and network isolation. Override `GNOME_PROBE_BIN` and
+`GNOME_PROBE_ARTIFACT_DIR` to select the binary and evidence directory.
 
 ### Native KWin checks
 

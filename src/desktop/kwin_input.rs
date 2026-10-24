@@ -165,7 +165,7 @@ impl Input {
     }
 }
 
-pub(super) fn keysyms(key: &str) -> Result<Vec<u32>> {
+pub(crate) fn keysyms(key: &str) -> Result<Vec<u32>> {
     use xkbcommon::xkb;
     let names = key
         .split('+')
