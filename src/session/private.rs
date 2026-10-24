@@ -62,8 +62,9 @@ pub(crate) struct PrivateSession {
     pub(crate) compositor: Option<Child>,
     bus: Option<Child>,
     system_bus: Option<Child>,
+    client_bus: Option<Child>,
     accessibility_bus: Option<Child>,
-    accessibility_service: Option<zbus::blocking::Connection>,
+    accessibility_services: Vec<zbus::blocking::Connection>,
 }
 impl PrivateSession {
     pub(crate) fn start(
@@ -79,8 +80,9 @@ impl PrivateSession {
             compositor: None,
             bus: None,
             system_bus: None,
+            client_bus: None,
             accessibility_bus: None,
-            accessibility_service: None,
+            accessibility_services: Vec::new(),
         };
         session.bus = Some(start_private_bus(
             runtime,
@@ -88,6 +90,14 @@ impl PrivateSession {
             &bus_address(runtime),
             &[],
             extra_policy,
+            &configure,
+        )?);
+        session.client_bus = Some(start_private_bus(
+            runtime,
+            "client",
+            &socket_address(&runtime.join("client-bus")),
+            &[],
+            "",
             &configure,
         )?);
         let registry =
@@ -103,25 +113,30 @@ impl PrivateSession {
                 "",
                 &configure,
             )?);
-            session.accessibility_service = Some(
-                zbus::blocking::connection::Builder::address(bus_address(runtime).as_str())?
-                    .method_timeout(Duration::from_secs(5))
-                    .name("org.a11y.Bus")?
-                    .serve_at(
-                        "/org/a11y/bus",
-                        AccessibilityBus {
-                            address: address.clone(),
-                        },
-                    )?
-                    .serve_at(
-                        "/org/a11y/bus",
-                        AccessibilityStatus {
-                            enabled: true,
-                            screen_reader_enabled: false,
-                        },
-                    )?
-                    .build()?,
-            );
+            for bus in [
+                bus_address(runtime),
+                socket_address(&runtime.join("client-bus")),
+            ] {
+                session.accessibility_services.push(
+                    zbus::blocking::connection::Builder::address(bus.as_str())?
+                        .method_timeout(Duration::from_secs(5))
+                        .name("org.a11y.Bus")?
+                        .serve_at(
+                            "/org/a11y/bus",
+                            AccessibilityBus {
+                                address: address.clone(),
+                            },
+                        )?
+                        .serve_at(
+                            "/org/a11y/bus",
+                            AccessibilityStatus {
+                                enabled: true,
+                                screen_reader_enabled: false,
+                            },
+                        )?
+                        .build()?,
+                );
+            }
             fs::write(address_file, address)?;
         }
         Ok(session)
@@ -150,11 +165,12 @@ impl PrivateSession {
         self.compositor.as_ref().map(Child::id)
     }
     pub(crate) fn shutdown(&mut self) {
-        self.accessibility_service.take();
+        self.accessibility_services.clear();
         for slot in [
             &mut self.compositor,
             &mut self.accessibility_bus,
             &mut self.bus,
+            &mut self.client_bus,
             &mut self.system_bus,
         ] {
             if let Some(mut child) = slot.take() {
@@ -220,7 +236,7 @@ fn start_private_bus(
         &config,
         format!(
             r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-<busconfig><type>{kind}</type><auth>EXTERNAL</auth><listen>{address}</listen>
+<busconfig><type>{bus_type}</type><auth>EXTERNAL</auth><listen>{address}</listen>
 <servicedir>{services}</servicedir>
 <policy context="default">
 <allow user="{uid}"/><allow own="*"/><allow send_destination="*"/><allow receive_sender="*"/>
@@ -228,6 +244,11 @@ fn start_private_bus(
 <deny send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus" send_member="ReloadConfig"/>
 {extra_policy}
 </policy></busconfig>"#,
+            bus_type = if kind == "system" {
+                "system"
+            } else {
+                "session"
+            },
             address = escape(address),
             services = escape(&service_dir.to_string_lossy()),
             uid = unsafe { libc::geteuid() }
@@ -235,6 +256,8 @@ fn start_private_bus(
     )?;
     let socket = if kind == "session" {
         runtime.join("session-bus")
+    } else if kind == "client" {
+        runtime.join("client-bus")
     } else if kind == "accessibility" {
         runtime.join("at-spi/bus")
     } else {

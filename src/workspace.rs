@@ -3072,9 +3072,7 @@ pub fn terminal_launch_plan(
     let terminal_id = sanitize_terminal_id(terminal_id.as_deref().unwrap_or("terminal"))?;
     let session_name = terminal_id.clone();
     let target = session_name.clone();
-    let tmux_socket_path = status
-        .runtime_dir
-        .join(format!("terminal-{terminal_id}.tmux.sock"));
+    let tmux_socket_path = terminal_socket_path(&status.runtime_dir, &terminal_id);
     validate_unix_socket_path(&tmux_socket_path)?;
     let terminal_program = match terminal_program {
         Some(path) => path,
@@ -3599,6 +3597,7 @@ fn prepare_workspace_start(mut options: WorkspaceStartOptions) -> Result<Workspa
     let socket_path = runtime_dir.join("control.sock");
     validate_unix_socket_path(&socket_path)?;
     create_private_runtime_dir(&runtime_dir)?;
+    create_client_runtime(&runtime_dir)?;
     remove_stale_socket(&socket_path)?;
     let xauthority_path = runtime_dir.join("Xauthority");
     let display = if options.session.backend == crate::session::SessionBackend::X11 {
@@ -3733,6 +3732,39 @@ fn write_applied_policy_file(
     fs::write(&policy_path, format!("{content}\n"))
         .with_context(|| format!("failed to write {}", policy_path.display()))?;
     Ok(policy_path)
+}
+
+fn create_client_runtime(runtime: &Path) -> Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    let path = runtime.join("client");
+    match fs::DirBuilder::new()
+        .mode(PRIVATE_RUNTIME_DIR_MODE)
+        .create(&path)
+    {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let metadata = fs::symlink_metadata(&path)?;
+            if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+                bail!("workspace client runtime is not an owned directory");
+            }
+            Ok(())
+        }
+        Err(error) => Err(error).context("create workspace client runtime"),
+    }
+}
+
+fn terminal_socket_path(runtime: &Path, id: &str) -> PathBuf {
+    let legacy = runtime.join(format!("terminal-{id}.tmux.sock"));
+    if legacy
+        .symlink_metadata()
+        .is_ok_and(|meta| meta.file_type().is_socket())
+    {
+        legacy
+    } else {
+        runtime
+            .join("client")
+            .join(format!("terminal-{id}.tmux.sock"))
+    }
 }
 
 fn create_private_runtime_dir(path: &Path) -> Result<()> {
@@ -6826,6 +6858,7 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
         .validate_launch_spec(&spec)
         .context("workspace launch exceeds the MCP permission ceiling")?;
     validate_launch_policy_ack(&spec)?;
+    create_client_runtime(&state.status.runtime_dir)?;
     let log_paths = prepare_app_log_paths(&state.status.runtime_dir)?;
     let effective_policy = spec
         .applied_policy
@@ -6938,9 +6971,7 @@ fn terminal_info(id: &str, terminal_id: &str, app_id: Option<String>) -> Result<
     let id = sanitize_workspace_id(id)?;
     let status = status_workspace(&id)?;
     let terminal_id = sanitize_terminal_id(terminal_id)?;
-    let tmux_socket_path = status
-        .runtime_dir
-        .join(format!("terminal-{terminal_id}.tmux.sock"));
+    let tmux_socket_path = terminal_socket_path(&status.runtime_dir, &terminal_id);
     let session_name = terminal_id.clone();
     let target = session_name.clone();
     let output = tmux_output(

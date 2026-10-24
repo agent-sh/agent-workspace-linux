@@ -621,14 +621,19 @@ impl X11DesktopControl<'_> {
             .trim()
             .to_string();
         let (wm_instance, wm_class) = self.window_class_from_xprop(&id);
-        let pid = self
-            .command("xdotool")
-            .args(["getwindowpid", &id])
-            .output()
+        // XRes returns the PID seen by our X server, unlike _NET_WM_PID which
+        // may be a PID from the sandbox's private process namespace.
+        let pid = daemon_executable_path()
             .ok()
-            .and_then(|output| output.status.success().then_some(output.stdout))
-            .and_then(|stdout| String::from_utf8(stdout).ok())
-            .and_then(|text| text.trim().parse::<u32>().ok())
+            .and_then(|exe| {
+                self.command(exe)
+                    .args(["__xtest", "window-pid", &id])
+                    .output()
+                    .ok()
+                    .filter(|output| output.status.success())
+                    .and_then(|output| String::from_utf8(output.stdout).ok())
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+            })
             .or_else(|| self.window_pid_from_xprop(&id));
         let geometry_output = self
             .command("xdotool")

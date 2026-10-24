@@ -113,7 +113,7 @@ for scale in (1, 1.5):
         env = workspace(id, "env")["environment"]["variables"]
         env = {entry["name"]: entry["value"] for entry in env}
         assert env["XDG_SESSION_TYPE"] == "wayland"
-        assert env["DBUS_SESSION_BUS_ADDRESS"].endswith(f"/{id}/session-bus")
+        assert env["DBUS_SESSION_BUS_ADDRESS"].endswith(f"/{id}/client-bus")
         assert env["WAYLAND_DISPLAY"] == "workspace-wayland"
         assert env["QT_QPA_PLATFORM"] == "wayland"
         bus_env = dict(os.environ, **env)

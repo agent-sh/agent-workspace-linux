@@ -50,6 +50,9 @@ const HOST_SESSION_ENV_VARS: &[&str] = &[
     "XDG_SESSION_ID",
     "GNOME_KEYRING_CONTROL",
     "GPG_AGENT_INFO",
+    "IBUS_ADDRESS",
+    "IBUS_DAEMON_SOCKET",
+    "SESSION_MANAGER",
 ];
 
 pub(crate) fn scrub_host_session_environment(command: &mut Command) {
@@ -92,6 +95,7 @@ pub(crate) fn workspace_environment_variables(status: &WorkspaceStatus) -> Vec<E
         &status.xauthority_path,
         &status.runtime_dir,
     );
+    configure_application_bus(&mut command, status);
     for (name, value) in command.get_envs() {
         let name = name.to_string_lossy().to_string();
         variables.retain(|entry| entry.name != name);
@@ -124,6 +128,17 @@ pub(crate) fn configure_launch_environment(
         &status.xauthority_path,
         &status.runtime_dir,
     );
+    configure_application_bus(command, status);
+}
+
+fn configure_application_bus(command: &mut Command, status: &WorkspaceStatus) {
+    let bus = status.runtime_dir.join("client-bus");
+    if bus.exists() {
+        command.env(
+            "DBUS_SESSION_BUS_ADDRESS",
+            crate::session::private::socket_address(&bus),
+        );
+    }
 }
 
 pub(crate) struct SessionSandboxResources {
@@ -192,9 +207,43 @@ pub(crate) fn bubblewrap_sandbox_for_launch(
             "/".to_string(),
             "--dev".to_string(),
             "/dev".to_string(),
+            "--unshare-pid".to_string(),
             "--proc".to_string(),
             "/proc".to_string(),
         ];
+        // Keep desktop control/configuration private even for network-only
+        // profiles whose ordinary host files remain visible. Fresh procfs in the
+        // app PID namespace also prevents /proc/<host-pid>/root/fd bypasses.
+        args.extend([
+            "--tmpfs".to_string(),
+            status.runtime_dir.display().to_string(),
+        ]);
+        let resources = app_session_resources(status);
+        let mut dirs = BTreeSet::new();
+        for path in resources
+            .read_only_binds
+            .iter()
+            .chain(&resources.read_write_binds)
+        {
+            add_parent_dirs(&mut dirs, path);
+        }
+        for dir in dirs {
+            if dir.starts_with(&status.runtime_dir) && dir != status.runtime_dir {
+                args.extend(["--dir".to_string(), dir.display().to_string()]);
+            }
+        }
+        for (flag, paths) in [
+            ("--ro-bind", resources.read_only_binds),
+            ("--bind", resources.read_write_binds),
+        ] {
+            for path in paths {
+                args.extend([
+                    flag.to_string(),
+                    path.display().to_string(),
+                    path.display().to_string(),
+                ]);
+            }
+        }
         if network.unshare_net() {
             args.push("--unshare-net".to_string());
         }
@@ -263,17 +312,39 @@ pub(crate) fn uses_bubblewrap_mount_isolation(policy: Option<&AppliedWorkspacePo
     })
 }
 
+fn app_session_resources(status: &WorkspaceStatus) -> SessionSandboxResources {
+    let mut resources = status.session.sandbox_resources(
+        &status.xauthority_path,
+        &status.runtime_dir,
+        &status.display,
+    );
+    let control_bus = status.runtime_dir.join("session-bus");
+    let client_bus = status.runtime_dir.join("client-bus");
+    if client_bus.exists() {
+        for path in resources
+            .read_only_binds
+            .iter_mut()
+            .chain(&mut resources.read_write_binds)
+        {
+            if *path == control_bus {
+                *path = client_bus.clone();
+            }
+        }
+    }
+    let client = status.runtime_dir.join("client");
+    if client.is_dir() {
+        resources.read_write_binds.push(client);
+    }
+    resources
+}
+
 pub(crate) fn restricted_mount_namespace_args(
     status: &WorkspaceStatus,
     policy: Option<&AppliedWorkspacePolicy>,
     cwd: Option<&Path>,
     network: LaunchNetworkPlan,
 ) -> Result<Vec<String>> {
-    let resources = status.session.sandbox_resources(
-        &status.xauthority_path,
-        &status.runtime_dir,
-        &status.display,
-    );
+    let resources = app_session_resources(status);
     restricted_mount_namespace_args_with_resources(policy, cwd, network, resources)
 }
 
@@ -329,6 +400,7 @@ fn restricted_mount_namespace_args_with_resources(
             args.push(path.to_string());
         }
     }
+    args.push("--unshare-pid".to_string());
     args.push("--proc".to_string());
     args.push("/proc".to_string());
     args.push("--dev".to_string());
