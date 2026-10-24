@@ -261,6 +261,19 @@ struct ViewerSnapshot {
     profiles: Vec<profile::WorkspaceProfile>,
     doctor_ready: bool,
     doctor_blockers: Vec<String>,
+    kwin_doctor_ready: bool,
+    kwin_doctor_blockers: Vec<String>,
+}
+
+impl ViewerSnapshot {
+    fn start_readiness(&self, session: crate::session::SessionSpec) -> (bool, &[String]) {
+        match session.backend {
+            crate::session::SessionBackend::X11 => (self.doctor_ready, &self.doctor_blockers),
+            crate::session::SessionBackend::Kwin => {
+                (self.kwin_doctor_ready, &self.kwin_doctor_blockers)
+            }
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -2476,18 +2489,10 @@ fn compute_viewer_refresh(
             let snapshot = ViewerSnapshot {
                 workspaces: list.workspaces,
                 profiles: profiles.profiles,
-                doctor_ready: doctor.ready_for_x11_workspace || doctor.ready_for_kwin_workspace,
-                doctor_blockers: if doctor.ready_for_x11_workspace
-                    || doctor.ready_for_kwin_workspace
-                {
-                    Vec::new()
-                } else {
-                    doctor
-                        .blockers
-                        .into_iter()
-                        .chain(doctor.kwin_blockers)
-                        .collect()
-                },
+                doctor_ready: doctor.ready_for_x11_workspace,
+                doctor_blockers: doctor.blockers,
+                kwin_doctor_ready: doctor.ready_for_kwin_workspace,
+                kwin_doctor_blockers: doctor.kwin_blockers,
             };
 
             let (active_window, frame_update, error) = if running {
@@ -2757,6 +2762,11 @@ impl Render for AgentWorkspaceViewer {
             .filter(|(_, total)| *total > 1)
             .map(|(index, total)| format!("{index}/{total}"));
         let selected_profile_label = self.selected_profile_label();
+        let start_session = self
+            .selected_profile()
+            .map(|profile| profile.session)
+            .unwrap_or_default();
+        let (doctor_ready, doctor_blockers) = self.snapshot.start_readiness(start_session);
         let cleanup_confirm_seconds_left = self.pending_cleanup.as_ref().and_then(|pending| {
             (pending.id == self.target_id && pending.expires_at_unix > now)
                 .then_some(pending.expires_at_unix.saturating_sub(now).max(1))
@@ -2802,11 +2812,10 @@ impl Render for AgentWorkspaceViewer {
             error.clone()
         } else if running {
             format!("{display_label} | {app_count} app(s) | {activity_label}")
-        } else if self.snapshot.doctor_ready {
+        } else if doctor_ready {
             format!("Ready | Profile: {selected_profile_label}")
         } else {
-            self.snapshot
-                .doctor_blockers
+            doctor_blockers
                 .first()
                 .cloned()
                 .unwrap_or_else(|| "Runtime is not ready".to_string())
@@ -2842,8 +2851,8 @@ impl Render for AgentWorkspaceViewer {
                 refreshing,
                 self.error.as_deref(),
                 running,
-                self.snapshot.doctor_ready,
-                &self.snapshot.doctor_blockers,
+                doctor_ready,
+                doctor_blockers,
                 &selected_profile_label,
                 self.latest_activity.as_ref(),
                 self.active_window.as_ref(),
@@ -2857,8 +2866,8 @@ impl Render for AgentWorkspaceViewer {
                     refreshing,
                     self.error.as_deref(),
                     running,
-                    self.snapshot.doctor_ready,
-                    &self.snapshot.doctor_blockers,
+                    doctor_ready,
+                    doctor_blockers,
                     &selected_profile_label,
                     self.latest_activity.as_ref(),
                     self.active_window.as_ref(),
@@ -2868,16 +2877,16 @@ impl Render for AgentWorkspaceViewer {
                 FooterMode::Task => footer_task_label(
                     selected,
                     running,
-                    self.snapshot.doctor_ready,
-                    &self.snapshot.doctor_blockers,
+                    doctor_ready,
+                    doctor_blockers,
                     &selected_profile_label,
                     self.active_window.as_ref(),
                     workspace_apps,
                 ),
                 FooterMode::Isolation => footer_isolation_label(
                     selected,
-                    self.snapshot.doctor_ready,
-                    &self.snapshot.doctor_blockers,
+                    doctor_ready,
+                    doctor_blockers,
                     &selected_profile_label,
                     &self.permissions,
                 ),
@@ -5896,6 +5905,37 @@ fn wall_clock_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn start_readiness_follows_selected_backend_and_x11_default() {
+        use crate::session::{SessionBackend, SessionSpec};
+        let x11 = SessionSpec::default();
+        let kwin = SessionSpec {
+            backend: SessionBackend::Kwin,
+            scale: 1.5,
+        };
+        let mut snapshot = ViewerSnapshot {
+            doctor_ready: false,
+            doctor_blockers: vec!["Install Xvfb".into()],
+            kwin_doctor_ready: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            snapshot.start_readiness(x11),
+            (false, &["Install Xvfb".into()][..])
+        );
+        assert_eq!(snapshot.start_readiness(kwin), (true, &[][..]));
+        snapshot.doctor_ready = true;
+        snapshot.doctor_blockers.clear();
+        snapshot.kwin_doctor_ready = false;
+        snapshot.kwin_doctor_blockers = vec!["Install KWin".into()];
+        assert_eq!(snapshot.start_readiness(x11), (true, &[][..]));
+        assert_eq!(
+            snapshot.start_readiness(kwin),
+            (false, &["Install KWin".into()][..])
+        );
+    }
+
     use crate::policy::{
         MountMode, NetworkPolicy, PolicyRuntimeCapabilities, PolicyToolCheck, ProfileMount,
     };

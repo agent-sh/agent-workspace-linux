@@ -447,7 +447,7 @@ fn decode_image(
     reader.read_exact(&mut raw)?;
     let mut rgba = Vec::with_capacity(width as usize * height as usize * 4);
     for row in raw.chunks_exact(stride as usize) {
-        for p in row[..width as usize * 4].chunks_exact(4) {
+        for p in row[..width as usize * 4].as_chunks::<4>().0 {
             let (r, g, b, a) = if format <= 6 {
                 (p[2], p[1], p[0], if format == 4 { 255 } else { p[3] })
             } else {
