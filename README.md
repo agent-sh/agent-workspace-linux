@@ -120,6 +120,13 @@ Apps use native Wayland by default; rootless XWayland remains available for
 legacy clients. The existing viewer, IPC, permission ceiling and explicit
 Chrome profile import rules apply to both backends.
 
+Managed terminal sessions end when their workspace stops, even after the terminal
+window has closed. Stale cleanup uses the saved launch and session identity.
+Verified terminal cleanup uses Linux pidfds. Older kernels without `SO_PEERPIDFD`
+use `pidfd_open` with process, session and exact socket-argument verification.
+If ownership cannot be verified, stop and cleanup preserve the runtime and report
+an error instead of signaling an unrelated process.
+
 ### Native KWin checks
 
 Build the binary, then run `scripts/kwin_probe.sh`. The disposable Ubuntu 26.04

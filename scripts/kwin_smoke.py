@@ -89,6 +89,7 @@ for scale in (1, 1.5):
     stale_services.mkdir(parents=True, exist_ok=True)
     shutil.copy(standard_services / "org.agent_sh.Forbidden.service", stale_services)
     status = None
+    terminal_pids = []
     try:
         if scale == 1.5:
             mcp = Mcp(BIN, ARTIFACTS / f"{id}-mcp.log", headless=True)
@@ -202,6 +203,16 @@ for scale in (1, 1.5):
             check_png(viewer["screenshot"]["path"])
         command("workspace", "start", "--id", id, "--session", "x11", "--ack-hidden-workspace", expected=False)
         workspace(id, "close-window", wid)
+        if mcp:
+            terminal = mcp.tool("workspace_run_in_terminal", {"id":id, "terminal_id":"cleanup",
+                "command":["sleep","600"], "window_timeout_ms":15000, "timeout_ms":10000})
+            assert terminal["ok"], terminal
+            terminal = terminal["terminal"]
+            terminal_pids = [int(pid) for pid in subprocess.check_output(
+                ["tmux", "-S", terminal["tmux_socket_path"], "display-message", "-p", "#{pid} #{pane_pid}"],
+                env=bus_env, text=True, timeout=5).split()]
+            killed = mcp.tool("workspace_kill_app", {"id":id, "app_id":terminal["app_id"]})
+            assert killed["ok"], killed
         print(f"KWin {scale}: native Qt, Unicode input, clipboard, window control, pointer, capture and viewer frames passed", flush=True)
     finally:
         if mcp:
@@ -213,6 +224,12 @@ for scale in (1, 1.5):
         else:
             workspace(id, "stop")
         wait_for(lambda: not (runtime / "control.sock").exists(), "workspace stop")
+        def terminal_stopped(pid):
+            try:
+                return Path(f"/proc/{pid}/stat").read_text().rsplit(") ",1)[1].split()[0] in ("Z","X")
+            except FileNotFoundError:
+                return True
+        wait_for(lambda: all(terminal_stopped(pid) for pid in terminal_pids), "managed terminal shutdown")
         if status:
             wait_for(lambda: not Path(f"/proc/{status['window_manager_pid']}").exists(), "compositor process cleanup")
             assert not (runtime / "workspace-wayland").exists(), "Wayland socket survived clean stop"

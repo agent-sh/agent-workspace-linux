@@ -27,7 +27,7 @@ if command -v node >/dev/null 2>&1; then
   echo "== clean mcp permissions smoke =="
   AGENT_WORKSPACE_BIN="$BIN" node "$ROOT_DIR/scripts/mcp_clean_permissions_smoke.js"
   echo "== terminal TUI mcp smoke =="
-  AGENT_WORKSPACE_BIN="$BIN" node "$ROOT_DIR/scripts/mcp_terminal_tui_smoke.js"
+  AGENT_WORKSPACE_BIN="$BIN" "$ROOT_DIR/scripts/terminal_lifecycle_smoke.sh"
 else
   echo "== mcp permissions smoke skipped: node not found =="
 fi
