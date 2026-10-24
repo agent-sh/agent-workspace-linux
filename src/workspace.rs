@@ -132,6 +132,8 @@ pub struct DoctorReport {
     pub ready_for_kwin_workspace: bool,
     pub ready_for_gnome_workspace: bool,
     pub gnome_blockers: Vec<String>,
+    pub ready_for_hyprland_workspace: bool,
+    pub hyprland_blockers: Vec<String>,
     pub kwin_blockers: Vec<String>,
     pub ready_for_host_viewer: bool,
     pub blockers: Vec<String>,
@@ -1175,11 +1177,14 @@ pub fn doctor_report() -> DoctorReport {
     let gnome_blockers = crate::session::gnome::blockers();
     let kwin_blockers = crate::session::kwin::blockers();
     let i3_blockers = crate::session::i3::blockers();
+    let hyprland_blockers = crate::session::hyprland::blockers();
     DoctorReport {
         ready_for_i3_workspace: i3_blockers.is_empty(),
         i3_blockers,
         ready_for_gnome_workspace: gnome_blockers.is_empty(),
         gnome_blockers,
+        ready_for_hyprland_workspace: hyprland_blockers.is_empty(),
+        hyprland_blockers,
         ready_for_kwin_workspace: kwin_blockers.is_empty(),
         kwin_blockers,
         runtime,
@@ -8642,7 +8647,7 @@ fn process_exists(pid: u32) -> bool {
     PathBuf::from(format!("/proc/{pid}")).exists()
 }
 
-fn create_xauthority(display: &str, path: &Path) -> Result<()> {
+pub(crate) fn create_xauthority(display: &str, path: &Path) -> Result<()> {
     let cookie = random_cookie()?;
     let _ = fs::remove_file(path);
     if let Some(parent) = path.parent() {

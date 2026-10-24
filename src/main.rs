@@ -31,10 +31,22 @@ use workspace::{DaemonOptions, EnvVar, LaunchSpec, WorkspaceStartOptions};
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
+    if std::env::args_os()
+        .next()
+        .as_deref()
+        .and_then(|arg| std::path::Path::new(arg).file_name())
+        == Some(std::ffi::OsStr::new("Xwayland"))
+        && std::env::var("AGENT_WORKSPACE_XWAYLAND_BACKEND").as_deref() == Ok("hyprland")
+    {
+        return session::hyprland::xwayland(&args);
+    }
     // Internal helper: synthetic XTEST pointer input (motion+button) used by the
     // workspace daemon so synthetic clicks reach XInput2 apps (winit/egui, …).
     if args.first().map(String::as_str) == Some("__xtest") {
         return xtest_input::run(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("__hyprland-xwayland") {
+        return session::hyprland::xwayland(&args[1..]);
     }
     if args.first().map(String::as_str) == Some("__kwin-client-env") {
         let path = args
@@ -4424,8 +4436,8 @@ Usage:
   agent-workspace-linux profile template project-dev [--id ID] [--host-path PATH]
   agent-workspace-linux profile template restricted-chrome [--id ID] [--browser-path PATH]
   agent-workspace-linux profile template browser-session [--id ID] [--browser-path PATH] --user-data-dir PATH
-  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--ack-unenforced-policy] [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3] [--scale N] [--width PX] [--height PX]
-  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] [--ack-unenforced-policy] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3] [--scale N] [--width PX] [--height PX]
+  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--ack-unenforced-policy] [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland] [--scale N] [--width PX] [--height PX]
+  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] [--ack-unenforced-policy] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland] [--scale N] [--width PX] [--height PX]
   agent-workspace-linux workspace list
   agent-workspace-linux workspace cleanup [--id ID] [--dry-run]
   agent-workspace-linux workspace status [--id ID]

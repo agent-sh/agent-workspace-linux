@@ -1,7 +1,9 @@
 use anyhow::{bail, Context, Result};
 use std::{
+    ops::{Deref, DerefMut},
     os::{fd::AsRawFd, unix::net::UnixStream},
-    path::Path,
+    path::{Path, PathBuf},
+    sync::{Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 use wayland_client::{
@@ -82,7 +84,32 @@ pub(crate) struct Input {
     queue: EventQueue<State>,
     state: State,
 }
+// A virtual device disappearing between requests removes wl_seat pointer
+// capability before clients can bind it. Keep one device for the daemon's
+// workspace lifetime; applications see a stable seat from their first frame.
+static INPUT: Mutex<Option<(PathBuf, Input)>> = Mutex::new(None);
+pub(crate) struct PersistentInput(MutexGuard<'static, Option<(PathBuf, Input)>>);
+impl Deref for PersistentInput {
+    type Target = Input;
+    fn deref(&self) -> &Input {
+        &self.0.as_ref().expect("input connected").1
+    }
+}
+impl DerefMut for PersistentInput {
+    fn deref_mut(&mut self) -> &mut Input {
+        &mut self.0.as_mut().expect("input connected").1
+    }
+}
 impl Input {
+    pub fn persistent(socket: &Path) -> Result<PersistentInput> {
+        let mut guard = INPUT
+            .lock()
+            .map_err(|_| anyhow::anyhow!("workspace pointer lock poisoned"))?;
+        if guard.as_ref().is_none_or(|(path, _)| path != socket) {
+            *guard = Some((socket.to_path_buf(), Self::connect(socket)?));
+        }
+        Ok(PersistentInput(guard))
+    }
     pub fn connect(socket_path: &Path) -> Result<Self> {
         // An explicit private socket is mandatory. Never use connect_to_env.
         let socket = UnixStream::connect(socket_path)

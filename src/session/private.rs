@@ -143,6 +143,7 @@ impl PrivateSession {
     }
     /// Some desktop shells require a reachable system bus even when no system
     /// services exist. This empty bus never activates host system services.
+    #[allow(dead_code)]
     pub(crate) fn start_system_bus(
         &mut self,
         runtime: &Path,

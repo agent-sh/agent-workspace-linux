@@ -111,6 +111,11 @@ settings, input and clipboard. KWin 6.6 or newer (including `kwin-common`),
 `doctor` reports their readiness separately from X11. This is KWin, not a full
 Plasma desktop shell.
 
+Hyprland is also available with `--session hyprland`. It uses a private KWin
+renderer and a separate Hyprland headless output, with native toplevel capture
+and authenticated XWayland. See [the Hyprland backend guide](docs/hyprland.md)
+for dependencies and its isolated acceptance probe.
+
 Use `--session kwin --scale 1.5` for a 150% output, or
 `"session": {"backend":"kwin", "scale":1.5}` in a profile or MCP call. Width,
 height, window geometry and pointer coordinates stay in screenshot pixels.
