@@ -35,7 +35,11 @@ impl X11Session {
             window_manager: None,
         };
         wait_for_display(&options.display, &options.xauthority_path)?;
-        session.window_manager = spawn_window_manager(options)?;
+        session.window_manager = if options.session.backend == crate::session::SessionBackend::I3 {
+            Some(super::i3::spawn(options)?)
+        } else {
+            spawn_window_manager(options)?
+        };
         Ok(session)
     }
 
@@ -48,13 +52,28 @@ impl X11Session {
     }
 
     pub(crate) fn shutdown(&mut self) {
-        if let Some(mut window_manager) = self.window_manager.take() {
-            let _ = window_manager.kill();
-            let _ = window_manager.wait();
-        }
-        if let Some(mut x_server) = self.x_server.take() {
-            let _ = x_server.kill();
-            let _ = x_server.wait();
+        for slot in [&mut self.window_manager, &mut self.x_server] {
+            if let Some(mut child) = slot.take() {
+                // Let i3/Xvfb unlink private sockets on normal shutdown. The child
+                // remains unreaped until try_wait, so its PID cannot be reused here.
+                unsafe {
+                    libc::kill(child.id() as i32, libc::SIGTERM);
+                }
+                let deadline = Instant::now() + Duration::from_secs(5);
+                let exited = loop {
+                    if child.try_wait().ok().flatten().is_some() {
+                        break true;
+                    }
+                    if Instant::now() >= deadline {
+                        break false;
+                    }
+                    thread::sleep(Duration::from_millis(20));
+                };
+                if !exited {
+                    let _ = child.kill();
+                }
+                let _ = child.wait();
+            }
         }
     }
 }
@@ -87,6 +106,8 @@ pub(crate) fn configure_process_environment(
         .env("XAUTHORITY", xauthority)
         .env_remove("WAYLAND_DISPLAY")
         .env_remove("WAYLAND_SOCKET")
+        .env_remove("I3SOCK")
+        .env_remove("SWAYSOCK")
         .env("XDG_SESSION_TYPE", "x11")
         .env("GDK_BACKEND", "x11")
         .env("QT_QPA_PLATFORM", "xcb")

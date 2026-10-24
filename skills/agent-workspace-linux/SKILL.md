@@ -102,7 +102,7 @@ schemas for later phases until the plan reaches them.
 6. Stop: use `workspace_stop` when finished; use `workspace_cleanup_stale` for
    orphaned runtimes.
 
-Session selection supports X11 (`Xvfb` + Openbox) and native KWin Wayland.
+Session selection supports X11 (`Xvfb` + Openbox), i3 on private Xvfb, and native KWin Wayland.
 MCP callers can pass `session: {"backend":"kwin", "scale":1.5}` for 150%
 output scaling. Explicit MCP input overrides the profile session; omitting
 both keeps the pinned X11 default. CLI start/open-profile accepts
@@ -110,6 +110,10 @@ both keeps the pinned X11 default. CLI start/open-profile accepts
 and an accessible DRM render node.
 It runs directly, without a parent Xvfb, and is not a full Plasma shell.
 Pointer and window coordinates use screenshot pixels on either backend.
+Select i3 with `session: {"backend":"i3"}` or `--session i3`. It uses scale 1,
+needs `i3-wm` and the X11 dependencies including ImageMagick `import`, and has
+no launcher bindings or startup commands. Move and resize float the target window.
+Minimize uses the scratchpad; show restores the window to the current workspace.
 Unsupported session names are rejected.
 
 Skip unless: each step's precondition is visible in the previous tool result

@@ -24,6 +24,10 @@ impl<'a> X11DesktopControl<'a> {
         Self { status }
     }
 
+    fn is_i3(&self) -> bool {
+        self.status.session.backend == crate::session::SessionBackend::I3
+    }
+
     fn command(&self, program: impl AsRef<OsStr>) -> Command {
         workspace_command(self.status, program)
     }
@@ -348,7 +352,7 @@ impl DesktopControl for X11DesktopControl<'_> {
                 .output()
                 .context("failed to run import for workspace window screenshot")?;
             output_text(output, "import -window")?;
-        } else if command_path_check("scrot").ok {
+        } else if !self.is_i3() && command_path_check("scrot").ok {
             self.focus_window(&window_id)?;
             let output = self
                 .command("scrot")
@@ -418,6 +422,14 @@ impl DesktopControl for X11DesktopControl<'_> {
     fn move_window(&self, window_id: &str, x: i32, y: i32) -> Result<WorkspaceWindow> {
         let window_id = sanitize_x11_id(window_id, "window id")?;
         validate_workspace_coordinates(self.status, x, y, "window move")?;
+        if self.is_i3() {
+            super::i3::command(
+                self.status,
+                &window_id,
+                &format!("floating enable, move absolute position {x} px {y} px"),
+            )?;
+            return self.window_info(&window_id);
+        }
         let output = self
             .command("xdotool")
             .args([
@@ -437,6 +449,14 @@ impl DesktopControl for X11DesktopControl<'_> {
         let window_id = sanitize_x11_id(window_id, "window id")?;
         validate_window_size(width, height)?;
         validate_window_size_for_workspace(self.status, width, height)?;
+        if self.is_i3() {
+            super::i3::command(
+                self.status,
+                &window_id,
+                &format!("floating enable, resize set {width} px {height} px"),
+            )?;
+            return self.window_info(&window_id);
+        }
         let output = self
             .command("xdotool")
             .args([
@@ -465,6 +485,10 @@ impl DesktopControl for X11DesktopControl<'_> {
 
     fn minimize_window(&self, window_id: &str) -> Result<WorkspaceWindow> {
         let window_id = sanitize_x11_id(window_id, "window id")?;
+        if self.is_i3() {
+            super::i3::command(self.status, &window_id, "move scratchpad")?;
+            return self.window_info(&window_id);
+        }
         let output = self
             .command("xdotool")
             .args(["windowminimize", "--sync", &window_id])
@@ -476,6 +500,14 @@ impl DesktopControl for X11DesktopControl<'_> {
 
     fn show_window(&self, window_id: &str) -> Result<WorkspaceWindow> {
         let window_id = sanitize_x11_id(window_id, "window id")?;
+        if self.is_i3() {
+            super::i3::command(
+                self.status,
+                &window_id,
+                "move container to workspace current",
+            )?;
+            return self.window_info(&window_id);
+        }
         let output = self
             .command("xdotool")
             .args(["windowmap", "--sync", &window_id])

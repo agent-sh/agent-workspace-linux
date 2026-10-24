@@ -261,6 +261,8 @@ struct ViewerSnapshot {
     profiles: Vec<profile::WorkspaceProfile>,
     doctor_ready: bool,
     doctor_blockers: Vec<String>,
+    i3_doctor_ready: bool,
+    i3_doctor_blockers: Vec<String>,
     kwin_doctor_ready: bool,
     kwin_doctor_blockers: Vec<String>,
     gnome_doctor_ready: bool,
@@ -271,6 +273,7 @@ impl ViewerSnapshot {
     fn start_readiness(&self, session: crate::session::SessionSpec) -> (bool, &[String]) {
         match session.backend {
             crate::session::SessionBackend::X11 => (self.doctor_ready, &self.doctor_blockers),
+            crate::session::SessionBackend::I3 => (self.i3_doctor_ready, &self.i3_doctor_blockers),
             crate::session::SessionBackend::Gnome => {
                 (self.gnome_doctor_ready, &self.gnome_doctor_blockers)
             }
@@ -2496,6 +2499,8 @@ fn compute_viewer_refresh(
                 profiles: profiles.profiles,
                 doctor_ready: doctor.ready_for_x11_workspace,
                 doctor_blockers: doctor.blockers,
+                i3_doctor_ready: doctor.ready_for_i3_workspace,
+                i3_doctor_blockers: doctor.i3_blockers,
                 kwin_doctor_ready: doctor.ready_for_kwin_workspace,
                 kwin_doctor_blockers: doctor.kwin_blockers,
                 gnome_doctor_ready: doctor.ready_for_gnome_workspace,

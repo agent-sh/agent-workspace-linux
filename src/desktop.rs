@@ -1,4 +1,5 @@
 pub(crate) mod gnome;
+pub(crate) mod i3;
 pub(crate) mod kwin;
 pub(crate) mod x11;
 
