@@ -122,8 +122,9 @@ Chrome profile import rules apply to both backends.
 
 Managed terminal sessions end when their workspace stops, even after the terminal
 window has closed. Stale cleanup uses the saved launch and session identity.
-Verified terminal cleanup requires the Linux `SO_PEERPIDFD` socket option; if
-ownership cannot be verified, stop and cleanup preserve the runtime and report
+Verified terminal cleanup uses Linux pidfds. Older kernels without `SO_PEERPIDFD`
+use `pidfd_open` with process, session and exact socket-argument verification.
+If ownership cannot be verified, stop and cleanup preserve the runtime and report
 an error instead of signaling an unrelated process.
 
 ### Native KWin checks

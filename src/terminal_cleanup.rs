@@ -56,6 +56,28 @@ fn owner_environment_matches(bytes: &[u8], workspace: &str, session: &str) -> bo
     })
 }
 
+fn pidfd_matches_pid(fd: &OwnedFd, pid: i32) -> Result<bool> {
+    let info = fs::read_to_string(format!("/proc/self/fdinfo/{}", fd.as_raw_fd()))?;
+    let mut values = info.lines().filter_map(|line| line.strip_prefix("Pid:"));
+    let found: i32 = values
+        .next()
+        .context("pidfd has no procfs PID")?
+        .trim()
+        .parse()?;
+    if values.next().is_some() {
+        bail!("ambiguous pidfd process identity");
+    }
+    Ok(found == pid)
+}
+
+fn socket_argv_matches(command: &[u8], program: &Path, socket: &Path) -> bool {
+    let mut prefix = program.as_os_str().as_bytes().to_vec();
+    prefix.extend_from_slice(b"\0-S\0");
+    prefix.extend_from_slice(socket.as_os_str().as_bytes());
+    prefix.push(0);
+    command.starts_with(&prefix)
+}
+
 fn exited(fd: &OwnedFd, timeout: Duration) -> Result<bool> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -174,7 +196,8 @@ fn stop_server(
     if peer.pid <= 1 || peer.uid != unsafe { libc::geteuid() } {
         bail!("managed terminal peer owner mismatch");
     }
-    // Pin the actual socket peer atomically, rather than looking up a recyclable PID.
+    // New kernels can pin the socket peer directly. On older kernels, pin the
+    // candidate PID and revalidate the current process against the saved launch.
     let mut raw_pidfd: i32 = -1;
     size = std::mem::size_of_val(&raw_pidfd) as libc::socklen_t;
     if unsafe {
@@ -187,8 +210,22 @@ fn stop_server(
         )
     } != 0
     {
-        return Err(io::Error::last_os_error())
-            .context("kernel cannot pin the managed terminal socket peer (SO_PEERPIDFD)");
+        let error = io::Error::last_os_error();
+        if error.raw_os_error() == Some(libc::ESRCH) {
+            return Ok(None);
+        }
+        if error.raw_os_error() != Some(libc::ENOPROTOOPT) {
+            return Err(error).context("pin managed terminal socket peer");
+        }
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, peer.pid, 0) };
+        if descriptor < 0 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() == Some(libc::ESRCH) {
+                return Ok(None);
+            }
+            return Err(error).context("pin managed terminal candidate process");
+        }
+        raw_pidfd = descriptor as i32;
     }
     if raw_pidfd < 0 {
         bail!("missing terminal peer process descriptor");
@@ -197,13 +234,26 @@ fn stop_server(
     if exited(&pidfd, Duration::ZERO)? {
         return Ok(None);
     }
+    if !pidfd_matches_pid(&pidfd, peer.pid)? {
+        if exited(&pidfd, Duration::ZERO)? {
+            return Ok(None);
+        }
+        bail!("terminal pidfd and procfs PID namespace differ");
+    }
     let identity = (|| -> io::Result<_> {
+        if fs::metadata(format!("/proc/{}", peer.pid))?.uid() != peer.uid {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "terminal process owner changed",
+            ));
+        }
         Ok((
             fs::read_link(format!("/proc/{}/exe", peer.pid))?,
             fs::read(format!("/proc/{}/environ", peer.pid))?,
+            fs::read(format!("/proc/{}/cmdline", peer.pid))?,
         ))
     })();
-    let (executable, environment) = match identity {
+    let (executable, environment, command) = match identity {
         Ok(identity) => identity,
         Err(error) => {
             if exited(&pidfd, Duration::ZERO)? {
@@ -220,7 +270,19 @@ fn stop_server(
             .to_vec(),
     ));
     let expected = fs::canonicalize(program).unwrap_or_else(|_| program.to_path_buf());
-    if executable != expected || !owner_environment_matches(&environment, workspace, session) {
+    if exited(&pidfd, Duration::ZERO)? {
+        return Ok(None);
+    }
+    if !pidfd_matches_pid(&pidfd, peer.pid)? {
+        if exited(&pidfd, Duration::ZERO)? {
+            return Ok(None);
+        }
+        bail!("terminal process identity changed during verification");
+    }
+    if executable != expected
+        || !owner_environment_matches(&environment, workspace, session)
+        || !socket_argv_matches(&command, program, socket)
+    {
         if exited(&pidfd, Duration::ZERO)? {
             return Ok(None);
         }
@@ -277,6 +339,32 @@ pub(super) fn cleanup(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn socket_binding_is_exact_and_nul_delimited() {
+        let program = Path::new("/usr/bin/tmux");
+        let socket = Path::new("/runtime/terminal-a.tmux.sock");
+        assert!(socket_argv_matches(
+            b"/usr/bin/tmux\0-S\0/runtime/terminal-a.tmux.sock\0new-session\0",
+            program,
+            socket
+        ));
+        assert!(!socket_argv_matches(
+            b"/usr/bin/tmux\0-S\0/runtime/terminal-a.tmux.sock-extra\0",
+            program,
+            socket
+        ));
+        assert!(!socket_argv_matches(
+            b"/usr/bin/tmux\0-S\0/other/socket\0",
+            program,
+            socket
+        ));
+        assert!(!socket_argv_matches(
+            b"/usr/bin/tmux\0-S\0/runtime/terminal-a.tmux.sock",
+            program,
+            socket
+        ));
+    }
+
     #[test]
     fn ownership_requires_exact_unique_workspace_and_session_tags() {
         let good = b"IGNORED=value\0AGENT_WORKSPACE_ID=qa\0AGENT_WORKSPACE_SESSION_ID=unique\0";

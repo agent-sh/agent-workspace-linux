@@ -166,8 +166,8 @@ function terminalSocket(id, terminalId) {
   ownedSockets.add(socket);
   return socket;
 }
-function tmux(socket, args) {
-  const result = childProcess.spawnSync("tmux", ["-S", socket, ...args], { env, encoding: "utf8", timeout: 10000 });
+function tmux(socket, args, commandEnv = env) {
+  const result = childProcess.spawnSync("tmux", ["-S", socket, ...args], { env: commandEnv, encoding: "utf8", timeout: 10000 });
   assert(result.status === 0, `tmux ${args[0]} failed: ${result.stderr}`);
   return result.stdout.trim();
 }
@@ -345,6 +345,27 @@ async function main() {
     await waitForProcessesStopped([foreign], "foreign fixture cleanup");
     workspaceCli("cleanup", "--id", guardedId);
     assert(processRunning(sentinel.server) && processRunning(sentinel.pane), "stale cleanup stopped unrelated tmux");
+
+    const taggedId = `${workspaceId}-tagged`;
+    const tagged = await startExtraTerminal(taggedId, "tagged");
+    const taggedStatus = workspaceCli("status", "--id", taggedId);
+    tmux(tagged.socket, ["kill-server"]);
+    await waitForProcessesStopped([tagged.processes], "tagged fixture replacement");
+    const outsideSocket = path.join(tempDir, "tagged-sentinel.sock");
+    ownedSockets.add(outsideSocket);
+    const taggedEnv = { ...env, AGENT_WORKSPACE_ID: taggedId, AGENT_WORKSPACE_SESSION_ID: taggedStatus.session_id };
+    tmux(outsideSocket, ["new-session", "-d", "-s", "tagged", "--", "sleep", "600"], taggedEnv);
+    const outside = terminalProcesses(outsideSocket, "tagged");
+    if (fs.existsSync(tagged.socket)) fs.unlinkSync(tagged.socket);
+    fs.linkSync(outsideSocket, tagged.socket);
+    const aliasRefused = await callTool("workspace_stop", {id:taggedId}, 15000, true);
+    assert(aliasRefused.ok === false && processRunning(outside.server), "shared environment tags authorized an unrelated socket alias");
+    assert(fs.existsSync(taggedStatus.socket_path), "socket-alias refusal lost workspace control");
+    tmux(outsideSocket, ["kill-server"]);
+    await waitForProcessesStopped([outside], "tagged sentinel cleanup");
+    const taggedStopped = await callTool("workspace_stop", {id:taggedId}, 15000);
+    assert(taggedStopped.ok, JSON.stringify(taggedStopped));
+
   } finally {
     // Run fallback cleanup after assertions, so it cannot hide a runtime leak.
     for (const socket of ownedSockets) {
