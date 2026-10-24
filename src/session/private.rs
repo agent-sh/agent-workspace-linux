@@ -244,11 +244,7 @@ fn start_private_bus(
 <deny send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus" send_member="ReloadConfig"/>
 {extra_policy}
 </policy></busconfig>"#,
-            bus_type = if kind == "system" {
-                "system"
-            } else {
-                "session"
-            },
+            bus_type = if kind == "client" { "session" } else { kind },
             address = escape(address),
             services = escape(&service_dir.to_string_lossy()),
             uid = unsafe { libc::geteuid() }

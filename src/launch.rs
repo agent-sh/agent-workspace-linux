@@ -214,10 +214,16 @@ pub(crate) fn bubblewrap_sandbox_for_launch(
         // Keep desktop control/configuration private even for network-only
         // profiles whose ordinary host files remain visible. Fresh procfs in the
         // app PID namespace also prevents /proc/<host-pid>/root/fd bypasses.
-        args.extend([
-            "--tmpfs".to_string(),
-            status.runtime_dir.display().to_string(),
-        ]);
+        // Bubblewrap does not traverse symlink parents for mount targets. Mask
+        // the real directory so short runtime aliases see the same private view.
+        let runtime_target =
+            fs::canonicalize(&status.runtime_dir).unwrap_or_else(|_| status.runtime_dir.clone());
+        let target_path = |path: &Path| {
+            path.strip_prefix(&status.runtime_dir)
+                .map(|relative| runtime_target.join(relative))
+                .unwrap_or_else(|_| path.to_path_buf())
+        };
+        args.extend(["--tmpfs".to_string(), runtime_target.display().to_string()]);
         let resources = app_session_resources(status);
         let mut dirs = BTreeSet::new();
         for path in resources
@@ -229,7 +235,7 @@ pub(crate) fn bubblewrap_sandbox_for_launch(
         }
         for dir in dirs {
             if dir.starts_with(&status.runtime_dir) && dir != status.runtime_dir {
-                args.extend(["--dir".to_string(), dir.display().to_string()]);
+                args.extend(["--dir".to_string(), target_path(&dir).display().to_string()]);
             }
         }
         for (flag, paths) in [
@@ -240,7 +246,7 @@ pub(crate) fn bubblewrap_sandbox_for_launch(
                 args.extend([
                     flag.to_string(),
                     path.display().to_string(),
-                    path.display().to_string(),
+                    target_path(&path).display().to_string(),
                 ]);
             }
         }
