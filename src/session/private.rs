@@ -61,6 +61,7 @@ impl AccessibilityStatus {
 pub(crate) struct PrivateSession {
     pub(crate) compositor: Option<Child>,
     bus: Option<Child>,
+    system_bus: Option<Child>,
     accessibility_bus: Option<Child>,
     accessibility_service: Option<zbus::blocking::Connection>,
 }
@@ -77,6 +78,7 @@ impl PrivateSession {
         let mut session = Self {
             compositor: None,
             bus: None,
+            system_bus: None,
             accessibility_bus: None,
             accessibility_service: None,
         };
@@ -124,6 +126,26 @@ impl PrivateSession {
         }
         Ok(session)
     }
+    /// Some desktop shells require a reachable system bus even when no system
+    /// services exist. This empty bus never activates host system services.
+    pub(crate) fn start_system_bus(
+        &mut self,
+        runtime: &Path,
+        configure: impl Fn(&mut Command),
+    ) -> Result<()> {
+        if self.system_bus.is_some() {
+            bail!("private system bus already running");
+        }
+        self.system_bus = Some(start_private_bus(
+            runtime,
+            "system",
+            &socket_address(&runtime.join("system-bus")),
+            &[],
+            "",
+            &configure,
+        )?);
+        Ok(())
+    }
     pub(crate) fn pid(&self) -> Option<u32> {
         self.compositor.as_ref().map(Child::id)
     }
@@ -133,6 +155,7 @@ impl PrivateSession {
             &mut self.compositor,
             &mut self.accessibility_bus,
             &mut self.bus,
+            &mut self.system_bus,
         ] {
             if let Some(mut child) = slot.take() {
                 // Allow the compositor to unlink its display sockets before
@@ -212,8 +235,10 @@ fn start_private_bus(
     )?;
     let socket = if kind == "session" {
         runtime.join("session-bus")
-    } else {
+    } else if kind == "accessibility" {
         runtime.join("at-spi/bus")
+    } else {
+        runtime.join("system-bus")
     };
     if socket.exists() {
         fs::remove_file(&socket)?;
