@@ -2747,10 +2747,10 @@ impl Render for AgentWorkspaceViewer {
             .map(|s| s.session)
             .or_else(|| manifest.map(|m| m.session))
             .unwrap_or_default();
-        let display_label = if session.backend != crate::session::SessionBackend::X11 {
-            format!("{session} Wayland | {:.0}%", session.scale * 100.0)
-        } else {
-            display.to_string()
+        let display_label = match session.backend {
+            crate::session::SessionBackend::X11 => display.to_string(),
+            crate::session::SessionBackend::I3 => format!("i3 X11 | {display}"),
+            _ => format!("{session} Wayland | {:.0}%", session.scale * 100.0),
         };
         let app_count = status
             .map(|status| status.apps.len())

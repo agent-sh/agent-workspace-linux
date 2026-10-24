@@ -53,7 +53,7 @@ impl SessionSpec {
                     SessionBackend::Kwin => 0.5 / 256.0,
                     // Mutter exposes monitor scale as a single-precision float.
                     SessionBackend::Gnome => 1e-6,
-                    SessionBackend::X11 => 0.0,
+                    SessionBackend::X11 | SessionBackend::I3 => 0.0,
                 }
     }
     pub fn validate(self) -> Result<()> {
