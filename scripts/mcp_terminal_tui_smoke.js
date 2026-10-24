@@ -40,6 +40,8 @@ const env = {
   XDG_RUNTIME_DIR: runtimeDir,
 };
 
+for (const name of ["AGENT_WORKSPACE_ID", "AGENT_WORKSPACE_SESSION_ID", "AGENT_WORKSPACE_RUNTIME_DIR", "AGENT_WORKSPACE_SOCKET", "TMUX"]) delete env[name];
+
 const child = childProcess.spawn(bin, ["mcp", "--headless"], {
   cwd: repoRoot,
   env,
@@ -122,7 +124,7 @@ function notify(method, params) {
   child.stdin.write(`${JSON.stringify({ jsonrpc: "2.0", method, params })}\n`);
 }
 
-async function callTool(name, args, timeoutMs) {
+async function callTool(name, args, timeoutMs, allowError = false) {
   const result = await request(
     "tools/call",
     {
@@ -132,7 +134,7 @@ async function callTool(name, args, timeoutMs) {
     timeoutMs,
     `tools/call ${name}`,
   );
-  if (result.isError) {
+  if (result.isError && !allowError) {
     throw new Error(`tool ${name} returned MCP error: ${JSON.stringify(result)}`);
   }
   if (result.structuredContent && typeof result.structuredContent === "object") {
@@ -157,9 +159,59 @@ async function waitForTerminalText(workspaceId, terminalId, pattern) {
   throw new Error(`terminal text did not match ${pattern}: ${JSON.stringify(last)}`);
 }
 
+const ownedSockets = new Set();
+const extraWorkspaceIds = [];
+function terminalSocket(id, terminalId) {
+  const socket = path.join(runtimeDir, "agent-workspace-linux", id, `terminal-${terminalId}.tmux.sock`);
+  ownedSockets.add(socket);
+  return socket;
+}
+function tmux(socket, args) {
+  const result = childProcess.spawnSync("tmux", ["-S", socket, ...args], { env, encoding: "utf8", timeout: 10000 });
+  assert(result.status === 0, `tmux ${args[0]} failed: ${result.stderr}`);
+  return result.stdout.trim();
+}
+function terminalProcesses(socket, target) {
+  const [server, pane] = tmux(socket, ["display-message", "-p", "-t", target, "#{pid} #{pane_pid}"]).split(/\s+/).map(Number);
+  assert(server > 1 && pane > 1, "terminal process identities must be available");
+  return { server, pane };
+}
+function processRunning(pid) {
+  try {
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    return !["Z", "X"].includes(stat.slice(stat.lastIndexOf(") ") + 2).split(" ")[0]);
+  } catch (error) {
+    if (error.code === "ENOENT") return false;
+    throw error;
+  }
+}
+async function waitForProcessesStopped(processes, label) {
+  const pids = processes.flatMap(({ server, pane }) => [server, pane]);
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline && pids.some(processRunning)) {
+    await new Promise(resolve => setTimeout(resolve, 50));
+  }
+  assert(!pids.some(processRunning), `${label}: managed processes survived: ${pids.filter(processRunning)}`);
+}
+function workspaceCli(...args) {
+  const result = childProcess.spawnSync(bin, ["workspace", ...args], { env, encoding: "utf8", timeout: 15000 });
+  assert(result.status === 0, `workspace CLI failed: ${result.stderr}`);
+  return JSON.parse(result.stdout);
+}
+async function startExtraTerminal(id, terminalId) {
+  extraWorkspaceIds.push(id);
+  const started = await callTool("workspace_start", { id, acknowledge_hidden_workspace: true, purpose: "terminal cleanup regression", width: 900, height: 620 }, 15000);
+  assert(started.ok, JSON.stringify(started));
+  const socket = terminalSocket(id, terminalId);
+  const launched = await callTool("workspace_run_in_terminal", { id, terminal_id: terminalId, command: ["sleep", "600"], window_timeout_ms: 15000, timeout_ms: 10000 }, 20000);
+  assert(launched.ok, JSON.stringify(launched));
+  return { socket, processes: terminalProcesses(socket, terminalId) };
+}
+
 async function main() {
   const workspaceId = `tui-${process.pid}`;
   const terminalId = "game";
+  const socket = terminalSocket(workspaceId, terminalId);
   try {
     const initializeResult = await request("initialize", {
       protocolVersion: "2024-11-05",
@@ -246,9 +298,62 @@ async function main() {
       `terminal input event should omit raw text: ${JSON.stringify(terminalEvent)}`,
     );
 
+    const live = terminalProcesses(socket, terminalId);
+    const detachedSocket = terminalSocket(workspaceId, "detached");
+    const detached = await callTool("workspace_run_in_terminal", { id: workspaceId, terminal_id: "detached", command: ["sleep", "600"], window_timeout_ms: 15000, timeout_ms: 10000 }, 20000);
+    const detachedProcesses = terminalProcesses(detachedSocket, "detached");
+    await callTool("workspace_kill_app", { id: workspaceId, app_id: detached.terminal.app_id });
+    assert(processRunning(detachedProcesses.server), "closing a client must leave its terminal session available until workspace stop");
+
+    const sentinelSocket = path.join(tempDir, "sentinel.sock");
+    ownedSockets.add(sentinelSocket);
+    tmux(sentinelSocket, ["new-session", "-d", "-s", "sentinel", "--", "sleep", "600"]);
+    const sentinel = terminalProcesses(sentinelSocket, "sentinel");
     const stopped = await callTool("workspace_stop", { id: workspaceId }, 15000);
     assert(stopped.ok === true, `workspace_stop failed: ${JSON.stringify(stopped)}`);
+    await waitForProcessesStopped([live, detachedProcesses], "workspace stop");
+    assert(processRunning(sentinel.server) && processRunning(sentinel.pane), "unrelated tmux session was stopped");
+
+    const staleId = `${workspaceId}-stale`;
+    const stale = await startExtraTerminal(staleId, "stale");
+    const staleStatus = workspaceCli("status", "--id", staleId);
+    process.kill(staleStatus.daemon_pid, "SIGKILL");
+    await waitForProcessesStopped([{server:staleStatus.daemon_pid,pane:staleStatus.daemon_pid}], "daemon crash");
+    const preview = workspaceCli("cleanup", "--id", staleId, "--dry-run");
+    assert(preview.candidates.some(entry => entry.id === staleId), JSON.stringify(preview));
+    assert(processRunning(stale.processes.server), "dry run stopped a terminal server");
+    const cleaned = workspaceCli("cleanup", "--id", staleId);
+    assert(cleaned.removed.some(entry => entry.id === staleId), JSON.stringify(cleaned));
+    await waitForProcessesStopped([stale.processes], "stale cleanup");
+
+    const guardedId = `${workspaceId}-guarded`;
+    const guarded = await startExtraTerminal(guardedId, "guarded");
+    tmux(guarded.socket, ["kill-server"]);
+    await waitForProcessesStopped([guarded.processes], "replace stopped fixture");
+    tmux(guarded.socket, ["new-session", "-d", "-s", "guarded", "--", "sleep", "600"]);
+    const foreign = terminalProcesses(guarded.socket, "guarded");
+    const refused = await callTool("workspace_stop", {id:guardedId}, 15000, true);
+    assert(refused.ok === false, "stop accepted a terminal from a different workspace session");
+    const guardedStatus = workspaceCli("status", "--id", guardedId);
+    assert(fs.existsSync(guardedStatus.socket_path) && processRunning(foreign.server), "failed stop lost control or killed an unrelated server");
+    process.kill(guardedStatus.daemon_pid, "SIGKILL");
+    await waitForProcessesStopped([{server:guardedStatus.daemon_pid,pane:guardedStatus.daemon_pid}], "guarded daemon crash");
+    const skipped = workspaceCli("cleanup", "--id", guardedId);
+    assert(skipped.skipped.some(entry => entry.id === guardedId) && fs.existsSync(guardedStatus.runtime_dir), "unverified runtime was removed");
+    assert(processRunning(foreign.server), "cleanup killed a mismatched-session server");
+    tmux(guarded.socket, ["kill-server"]);
+    await waitForProcessesStopped([foreign], "foreign fixture cleanup");
+    workspaceCli("cleanup", "--id", guardedId);
+    assert(processRunning(sentinel.server) && processRunning(sentinel.pane), "stale cleanup stopped unrelated tmux");
   } finally {
+    // Run fallback cleanup after assertions, so it cannot hide a runtime leak.
+    for (const socket of ownedSockets) {
+      childProcess.spawnSync("tmux", ["-S", socket, "kill-server"], { env, stdio: "ignore", timeout: 1000 });
+    }
+    for (const id of extraWorkspaceIds) {
+      try { await callTool("workspace_stop", { id }, 5000); } catch {}
+      try { workspaceCli("cleanup", "--id", id); } catch {}
+    }
     try {
       await callTool("workspace_stop", { id: workspaceId }, 5000);
     } catch {

@@ -1,3 +1,6 @@
+#[path = "terminal_cleanup.rs"]
+mod terminal_cleanup;
+
 use crate::approval::{
     hidden_workspace_acknowledgement, unenforced_policy_acknowledgement, ApprovalBundle,
 };
@@ -1556,8 +1559,23 @@ pub fn cleanup_stale_workspaces(id: Option<String>, dry_run: bool) -> Result<Wor
             continue;
         }
 
-        let process_cleanup =
-            cleanup_stale_workspace_processes(workspace.manifest.as_ref(), dry_run);
+        let process_cleanup = match cleanup_stale_workspace_processes(
+            workspace.manifest.as_ref(),
+            &workspace.id,
+            &workspace.runtime_dir,
+            dry_run,
+        ) {
+            Ok(actions) => actions,
+            Err(error) => {
+                skipped.push(WorkspaceCleanupEntry {
+                    id: workspace.id,
+                    runtime_dir: workspace.runtime_dir,
+                    reason: format!("terminal cleanup could not be verified: {error:#}"),
+                    process_cleanup: Vec::new(),
+                });
+                continue;
+            }
+        };
         if dry_run {
             candidates.push(WorkspaceCleanupEntry {
                 id: workspace.id,
@@ -1595,16 +1613,42 @@ pub fn cleanup_stale_workspaces(id: Option<String>, dry_run: bool) -> Result<Wor
 
 fn cleanup_stale_workspace_processes(
     manifest: Option<&WorkspaceManifest>,
+    workspace_id: &str,
+    runtime_dir: &Path,
     dry_run: bool,
-) -> Vec<String> {
+) -> Result<Vec<String>> {
     let Some(manifest) = manifest else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
+    if manifest.id != workspace_id
+        || (manifest.runtime_dir != runtime_dir
+            && fs::canonicalize(&manifest.runtime_dir)? != fs::canonicalize(runtime_dir)?)
+    {
+        bail!("workspace manifest does not match the selected runtime");
+    }
+    let terminal_preview = terminal_cleanup::cleanup(
+        &manifest.runtime_dir,
+        &manifest.id,
+        &manifest.session_id,
+        &manifest.apps,
+        true,
+    )?;
     let mut actions = Vec::new();
 
     for app in &manifest.apps {
         cleanup_stale_app_process_group(app, dry_run, &mut actions);
     }
+    actions.extend(if dry_run {
+        terminal_preview
+    } else {
+        terminal_cleanup::cleanup(
+            &manifest.runtime_dir,
+            &manifest.id,
+            &manifest.session_id,
+            &manifest.apps,
+            false,
+        )?
+    });
     manifest.session.cleanup_stale_processes(
         manifest.window_manager_pid,
         manifest.x_server_pid,
@@ -1621,7 +1665,7 @@ fn cleanup_stale_workspace_processes(
         );
     }
 
-    actions
+    Ok(actions)
 }
 
 fn cleanup_stale_app_process_group(app: &WorkspaceApp, dry_run: bool, actions: &mut Vec<String>) {
@@ -6559,7 +6603,20 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             ),
         },
         IpcRequest::Stop => {
-            let stopped_apps = terminate_running_workspace_apps(state)?;
+            let stopped_apps = match terminate_running_workspace_apps(state) {
+                Ok(apps) => apps,
+                Err(error) => {
+                    return finish_ipc_response(
+                        stream,
+                        response_with_status(
+                            false,
+                            format!("workspace stop refused: {error:#}"),
+                            &state.status,
+                        ),
+                        false,
+                    )
+                }
+            };
             state.status.ready = false;
             record_event(
                 state,
@@ -8228,6 +8285,13 @@ fn kill_workspace_app(
 }
 
 fn terminate_running_workspace_apps(state: &mut DaemonState) -> Result<Vec<WorkspaceApp>> {
+    terminal_cleanup::cleanup(
+        &state.status.runtime_dir,
+        &state.status.id,
+        &state.status.session_id,
+        &state.status.apps,
+        true,
+    )?;
     let mut stopped_apps = Vec::new();
     let mut exit_events = Vec::new();
     for app in &mut state.apps {
@@ -8244,6 +8308,13 @@ fn terminate_running_workspace_apps(state: &mut DaemonState) -> Result<Vec<Works
     for detail in exit_events {
         record_event(state, "app_exit", detail)?;
     }
+    terminal_cleanup::cleanup(
+        &state.status.runtime_dir,
+        &state.status.id,
+        &state.status.session_id,
+        &state.status.apps,
+        false,
+    )?;
     Ok(stopped_apps)
 }
 
