@@ -205,6 +205,10 @@ pub enum SessionBackend {
 }
 
 impl SessionBackend {
+    pub(crate) fn requires_client_application_bus(self) -> bool {
+        matches!(self, Self::Kwin | Self::Gnome)
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             Self::X11 => "x11",
