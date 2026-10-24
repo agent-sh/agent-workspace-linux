@@ -61,6 +61,16 @@ Path("/tmp/.X11-unix").mkdir(mode=0o1777, exist_ok=True)
 report = command("doctor")
 assert report["ready_for_kwin_workspace"], report
 assert not report["ready_for_x11_workspace"], "KWin must not need an X11 window manager"
+# Diagnose a missing scale tool before trying to start a compositor.
+partial_path = Path("/tmp/awl-path-without-kscreen")
+partial_path.mkdir(exist_ok=True)
+for executable in ("kwin_wayland", "Xwayland", "dbus-daemon", "wl-copy", "wl-paste", "kbuildsycoca6", "timeout"):
+    (partial_path / executable).symlink_to(shutil.which(executable))
+missing_scale_tool = subprocess.run([BIN, "doctor"], env=dict(os.environ, PATH=str(partial_path)),
+    capture_output=True, text=True, timeout=10)
+missing_report = json.loads(missing_scale_tool.stdout)
+assert not missing_report["ready_for_kwin_workspace"], missing_report
+assert "kscreen-doctor" in missing_scale_tool.stdout, missing_report
 
 for scale in (1, 1.5):
     id = f"kwin-{int(scale * 100)}"
@@ -74,6 +84,10 @@ for scale in (1, 1.5):
     marker = Path(f"/tmp/forbidden-service-{id}")
     (standard_services / "org.agent_sh.Forbidden.service").write_text(
         f"[D-BUS Service]\nName=org.agent_sh.Forbidden\nExec=/usr/bin/touch {marker}\n")
+    # A stopped session may leave service files behind. Startup must discard them.
+    stale_services = runtime / "session-services"
+    stale_services.mkdir(parents=True, exist_ok=True)
+    shutil.copy(standard_services / "org.agent_sh.Forbidden.service", stale_services)
     status = None
     try:
         if scale == 1.5:
@@ -102,6 +116,21 @@ for scale in (1, 1.5):
         assert env["WAYLAND_DISPLAY"] == "workspace-wayland"
         assert env["QT_QPA_PLATFORM"] == "wayland"
         bus_env = dict(os.environ, **env)
+        a11y_address = env["AT_SPI_BUS_ADDRESS"]
+        a11y_update = subprocess.run(["dbus-send", f"--bus={a11y_address}", "--print-reply", "--reply-timeout=1000",
+            "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus",
+            "org.freedesktop.DBus.UpdateActivationEnvironment", "dict:string:string:WORKSPACE_TEST,blocked"],
+            env=bus_env, capture_output=True, text=True, timeout=3)
+        assert a11y_update.returncode != 0 and "AccessDenied" in a11y_update.stderr, a11y_update
+        for address in (env["DBUS_SESSION_BUS_ADDRESS"], a11y_address):
+            reload_config = subprocess.run(["dbus-send", f"--bus={address}", "--print-reply", "--reply-timeout=1000",
+                "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus.ReloadConfig"],
+                env=bus_env, capture_output=True, text=True, timeout=3)
+            assert reload_config.returncode != 0 and "AccessDenied" in reload_config.stderr, reload_config
+        a11y_forbidden = subprocess.run(["dbus-send", f"--bus={a11y_address}", "--print-reply", "--reply-timeout=1000",
+            "--dest=org.agent_sh.Forbidden", "/org/agent_sh/Forbidden", "org.agent_sh.Forbidden.Ping"],
+            env=bus_env, capture_output=True, text=True, timeout=3)
+        assert a11y_forbidden.returncode != 0 and "ServiceUnknown" in a11y_forbidden.stderr, a11y_forbidden
         forbidden = subprocess.run(["dbus-send", "--session", "--print-reply", "--reply-timeout=1000",
             "--dest=org.agent_sh.Forbidden", "/org/agent_sh/Forbidden", "org.agent_sh.Forbidden.Ping"],
             env=bus_env, capture_output=True, text=True, timeout=3)

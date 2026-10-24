@@ -18,7 +18,7 @@ pub(crate) const WAYLAND_SOCKET: &str = "workspace-wayland";
 
 pub(crate) fn blockers() -> Vec<String> {
     use std::os::unix::{ffi::OsStrExt, fs::FileTypeExt};
-    let mut blockers: Vec<String> = ["kwin_wayland", "Xwayland", "dbus-daemon", "wl-copy", "wl-paste", "kbuildsycoca6", "timeout"]
+    let mut blockers: Vec<String> = ["kwin_wayland", "Xwayland", "dbus-daemon", "wl-copy", "wl-paste", "kbuildsycoca6", "kscreen-doctor", "timeout"]
         .into_iter().filter(|name| !command_path_check(name).ok)
         .map(|name| format!("Install {name} for native KWin Wayland workspaces (KWin 6.6 or newer, including kwin-common)."))
         .collect();
@@ -52,9 +52,13 @@ pub(crate) fn blockers() -> Vec<String> {
 }
 
 pub(crate) fn bus_address(runtime: &Path) -> String {
+    socket_address(&runtime.join("session-bus"))
+}
+
+fn socket_address(path: &Path) -> String {
     use std::{fmt::Write as _, os::unix::ffi::OsStrExt};
     let mut address = String::from("unix:path=");
-    for byte in runtime.join("session-bus").as_os_str().as_bytes() {
+    for byte in path.as_os_str().as_bytes() {
         if byte.is_ascii_alphanumeric() || b"_-/.\\".contains(byte) {
             address.push(*byte as char);
         } else {
@@ -136,9 +140,44 @@ pub(crate) fn sandbox_resources(
     }
 }
 
+struct AccessibilityBus {
+    address: String,
+}
+#[zbus::interface(name = "org.a11y.Bus")]
+impl AccessibilityBus {
+    fn get_address(&self) -> &str {
+        &self.address
+    }
+}
+struct AccessibilityStatus {
+    enabled: bool,
+    screen_reader_enabled: bool,
+}
+#[zbus::interface(name = "org.a11y.Status")]
+impl AccessibilityStatus {
+    #[zbus(property)]
+    fn is_enabled(&self) -> bool {
+        self.enabled
+    }
+    #[zbus(property)]
+    fn set_is_enabled(&mut self, enabled: bool) {
+        self.enabled = enabled;
+    }
+    #[zbus(property)]
+    fn screen_reader_enabled(&self) -> bool {
+        self.screen_reader_enabled
+    }
+    #[zbus(property)]
+    fn set_screen_reader_enabled(&mut self, enabled: bool) {
+        self.screen_reader_enabled = enabled;
+    }
+}
+
 pub(crate) struct KwinSession {
     compositor: Option<Child>,
     bus: Option<Child>,
+    accessibility_bus: Option<Child>,
+    accessibility_service: Option<zbus::blocking::Connection>,
 }
 impl KwinSession {
     pub(crate) fn start(options: &mut DaemonOptions) -> Result<Self> {
@@ -184,87 +223,54 @@ impl KwinSession {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        let bus_path = runtime.join("session-bus");
-        if bus_path.exists() {
-            fs::remove_file(&bus_path)?;
+        // Discard addresses and service directories left by a stopped session.
+        let address_file = runtime.join("atspi-address");
+        if address_file.exists() {
+            fs::remove_file(&address_file)?;
         }
         let mut session = Self {
             compositor: None,
             bus: None,
+            accessibility_bus: None,
+            accessibility_service: None,
         };
-        let service_dir = runtime.join("session-services");
-        fs::create_dir_all(&service_dir)?;
-        // Only this narrowly scoped accessibility service may auto-activate.
-        // Standard desktop services would execute outside app launch sandboxes.
-        let accessibility = Path::new("/usr/share/dbus-1/services/org.a11y.Bus.service");
-        if accessibility.is_file() {
-            fs::copy(accessibility, service_dir.join("org.a11y.Bus.service"))?;
-        }
-        let escape = |path: &Path| {
-            path.to_string_lossy()
-                .replace('&', "&amp;")
-                .replace('<', "&lt;")
-                .replace('>', "&gt;")
-                .replace('"', "&quot;")
-        };
-        let bus_config = runtime.join("session-bus.conf");
-        fs::write(
-            &bus_config,
-            format!(
-                r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-<busconfig><type>session</type><auth>EXTERNAL</auth><listen>{bus}</listen>
-<servicedir>{}</servicedir>
-<policy context="default">
-<allow user="{uid}"/><allow own="*"/><allow send_destination="*"/><allow receive_sender="*"/>
-<deny send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus" send_member="UpdateActivationEnvironment"/>
-<deny send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus" send_member="ReloadConfig"/>
-</policy></busconfig>"#,
-                escape(&service_dir),
-                bus = bus_address(runtime),
-                uid = unsafe { libc::geteuid() }
-            ),
-        )?;
-        let mut bus = Command::new("dbus-daemon");
-        configure_process_environment(&mut bus, runtime, "", &options.xauthority_path);
-        // The allowed AT-SPI launcher stores only session-local accessibility
-        // state. Its GSettings writes must not require an unconfined dconf service.
-        bus.env("HOME", runtime.join("session-home"))
-            .env("GSETTINGS_BACKEND", "memory");
-        bus.arg("--config-file")
-            .arg(&bus_config)
-            .args(["--nofork", "--nopidfile", "--address"])
-            .arg(bus_address(runtime));
-        prepare_child(&mut bus);
-        bus.stdout(Stdio::null())
-            .stderr(Stdio::from(fs::File::create(
-                runtime.join("session-bus.log"),
-            )?));
-        session.bus = Some(bus.spawn().context("start private KWin session bus")?);
-        wait_for(
-            Duration::from_secs(5),
-            || Ok(bus_path.exists()),
-            "private KWin bus",
-        )?;
-        if accessibility.is_file() {
-            let connection =
+        session.bus = Some(start_private_bus(
+            runtime,
+            "session",
+            &bus_address(runtime),
+            &[],
+        )?);
+        let registry =
+            Path::new("/usr/share/dbus-1/accessibility-services/org.a11y.atspi.Registry.service");
+        if registry.is_file() {
+            fs::create_dir_all(runtime.join("at-spi"))?;
+            let address = socket_address(&runtime.join("at-spi/bus"));
+            session.accessibility_bus = Some(start_private_bus(
+                runtime,
+                "accessibility",
+                &address,
+                &[registry],
+            )?);
+            session.accessibility_service = Some(
                 zbus::blocking::connection::Builder::address(bus_address(runtime).as_str())?
                     .method_timeout(Duration::from_secs(5))
-                    .build()?;
-            let bus = zbus::blocking::Proxy::new(
-                &connection,
-                "org.a11y.Bus",
-                "/org/a11y/bus",
-                "org.a11y.Bus",
-            )?;
-            let address: String = bus.call("GetAddress", &())?;
-            let status = zbus::blocking::Proxy::new(
-                &connection,
-                "org.a11y.Bus",
-                "/org/a11y/bus",
-                "org.a11y.Status",
-            )?;
-            status.set_property("IsEnabled", true)?;
-            fs::write(runtime.join("atspi-address"), address)?;
+                    .name("org.a11y.Bus")?
+                    .serve_at(
+                        "/org/a11y/bus",
+                        AccessibilityBus {
+                            address: address.clone(),
+                        },
+                    )?
+                    .serve_at(
+                        "/org/a11y/bus",
+                        AccessibilityStatus {
+                            enabled: true,
+                            screen_reader_enabled: false,
+                        },
+                    )?
+                    .build()?,
+            );
+            fs::write(address_file, address)?;
         }
         let client_env = runtime.join("kwin-client.json");
         if client_env.exists() {
@@ -428,7 +434,12 @@ impl KwinSession {
         self.compositor.as_ref().map(Child::id)
     }
     pub(crate) fn shutdown(&mut self) {
-        for slot in [&mut self.compositor, &mut self.bus] {
+        self.accessibility_service.take();
+        for slot in [
+            &mut self.compositor,
+            &mut self.accessibility_bus,
+            &mut self.bus,
+        ] {
             if let Some(mut child) = slot.take() {
                 // Allow KWin to unlink its Wayland/XWayland sockets before
                 // reaping all remaining private-session services.
@@ -456,6 +467,91 @@ impl Drop for KwinSession {
     fn drop(&mut self) {
         self.shutdown();
     }
+}
+
+fn start_private_bus(
+    runtime: &Path,
+    kind: &str,
+    address: &str,
+    services: &[&Path],
+) -> Result<Child> {
+    let service_dir = runtime.join(format!("{kind}-services"));
+    if service_dir.symlink_metadata().is_ok() {
+        if service_dir.symlink_metadata()?.file_type().is_symlink() {
+            fs::remove_file(&service_dir)?;
+        } else {
+            fs::remove_dir_all(&service_dir)?;
+        }
+    }
+    fs::create_dir_all(&service_dir)?;
+    for service in services {
+        fs::copy(
+            service,
+            service_dir.join(service.file_name().context("service file name")?),
+        )?;
+    }
+    let escape = |value: &str| {
+        value
+            .replace('&', "&amp;")
+            .replace('<', "&lt;")
+            .replace('>', "&gt;")
+            .replace('"', "&quot;")
+    };
+    let config = runtime.join(format!("{kind}-bus.conf"));
+    fs::write(
+        &config,
+        format!(
+            r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<busconfig><type>{kind}</type><auth>EXTERNAL</auth><listen>{address}</listen>
+<servicedir>{services}</servicedir>
+<policy context="default">
+<allow user="{uid}"/><allow own="*"/><allow send_destination="*"/><allow receive_sender="*"/>
+<deny send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus" send_member="UpdateActivationEnvironment"/>
+<deny send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus" send_member="ReloadConfig"/>
+</policy></busconfig>"#,
+            address = escape(address),
+            services = escape(&service_dir.to_string_lossy()),
+            uid = unsafe { libc::geteuid() }
+        ),
+    )?;
+    let socket = if kind == "session" {
+        runtime.join("session-bus")
+    } else {
+        runtime.join("at-spi/bus")
+    };
+    if socket.exists() {
+        fs::remove_file(&socket)?;
+    }
+    let mut command = Command::new("dbus-daemon");
+    configure_process_environment(&mut command, runtime, "", &runtime.join("Xauthority"));
+    command
+        .env("HOME", runtime.join("session-home"))
+        .env("GSETTINGS_BACKEND", "memory")
+        .args(["--nofork", "--nopidfile", "--config-file"])
+        .arg(config)
+        .stdout(Stdio::null())
+        .stderr(Stdio::from(fs::File::create(
+            runtime.join(format!("{kind}-bus.log")),
+        )?));
+    prepare_child(&mut command);
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("start private {kind} bus"))?;
+    if let Err(error) = wait_for(
+        Duration::from_secs(5),
+        || {
+            if let Some(status) = child.try_wait()? {
+                bail!("private {kind} bus exited with {status}");
+            }
+            Ok(socket.exists())
+        },
+        &format!("private {kind} bus"),
+    ) {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(error);
+    }
+    Ok(child)
 }
 
 fn prepare_child(command: &mut Command) {
