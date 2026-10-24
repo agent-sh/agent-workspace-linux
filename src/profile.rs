@@ -1,6 +1,8 @@
 use crate::approval::{unenforced_policy_acknowledgement, ApprovalBundle};
+use crate::launch::merged_env;
 use crate::policy::{AppliedWorkspacePolicy, NetworkMode};
 pub use crate::policy::{MountMode, NetworkPolicy, ProfileMount};
+use crate::session::SessionSpec;
 use crate::workspace::{self, EnvVar, IpcResponse, LaunchSpec, WorkspaceStartOptions};
 use anyhow::{bail, Context, Result};
 use schemars::JsonSchema;
@@ -23,6 +25,8 @@ pub struct WorkspaceProfile {
     pub id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    #[serde(default)]
+    pub session: SessionSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -443,6 +447,7 @@ pub fn template_profile(
             WorkspaceProfile {
                 id,
                 description: Some(description),
+                session: SessionSpec::default(),
                 width: None,
                 height: None,
                 cwd: Some(PathBuf::from(PROJECT_WORKSPACE_PATH)),
@@ -467,6 +472,7 @@ pub fn template_profile(
                 description: Some(
                     "Chrome with workspace networking disabled. Uses --no-sandbox because Chrome's SUID sandbox may abort inside the bubblewrap network namespace; use an isolated browser profile and edit the browser path if needed. Exposes Chrome DevTools on an ephemeral loopback port for workspace-owned browser control.".to_string(),
                 ),
+                session: SessionSpec::default(),
                 width: Some(1280),
                 height: Some(800),
                 cwd: Some(PathBuf::from("/tmp")),
@@ -510,6 +516,7 @@ pub fn template_profile(
                 description: Some(
                     "Browser session profile with the selected user-data directory mounted read-write. Use only with explicit user approval; close the host browser or point to a copied profile to avoid profile lock/corruption. Uses --no-sandbox because Chrome can abort inside the enforced bubblewrap mount namespace. Exposes Chrome DevTools on an ephemeral loopback port for workspace-owned browser control.".to_string(),
                 ),
+                session: SessionSpec::default(),
                 width: Some(1280),
                 height: Some(800),
                 cwd: Some(PathBuf::from("/tmp")),
@@ -904,6 +911,7 @@ pub fn apply_profile_to_start_options(
 ) -> Result<WorkspaceProfile> {
     let profile = get_profile(profile_id)?;
     options.profile_id = Some(profile.id.clone());
+    options.session = profile.session;
     options.applied_policy = Some(applied_policy(&profile));
     options.profile_cwd = profile.cwd.clone();
     options.profile_env = profile.env.clone();
@@ -1427,20 +1435,6 @@ fn response_app_exit_code(response: &IpcResponse, app_id: &str) -> Option<i32> {
         .exit_code
 }
 
-fn merged_env(mut base: Vec<EnvVar>, overrides: Vec<EnvVar>) -> Vec<EnvVar> {
-    for override_var in overrides {
-        if let Some(existing) = base
-            .iter_mut()
-            .find(|base_var| base_var.name == override_var.name)
-        {
-            *existing = override_var;
-        } else {
-            base.push(override_var);
-        }
-    }
-    base
-}
-
 fn read_store(path: &Path) -> Result<ProfileStore> {
     if !path.exists() {
         return Ok(ProfileStore::default());
@@ -1529,6 +1523,7 @@ mod tests {
         WorkspaceProfile {
             id: "qa-local".to_string(),
             description: None,
+            session: SessionSpec::default(),
             width: None,
             height: None,
             cwd: None,
@@ -1539,6 +1534,14 @@ mod tests {
             setup_commands: Vec::new(),
             startup_apps: Vec::new(),
         }
+    }
+
+    #[test]
+    fn legacy_profile_without_session_defaults_to_x11() {
+        let profile: WorkspaceProfile =
+            serde_json::from_str(r#"{"id":"legacy"}"#).expect("legacy profile should parse");
+
+        assert_eq!(profile.session, SessionSpec::default());
     }
 
     #[test]

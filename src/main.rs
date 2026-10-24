@@ -9,11 +9,14 @@ mod agent;
 mod approval;
 mod browser;
 mod control;
+mod desktop;
 mod guardrails;
+mod launch;
 mod permissions;
 mod policy;
 mod profile;
 mod server;
+mod session;
 mod viewer;
 mod workspace;
 mod xtest_input;
@@ -21,6 +24,7 @@ mod xtest_input;
 use anyhow::{bail, Context, Result};
 use policy::{AppliedWorkspacePolicy, MountMode, ProfileMount};
 use profile::WorkspaceProfile;
+use session::SessionSpec;
 use std::{fs, path::PathBuf};
 use workspace::{DaemonOptions, EnvVar, LaunchSpec, WorkspaceStartOptions};
 
@@ -1046,6 +1050,7 @@ fn parse_start_options(args: &[String]) -> Result<ParsedStartOptions> {
     let mut foreground = false;
     let mut dry_run = false;
     let mut profile_id = None;
+    let mut session = None;
     let mut width_explicit = false;
     let mut height_explicit = false;
     let mut index = 0;
@@ -1069,6 +1074,10 @@ fn parse_start_options(args: &[String]) -> Result<ParsedStartOptions> {
             }
             "--profile" => {
                 profile_id = Some(value_after(args, index, "--profile")?.to_string());
+                index += 2;
+            }
+            "--session" => {
+                session = Some(value_after(args, index, "--session")?.parse()?);
                 index += 2;
             }
             "--id" => {
@@ -1104,6 +1113,7 @@ fn parse_start_options(args: &[String]) -> Result<ParsedStartOptions> {
             height_explicit,
         )?;
     }
+    options.session = SessionSpec::resolve(session, Some(options.session));
     Ok(ParsedStartOptions {
         options,
         profile_id,
@@ -1121,6 +1131,7 @@ fn parse_open_profile_options(
 )> {
     let mut options = WorkspaceStartOptions::default();
     let mut profile_id = None;
+    let mut session = None;
     let mut width_explicit = false;
     let mut height_explicit = false;
     let mut open_options = profile::ProfileWorkspaceOpenOptions::default();
@@ -1144,6 +1155,10 @@ fn parse_open_profile_options(
             }
             "--profile" => {
                 profile_id = Some(value_after(args, index, "--profile")?.to_string());
+                index += 2;
+            }
+            "--session" => {
+                session = Some(value_after(args, index, "--session")?.parse()?);
                 index += 2;
             }
             "--id" => {
@@ -1217,6 +1232,7 @@ fn parse_open_profile_options(
         width_explicit,
         height_explicit,
     )?;
+    options.session = SessionSpec::resolve(session, Some(options.session));
     Ok((
         ParsedStartOptions {
             options,
@@ -4171,6 +4187,7 @@ fn parse_id_and_args(args: &[String]) -> Result<(String, Vec<String>)> {
 
 fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
     let mut id = None;
+    let mut session = SessionSpec::default();
     let mut session_id = None;
     let mut purpose = None;
     let mut profile_id = None;
@@ -4196,6 +4213,10 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
             }
             "--session-id" => {
                 session_id = Some(value_after(&args, index, "--session-id")?.to_string());
+                index += 2;
+            }
+            "--session" => {
+                session = value_after(&args, index, "--session")?.parse()?;
                 index += 2;
             }
             "--profile" => {
@@ -4277,6 +4298,7 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
 
     Ok(DaemonOptions {
         id,
+        session,
         session_id,
         purpose,
         profile_id,
@@ -4352,8 +4374,8 @@ Usage:
   agent-workspace-linux profile template project-dev [--id ID] [--host-path PATH]
   agent-workspace-linux profile template restricted-chrome [--id ID] [--browser-path PATH]
   agent-workspace-linux profile template browser-session [--id ID] [--browser-path PATH] --user-data-dir PATH
-  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--ack-unenforced-policy] [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--width PX] [--height PX]
-  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] [--ack-unenforced-policy] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--width PX] [--height PX]
+  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--ack-unenforced-policy] [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11] [--width PX] [--height PX]
+  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] [--ack-unenforced-policy] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11] [--width PX] [--height PX]
   agent-workspace-linux workspace list
   agent-workspace-linux workspace cleanup [--id ID] [--dry-run]
   agent-workspace-linux workspace status [--id ID]
@@ -4471,6 +4493,25 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn start_options_default_to_x11_and_accept_explicit_x11() {
+        let defaults = parse_start_options(&[]).expect("default start options");
+        let explicit =
+            parse_start_options(&args(&["--session", "x11"])).expect("explicit x11 start options");
+
+        assert_eq!(defaults.options.session, SessionSpec::default());
+        assert_eq!(explicit.options.session, SessionSpec::default());
+    }
+
+    #[test]
+    fn start_options_reject_unimplemented_session_backend() {
+        let error = match parse_start_options(&args(&["--session", "kwin"])) {
+            Ok(_) => panic!("unimplemented backend must be rejected"),
+            Err(error) => error,
+        };
+        assert!(error.to_string().contains("must be x11"));
     }
 
     #[test]

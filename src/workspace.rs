@@ -2,18 +2,27 @@ use crate::approval::{
     hidden_workspace_acknowledgement, unenforced_policy_acknowledgement, ApprovalBundle,
 };
 use crate::control::{self, McpControlMode};
-use crate::permissions::{load_mcp_permission_state, McpPermissionState};
-use crate::policy::{
-    AppliedWorkspacePolicy, NetworkMode, PolicyRuntimeCapabilities, PolicyToolCheck,
+use crate::desktop::{sanitize_window_id, DesktopControl};
+use crate::launch::{
+    bubblewrap_sandbox_for_launch, launch_isolation_labels_for_policy,
+    launch_isolation_labels_from_sandbox, resolve_executable_path, uses_bubblewrap_mount_isolation,
 };
+#[cfg(test)]
+use crate::launch::{
+    external_symlink_target_parent, launch_network_plan, restricted_mount_namespace_args,
+    LaunchNetworkPlan,
+};
+use crate::permissions::{load_mcp_permission_state, McpPermissionState};
+#[cfg(test)]
+use crate::policy::NetworkMode;
+use crate::policy::{AppliedWorkspacePolicy, PolicyRuntimeCapabilities, PolicyToolCheck};
+use crate::session::SessionSpec;
 use anyhow::{anyhow, bail, Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
-    ffi::OsStr,
-    fs,
+    env, fs,
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::{
         ffi::OsStrExt,
@@ -86,7 +95,7 @@ impl ScrollDirection {
         }
     }
 
-    fn x11_button(self) -> u8 {
+    pub(crate) fn x11_button(self) -> u8 {
         match self {
             Self::Up => 4,
             Self::Down => 5,
@@ -151,6 +160,7 @@ pub struct Check {
 #[derive(Debug, Clone)]
 pub struct WorkspaceStartOptions {
     pub id: String,
+    pub session: SessionSpec,
     pub purpose: Option<String>,
     pub profile_id: Option<String>,
     pub applied_policy: Option<AppliedWorkspacePolicy>,
@@ -169,6 +179,7 @@ impl Default for WorkspaceStartOptions {
     fn default() -> Self {
         Self {
             id: DEFAULT_WORKSPACE_ID.to_string(),
+            session: SessionSpec::default(),
             purpose: None,
             profile_id: None,
             applied_policy: None,
@@ -186,6 +197,7 @@ impl Default for WorkspaceStartOptions {
 #[derive(Debug, Clone)]
 pub struct DaemonOptions {
     pub id: String,
+    pub session: SessionSpec,
     pub session_id: String,
     pub purpose: Option<String>,
     pub profile_id: Option<String>,
@@ -209,6 +221,8 @@ pub struct DaemonOptions {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceStatus {
     pub id: String,
+    #[serde(default)]
+    pub session: SessionSpec,
     #[serde(default)]
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -295,6 +309,8 @@ pub struct WorkspaceArtifact {
 pub struct WorkspaceManifest {
     pub id: String,
     #[serde(default)]
+    pub session: SessionSpec,
+    #[serde(default)]
     pub session_id: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
@@ -360,11 +376,15 @@ pub struct WorkspaceCleanupEntry {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceStartPreview {
     pub id: String,
+    #[serde(default)]
+    pub session: SessionSpec,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub purpose: Option<String>,
     pub ok_to_start: bool,
     pub would_start: bool,
     pub already_running: bool,
+    #[serde(default)]
+    pub session_mismatch: bool,
     pub runtime_ready: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub runtime_blockers: Vec<String>,
@@ -1573,12 +1593,12 @@ fn cleanup_stale_workspace_processes(
     for app in &manifest.apps {
         cleanup_stale_app_process_group(app, dry_run, &mut actions);
     }
-    if let Some(pid) = manifest.window_manager_pid {
-        cleanup_stale_process_pid(pid, "window manager", &["openbox"], dry_run, &mut actions);
-    }
-    if let Some(pid) = manifest.x_server_pid {
-        cleanup_stale_process_pid(pid, "X server", &["Xvfb"], dry_run, &mut actions);
-    }
+    manifest.session.cleanup_stale_processes(
+        manifest.window_manager_pid,
+        manifest.x_server_pid,
+        dry_run,
+        &mut actions,
+    );
     if let Some(pid) = manifest.daemon_pid {
         cleanup_stale_process_pid(
             pid,
@@ -1649,7 +1669,7 @@ fn cleanup_stale_app_process_group(app: &WorkspaceApp, dry_run: bool, actions: &
     }
 }
 
-fn cleanup_stale_process_pid(
+pub(crate) fn cleanup_stale_process_pid(
     pid: u32,
     label: &str,
     expected_names: &[&str],
@@ -2206,7 +2226,7 @@ pub fn screenshot_window(
 
 pub fn focus_window(id: &str, window_id: String) -> Result<IpcResponse> {
     let id = sanitize_workspace_id(id)?;
-    let window_id = sanitize_x11_id(&window_id, "window id")?;
+    let window_id = sanitize_window_id(&window_id)?;
     request(
         &workspace_socket_path(&id),
         IpcRequest::FocusWindow { window_id },
@@ -2237,7 +2257,7 @@ pub fn focus_matching_window(
 
 pub fn close_window(id: &str, window_id: String, dry_run: bool) -> Result<IpcResponse> {
     let id = sanitize_workspace_id(id)?;
-    let window_id = sanitize_x11_id(&window_id, "window id")?;
+    let window_id = sanitize_window_id(&window_id)?;
     request(
         &workspace_socket_path(&id),
         IpcRequest::CloseWindow { window_id, dry_run },
@@ -2997,10 +3017,10 @@ pub fn terminal_launch_plan(
     validate_unix_socket_path(&tmux_socket_path)?;
     let terminal_program = match terminal_program {
         Some(path) => path,
-        None => resolve_command_path(DEFAULT_TERMINAL_PROGRAM)
+        None => resolve_executable_path(DEFAULT_TERMINAL_PROGRAM)
             .context("xterm not found; pass terminal_program or install xterm")?,
     };
-    let tmux_program = resolve_command_path(DEFAULT_TMUX_PROGRAM)
+    let tmux_program = resolve_executable_path(DEFAULT_TMUX_PROGRAM)
         .context("tmux not found; install tmux to use workspace_run_in_terminal")?;
     let title = title.unwrap_or_else(|| format!("agent-workspace:{terminal_id}"));
     let mut launch_command = vec![
@@ -3245,9 +3265,7 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
         Some("initialize missing live control state for workspace daemon".to_string()),
     )?;
 
-    let mut x_server = spawn_xvfb(&options)?;
-    wait_for_display(&options.display, &options.xauthority_path)?;
-    let mut window_manager = spawn_window_manager(&options)?;
+    let mut session = options.session.start(&options)?;
 
     let listener = UnixListener::bind(&options.socket_path)
         .with_context(|| format!("failed to bind {}", options.socket_path.display()))?;
@@ -3266,6 +3284,7 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
     let mut state = DaemonState {
         status: WorkspaceStatus {
             id,
+            session: options.session,
             session_id,
             purpose: options.purpose,
             profile_id: options.profile_id,
@@ -3283,8 +3302,8 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
             socket_path: options.socket_path,
             xauthority_path: options.xauthority_path,
             daemon_pid: Some(std::process::id()),
-            x_server_pid: x_server.id(),
-            window_manager_pid: window_manager.as_ref().map(Child::id),
+            x_server_pid: session.x_server_pid(),
+            window_manager_pid: session.window_manager_pid(),
             last_event_sequence: 0,
             apps: Vec::new(),
         },
@@ -3296,6 +3315,7 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
     };
     write_workspace_manifest(&state.status, None)?;
     let start_detail = serde_json::json!({
+        "session": &state.status.session,
         "session_id": &state.status.session_id,
         "display": &state.status.display,
         "width": state.status.width,
@@ -3337,12 +3357,7 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
     let _ = terminate_running_workspace_apps(&mut state);
     state.status.ready = false;
     write_workspace_manifest(&state.status, Some(unix_now()))?;
-    if let Some(wm) = &mut window_manager {
-        let _ = wm.kill();
-        let _ = wm.wait();
-    }
-    let _ = x_server.kill();
-    let _ = x_server.wait();
+    session.shutdown();
     let _ = fs::remove_file(&state.status.socket_path);
     Ok(())
 }
@@ -3350,7 +3365,11 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
 fn workspace_start_preview(options: WorkspaceStartOptions) -> Result<WorkspaceStartPreview> {
     let id = sanitize_workspace_id(&options.id)?;
     let purpose = normalize_workspace_purpose(options.purpose)?;
-    let already_running = status_workspace(&id).is_ok();
+    let running_status = status_workspace(&id).ok();
+    let already_running = running_status.is_some();
+    let session_mismatch = running_status
+        .as_ref()
+        .is_some_and(|status| status.session != options.session);
     let runtime = doctor_report();
     let socket_path = workspace_socket_path(&id);
     let socket_path_error = validate_unix_socket_path(&socket_path)
@@ -3374,13 +3393,20 @@ fn workspace_start_preview(options: WorkspaceStartOptions) -> Result<WorkspaceSt
     let requires_unenforced_policy_ack = can_acknowledge_unenforced_policy;
     let missing_unenforced_policy_ack =
         requires_unenforced_policy_ack && !options.user_acknowledged_unenforced_policy;
-    let ok_to_start = already_running
-        || (runtime_ready
-            && !missing_hidden_workspace_ack
-            && !missing_unenforced_policy_ack
-            && !blocks_unenforced_policy);
+    let ok_to_start = !session_mismatch
+        && (already_running
+            || (runtime_ready
+                && !missing_hidden_workspace_ack
+                && !missing_unenforced_policy_ack
+                && !blocks_unenforced_policy));
     let would_start = !already_running && ok_to_start;
-    let message = if already_running {
+    let message = if session_mismatch {
+        session_mismatch_message(
+            &id,
+            &options.session,
+            &running_status.as_ref().expect("running status").session,
+        )
+    } else if already_running {
         format!("workspace {id:?} is already running")
     } else if missing_hidden_workspace_ack {
         "workspace start would require hidden-workspace acknowledgement".to_string()
@@ -3400,10 +3426,12 @@ fn workspace_start_preview(options: WorkspaceStartOptions) -> Result<WorkspaceSt
 
     let mut preview = WorkspaceStartPreview {
         id,
+        session: options.session,
         purpose,
         ok_to_start,
         would_start,
         already_running,
+        session_mismatch,
         runtime_ready,
         runtime_blockers,
         profile_id: options.profile_id,
@@ -3443,11 +3471,27 @@ fn start_approval_bundle(preview: &WorkspaceStartPreview) -> ApprovalBundle {
             "profile requires full policy enforcement, but this runtime cannot enforce all requested policy",
         );
     }
+    if preview.session_mismatch {
+        bundle = bundle.add_blocker(preview.message.clone());
+    }
     if !preview.runtime_ready {
         bundle = bundle.add_blockers(preview.runtime_blockers.clone());
     }
 
     bundle
+}
+
+fn session_mismatch_message(id: &str, requested: &SessionSpec, existing: &SessionSpec) -> String {
+    format!(
+        "workspace {id:?} is already running with session {existing}; requested session {requested} differs"
+    )
+}
+
+fn ensure_session_matches(id: &str, requested: &SessionSpec, existing: &SessionSpec) -> Result<()> {
+    if requested != existing {
+        bail!("{}", session_mismatch_message(id, requested, existing));
+    }
+    Ok(())
 }
 
 enum WorkspaceStartPlan {
@@ -3459,6 +3503,7 @@ fn prepare_workspace_start(options: WorkspaceStartOptions) -> Result<WorkspaceSt
     let id = sanitize_workspace_id(&options.id)?;
     let purpose = normalize_workspace_purpose(options.purpose)?;
     if let Ok(status) = status_workspace(&id) {
+        ensure_session_matches(&id, &options.session, &status.session)?;
         return Ok(WorkspaceStartPlan::AlreadyRunning(status));
     }
     if !options.user_acknowledged_hidden_workspace {
@@ -3494,6 +3539,7 @@ fn prepare_workspace_start(options: WorkspaceStartOptions) -> Result<WorkspaceSt
 
     Ok(WorkspaceStartPlan::Start(DaemonOptions {
         id,
+        session: options.session,
         session_id,
         purpose,
         profile_id: options.profile_id,
@@ -3524,6 +3570,7 @@ fn spawn_detached_daemon(options: &DaemonOptions) -> Result<()> {
         .arg("--id")
         .arg(&options.id);
     daemon.arg("--session-id").arg(&options.session_id);
+    daemon.arg("--session").arg(options.session.to_string());
     if let Some(purpose) = &options.purpose {
         daemon.arg("--purpose").arg(purpose);
     }
@@ -3583,7 +3630,7 @@ fn spawn_detached_daemon(options: &DaemonOptions) -> Result<()> {
     Ok(())
 }
 
-fn daemon_executable_path() -> Result<PathBuf> {
+pub(crate) fn daemon_executable_path() -> Result<PathBuf> {
     let exe = env::current_exe().context("failed to resolve current executable")?;
     if exe.exists() {
         return Ok(exe);
@@ -3624,6 +3671,7 @@ fn create_private_runtime_dir(path: &Path) -> Result<()> {
 fn workspace_manifest(status: &WorkspaceStatus, stopped_at_unix: Option<u64>) -> WorkspaceManifest {
     WorkspaceManifest {
         id: status.id.clone(),
+        session: status.session,
         session_id: status.session_id.clone(),
         purpose: status.purpose.clone(),
         profile_id: status.profile_id.clone(),
@@ -4147,32 +4195,7 @@ fn workspace_environment(status: &WorkspaceStatus) -> WorkspaceEnvironment {
         xauthority_path: status.xauthority_path.clone(),
         runtime_dir: status.runtime_dir.clone(),
         socket_path: status.socket_path.clone(),
-        variables: vec![
-            EnvVar {
-                name: "DISPLAY".to_string(),
-                value: status.display.clone(),
-            },
-            EnvVar {
-                name: "XAUTHORITY".to_string(),
-                value: status.xauthority_path.display().to_string(),
-            },
-            EnvVar {
-                name: "AGENT_WORKSPACE_ID".to_string(),
-                value: status.id.clone(),
-            },
-            EnvVar {
-                name: "AGENT_WORKSPACE_SESSION_ID".to_string(),
-                value: status.session_id.clone(),
-            },
-            EnvVar {
-                name: "AGENT_WORKSPACE_RUNTIME_DIR".to_string(),
-                value: status.runtime_dir.display().to_string(),
-            },
-            EnvVar {
-                name: "AGENT_WORKSPACE_SOCKET".to_string(),
-                value: status.socket_path.display().to_string(),
-            },
-        ],
+        variables: crate::launch::workspace_environment_variables(status),
     }
 }
 
@@ -6738,11 +6761,6 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
         command.args(&spec.command[1..]);
         command
     };
-    scrub_host_session_environment(&mut child_command);
-    for env_var in workspace_environment(&state.status).variables {
-        child_command.env(env_var.name, env_var.value);
-    }
-    configure_x11_workspace_process_environment(&mut child_command, &state.status);
     child_command
         .stdin(Stdio::null())
         .stdout(Stdio::from(
@@ -6758,9 +6776,7 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
             child_command.current_dir(cwd);
         }
     }
-    for env_var in &spec.env {
-        child_command.env(&env_var.name, &env_var.value);
-    }
+    crate::launch::configure_launch_environment(&mut child_command, &state.status, &spec.env);
     child_command.process_group(0);
     let child = child_command
         .spawn()
@@ -6797,33 +6813,6 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
     Ok(info)
 }
 
-/// Host-session environment variables that must not leak from the launching
-/// process into apps started inside the isolated workspace. These point at the
-/// host user's live desktop session services (D-Bus, PulseAudio, SSH/GPG agents,
-/// keyring, login session) and would let a workspace app reach back into the
-/// host session. We remove them with targeted `env_remove` only; PATH/HOME and
-/// the X11/Wayland display handling applied by
-/// `configure_x11_workspace_process_environment` are deliberately left intact.
-const HOST_SESSION_ENV_VARS: &[&str] = &[
-    "DBUS_SESSION_BUS_ADDRESS",
-    "DBUS_STARTER_ADDRESS",
-    "DBUS_STARTER_BUS_TYPE",
-    "PULSE_SERVER",
-    "PULSE_COOKIE",
-    "SSH_AUTH_SOCK",
-    "SSH_AGENT_PID",
-    "DESKTOP_SESSION",
-    "XDG_SESSION_ID",
-    "GNOME_KEYRING_CONTROL",
-    "GPG_AGENT_INFO",
-];
-
-fn scrub_host_session_environment(command: &mut Command) {
-    for name in HOST_SESSION_ENV_VARS {
-        command.env_remove(name);
-    }
-}
-
 fn launch_spec_with_workspace_defaults(
     status: &WorkspaceStatus,
     mut spec: LaunchSpec,
@@ -6838,274 +6827,8 @@ fn launch_spec_with_workspace_defaults(
     if spec.cwd.is_none() {
         spec.cwd = status.profile_cwd.clone();
     }
-    spec.env = merged_launch_env(status.profile_env.clone(), spec.env);
+    spec.env = crate::launch::merged_env(status.profile_env.clone(), spec.env);
     spec
-}
-
-fn merged_launch_env(mut base: Vec<EnvVar>, overrides: Vec<EnvVar>) -> Vec<EnvVar> {
-    for override_var in overrides {
-        if let Some(existing) = base
-            .iter_mut()
-            .find(|base_var| base_var.name == override_var.name)
-        {
-            *existing = override_var;
-        } else {
-            base.push(override_var);
-        }
-    }
-    base
-}
-
-struct BubblewrapSandbox {
-    args: Vec<String>,
-    mount_isolation: String,
-    network_isolation: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum LaunchNetworkPlan {
-    Host,
-    BubblewrapUnshareNet,
-    BubblewrapLoopbackOnly,
-}
-
-impl LaunchNetworkPlan {
-    fn uses_bubblewrap(self) -> bool {
-        matches!(
-            self,
-            Self::BubblewrapUnshareNet | Self::BubblewrapLoopbackOnly
-        )
-    }
-
-    fn unshare_net(self) -> bool {
-        matches!(
-            self,
-            Self::BubblewrapUnshareNet | Self::BubblewrapLoopbackOnly
-        )
-    }
-
-    fn isolation_label(self) -> &'static str {
-        match self {
-            Self::Host => "host",
-            Self::BubblewrapUnshareNet => "bubblewrap_unshare_net",
-            Self::BubblewrapLoopbackOnly => "bubblewrap_loopback_only",
-        }
-    }
-}
-
-fn bubblewrap_sandbox_for_launch(
-    status: &WorkspaceStatus,
-    policy: Option<&AppliedWorkspacePolicy>,
-    cwd: Option<&Path>,
-) -> Result<Option<BubblewrapSandbox>> {
-    let network = launch_network_plan(policy);
-    let mounts = uses_bubblewrap_mount_isolation(policy);
-    if !network.uses_bubblewrap() && !mounts {
-        return Ok(None);
-    }
-
-    if mounts {
-        Ok(Some(BubblewrapSandbox {
-            args: restricted_mount_namespace_args(status, policy, cwd, network)?,
-            mount_isolation: "bubblewrap_mount_namespace".to_string(),
-            network_isolation: network.isolation_label().to_string(),
-        }))
-    } else {
-        let mut args = vec![
-            "--bind".to_string(),
-            "/".to_string(),
-            "/".to_string(),
-            "--dev".to_string(),
-            "/dev".to_string(),
-            "--proc".to_string(),
-            "/proc".to_string(),
-        ];
-        if network.unshare_net() {
-            args.push("--unshare-net".to_string());
-        }
-        if let Some(cwd) = cwd {
-            args.push("--chdir".to_string());
-            args.push(cwd.display().to_string());
-        }
-        Ok(Some(BubblewrapSandbox {
-            args,
-            mount_isolation: "host".to_string(),
-            network_isolation: network.isolation_label().to_string(),
-        }))
-    }
-}
-
-fn launch_isolation_labels_from_sandbox(sandbox: Option<&BubblewrapSandbox>) -> (String, String) {
-    sandbox
-        .map(|sandbox| {
-            (
-                sandbox.mount_isolation.clone(),
-                sandbox.network_isolation.clone(),
-            )
-        })
-        .unwrap_or_else(|| ("host".to_string(), "host".to_string()))
-}
-
-fn launch_isolation_labels_for_policy(policy: Option<&AppliedWorkspacePolicy>) -> (String, String) {
-    let mount_isolation = if uses_bubblewrap_mount_isolation(policy) {
-        "bubblewrap_mount_namespace"
-    } else {
-        "host"
-    };
-    (
-        mount_isolation.to_string(),
-        launch_network_plan(policy).isolation_label().to_string(),
-    )
-}
-
-fn launch_network_plan(policy: Option<&AppliedWorkspacePolicy>) -> LaunchNetworkPlan {
-    if policy.is_some_and(|policy| {
-        matches!(policy.network.mode, NetworkMode::Disabled)
-            && policy.enforcement.network.enforced
-            && policy.runtime_capabilities.bubblewrap.ok
-    }) {
-        LaunchNetworkPlan::BubblewrapUnshareNet
-    } else if policy.is_some_and(|policy| {
-        matches!(policy.network.mode, NetworkMode::LocalOnly)
-            && policy.enforcement.network.enforced
-            && policy.runtime_capabilities.bubblewrap.ok
-    }) {
-        LaunchNetworkPlan::BubblewrapLoopbackOnly
-    } else {
-        LaunchNetworkPlan::Host
-    }
-}
-
-fn uses_bubblewrap_mount_isolation(policy: Option<&AppliedWorkspacePolicy>) -> bool {
-    policy.is_some_and(|policy| {
-        !policy.mounts.is_empty()
-            && policy.enforcement.mounts.enforced
-            && policy.runtime_capabilities.bubblewrap.ok
-    })
-}
-
-fn restricted_mount_namespace_args(
-    status: &WorkspaceStatus,
-    policy: Option<&AppliedWorkspacePolicy>,
-    cwd: Option<&Path>,
-    network: LaunchNetworkPlan,
-) -> Result<Vec<String>> {
-    let policy = policy.context("mount namespace requested without an applied policy")?;
-    let mut args = Vec::new();
-    let mut dirs = BTreeSet::new();
-    let mut extra_read_only_binds = BTreeSet::new();
-    let mut add_dir = |path: &Path| {
-        if path != Path::new("/") {
-            dirs.insert(path.to_path_buf());
-        }
-    };
-    add_dir(Path::new("/tmp"));
-    add_parent_dirs(&mut dirs, &status.xauthority_path);
-    if Path::new("/tmp/.X11-unix").exists() {
-        add_parent_dirs(&mut dirs, Path::new("/tmp/.X11-unix"));
-    }
-    for mount in &policy.mounts {
-        if !mount.workspace_path.is_absolute() {
-            bail!(
-                "profile mount workspace_path {} must be absolute for bubblewrap enforcement",
-                mount.workspace_path.display()
-            );
-        }
-        if !mount.host_path.exists() {
-            bail!(
-                "profile mount host_path {} does not exist",
-                mount.host_path.display()
-            );
-        }
-        add_parent_dirs(&mut dirs, &mount.workspace_path);
-    }
-    if let Some(parent) =
-        external_symlink_target_parent(Path::new("/etc/resolv.conf"), Path::new("/etc"))
-    {
-        add_parent_dirs(&mut dirs, &parent);
-        extra_read_only_binds.insert(parent);
-    }
-
-    for path in ["/usr", "/bin", "/lib", "/lib64", "/etc", "/opt"] {
-        if Path::new(path).exists() {
-            args.push("--ro-bind".to_string());
-            args.push(path.to_string());
-            args.push(path.to_string());
-        }
-    }
-    args.push("--proc".to_string());
-    args.push("/proc".to_string());
-    args.push("--dev".to_string());
-    args.push("/dev".to_string());
-
-    for dir in dirs {
-        args.push("--dir".to_string());
-        args.push(dir.display().to_string());
-    }
-    for path in extra_read_only_binds {
-        args.push("--ro-bind".to_string());
-        args.push(path.display().to_string());
-        args.push(path.display().to_string());
-    }
-    if Path::new("/tmp/.X11-unix").exists() {
-        args.push("--ro-bind".to_string());
-        args.push("/tmp/.X11-unix".to_string());
-        args.push("/tmp/.X11-unix".to_string());
-    }
-    args.push("--ro-bind".to_string());
-    args.push(status.xauthority_path.display().to_string());
-    args.push(status.xauthority_path.display().to_string());
-
-    for mount in &policy.mounts {
-        let canonical_host_path = fs::canonicalize(&mount.host_path).with_context(|| {
-            format!(
-                "failed to canonicalize profile mount host_path {}",
-                mount.host_path.display()
-            )
-        })?;
-        args.push(match mount.mode {
-            crate::policy::MountMode::ReadOnly => "--ro-bind".to_string(),
-            crate::policy::MountMode::ReadWrite => "--bind".to_string(),
-        });
-        args.push(canonical_host_path.display().to_string());
-        args.push(mount.workspace_path.display().to_string());
-    }
-    if network.unshare_net() {
-        args.push("--unshare-net".to_string());
-    }
-    args.push("--chdir".to_string());
-    args.push(
-        cwd.unwrap_or_else(|| Path::new("/tmp"))
-            .display()
-            .to_string(),
-    );
-    Ok(args)
-}
-
-fn external_symlink_target_parent(path: &Path, covered_root: &Path) -> Option<PathBuf> {
-    let _link_target = fs::read_link(path).ok()?;
-    let target = fs::canonicalize(path).ok()?;
-    let covered_root =
-        fs::canonicalize(covered_root).unwrap_or_else(|_| covered_root.to_path_buf());
-    if target.starts_with(covered_root) {
-        return None;
-    }
-    target.parent().map(Path::to_path_buf)
-}
-
-fn add_parent_dirs(dirs: &mut BTreeSet<PathBuf>, path: &Path) {
-    let mut parents = Vec::new();
-    let mut current = path.parent();
-    while let Some(parent) = current {
-        if parent == Path::new("/") {
-            break;
-        }
-        parents.push(parent.to_path_buf());
-        current = parent.parent();
-    }
-    for parent in parents.into_iter().rev() {
-        dirs.insert(parent);
-    }
 }
 
 fn wait_for_terminal(
@@ -7240,7 +6963,7 @@ fn tmux_status(socket_path: &Path, args: &[&str]) -> Result<()> {
 }
 
 fn tmux_command(socket_path: &Path, args: &[&str]) -> Command {
-    let tmux = resolve_command_path(DEFAULT_TMUX_PROGRAM)
+    let tmux = resolve_executable_path(DEFAULT_TMUX_PROGRAM)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_TMUX_PROGRAM));
     let mut command = Command::new(tmux);
     command.arg("-S").arg(socket_path).args(args);
@@ -7322,25 +7045,6 @@ fn sanitize_terminal_id(id: &str) -> Result<String> {
     Ok(trimmed.to_string())
 }
 
-fn resolve_command_path(program: &str) -> Option<PathBuf> {
-    if program.contains('/') {
-        let path = PathBuf::from(program);
-        return is_executable_file(&path).then_some(path);
-    }
-    env::var_os("PATH").and_then(|path| {
-        env::split_paths(&path)
-            .map(|dir| dir.join(program))
-            .find(|candidate| is_executable_file(candidate))
-    })
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
-}
-
 fn launch_description(command: &[String]) -> String {
     if command.is_empty() {
         "<empty command>".to_string()
@@ -7380,98 +7084,28 @@ fn rename_app_log(path: &Path, pid: u32, stream: &str) -> Result<PathBuf> {
     Ok(target)
 }
 
+fn desktop_control(status: &WorkspaceStatus) -> Box<dyn DesktopControl + '_> {
+    status.session.desktop_control(status)
+}
+
 fn list_workspace_windows(
     status: &WorkspaceStatus,
     include_hidden: bool,
 ) -> Result<Vec<WorkspaceWindow>> {
-    let ids = search_workspace_window_ids(status, !include_hidden)?;
-    let visible_ids: BTreeSet<String> = if include_hidden {
-        search_workspace_window_ids(status, true)?
-            .into_iter()
-            .collect()
-    } else {
-        ids.iter().cloned().collect()
-    };
-
-    ids.into_iter()
-        .map(|id| {
-            let visible = visible_ids.contains(&id);
-            window_info_with_visibility(status, &id, visible)
-        })
-        .collect()
+    desktop_control(status).list_windows(include_hidden)
 }
 
 fn search_workspace_window_ids(
     status: &WorkspaceStatus,
     only_visible: bool,
 ) -> Result<Vec<String>> {
-    let mut command = workspace_command(status, "xdotool");
-    command.arg("search");
-    if only_visible {
-        command.arg("--onlyvisible");
-    }
-    let output = command
-        .args(["--name", "."])
-        .output()
-        .context("failed to run xdotool window search")?;
-    if !output.status.success() {
-        return Ok(Vec::new());
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    Ok(stdout
-        .lines()
-        .filter_map(|line| {
-            let id = line.trim();
-            (!id.is_empty()).then(|| id.to_string())
-        })
-        .collect())
+    desktop_control(status).search_window_ids(only_visible)
 }
 
 fn active_workspace_window(status: &WorkspaceStatus) -> Result<Option<WorkspaceWindow>> {
-    // A destroyed popup can remain in _NET_ACTIVE_WINDOW. Actual input focus
-    // remains usable when the window manager's active-window metadata is stale.
-    for query in ["getactivewindow", "getwindowfocus"] {
-        let output = workspace_command(status, "xdotool")
-            .arg(query)
-            .output()
-            .with_context(|| format!("failed to run xdotool {query}"))?;
-        if !output.status.success() {
-            continue;
-        }
-        let text = output_text(output, query)?;
-        let window_id = text.trim();
-        if window_id.is_empty() || window_id == "0" || window_id == "1" {
-            continue;
-        }
-        match window_info(status, window_id) {
-            Ok(window) => {
-                if query == "getwindowfocus" && !window.visible {
-                    // Openbox focuses an internal support window when no application
-                    // is active. An unnamed input child must belong to listed content.
-                    let exe = daemon_executable_path()
-                        .context("resolve executable for native visibility")?;
-                    let output = workspace_command(status, &exe)
-                        .args(["__xtest", "content-check", window_id])
-                        .args(search_workspace_window_ids(status, true)?)
-                        .output()
-                        .context("failed to query native workspace visibility")?;
-                    let viewable = match output_text(output, "native workspace visibility") {
-                        Ok(value) => value,
-                        Err(error) if format!("{error:#}").contains("BadWindow") => continue,
-                        Err(error) => return Err(error),
-                    };
-                    if viewable.trim() != "true" {
-                        continue;
-                    }
-                }
-                return Ok(Some(window));
-            }
-            Err(error) if format!("{error:#}").contains("BadWindow") => continue,
-            Err(error) => return Err(error),
-        }
-    }
-    Ok(None)
+    desktop_control(status)
+        .active_window()
+        .map(|window| window.map(|window| annotate_workspace_window_for_status(status, window)))
 }
 
 fn active_workspace_window_for_state(state: &DaemonState) -> Result<Option<WorkspaceWindow>> {
@@ -7480,35 +7114,7 @@ fn active_workspace_window_for_state(state: &DaemonState) -> Result<Option<Works
 }
 
 fn workspace_pointer(status: &WorkspaceStatus) -> Result<WorkspacePointer> {
-    let output = workspace_command(status, "xdotool")
-        .args(["getmouselocation", "--shell"])
-        .output()
-        .context("failed to run xdotool getmouselocation")?;
-    let text = output_text(output, "xdotool getmouselocation")?;
-    let mut x = None;
-    let mut y = None;
-    let mut screen = None;
-    let mut window_id = None;
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key {
-            "X" => x = Some(value.parse().context("pointer X must be an integer")?),
-            "Y" => y = Some(value.parse().context("pointer Y must be an integer")?),
-            "SCREEN" => screen = Some(value.parse().context("pointer SCREEN must be an integer")?),
-            "WINDOW" if !value.trim().is_empty() && value.trim() != "0" => {
-                window_id = Some(value.trim().to_string());
-            }
-            _ => {}
-        }
-    }
-    Ok(WorkspacePointer {
-        x: x.context("pointer output missing X")?,
-        y: y.context("pointer output missing Y")?,
-        screen,
-        window_id,
-    })
+    desktop_control(status).pointer()
 }
 
 fn observe_workspace(
@@ -7746,9 +7352,22 @@ fn annotate_workspace_windows(
         .collect()
 }
 
-fn annotate_workspace_window(state: &DaemonState, mut window: WorkspaceWindow) -> WorkspaceWindow {
+fn annotate_workspace_window(state: &DaemonState, window: WorkspaceWindow) -> WorkspaceWindow {
+    let mut window = annotate_workspace_window_for_status(&state.status, window);
     if window.app_id.is_none() {
         window.app_id = state.window_app_ids.get(&window.id).cloned();
+    }
+    window
+}
+
+fn annotate_workspace_window_for_status(
+    status: &WorkspaceStatus,
+    mut window: WorkspaceWindow,
+) -> WorkspaceWindow {
+    if window.app_id.is_none() {
+        window.app_id = window
+            .pid
+            .and_then(|pid| workspace_app_id_for_pid(status, pid));
     }
     window
 }
@@ -8207,7 +7826,7 @@ fn resolve_workspace_window_with_visibility(
     include_hidden: bool,
 ) -> Result<Option<WorkspaceWindow>> {
     if let Some(window_id) = window_id {
-        let window_id = sanitize_x11_id(window_id, "window id")?;
+        let window_id = sanitize_window_id(window_id)?;
         return window_info(&state.status, &window_id)
             .map(|window| annotate_workspace_window(state, window))
             .map(Some);
@@ -8220,61 +7839,10 @@ fn resolve_workspace_window_with_visibility(
 }
 
 fn window_info(status: &WorkspaceStatus, id: &str) -> Result<WorkspaceWindow> {
-    let visible = search_workspace_window_ids(status, true)?
-        .iter()
-        .any(|visible_id| visible_id == id);
-    window_info_with_visibility(status, id, visible)
-}
-
-fn window_info_with_visibility(
-    status: &WorkspaceStatus,
-    id: &str,
-    visible: bool,
-) -> Result<WorkspaceWindow> {
-    let title = workspace_command(status, "xdotool")
-        .args(["getwindowname", id])
-        .output()
-        .with_context(|| format!("failed to read window name for {id}"))
-        .and_then(|output| output_text(output, "xdotool getwindowname"))
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let (wm_instance, wm_class) = window_class_from_xprop(status, id);
-    let pid = workspace_command(status, "xdotool")
-        .args(["getwindowpid", id])
-        .output()
-        .ok()
-        .and_then(|output| output.status.success().then_some(output.stdout))
-        .and_then(|stdout| String::from_utf8(stdout).ok())
-        .and_then(|text| text.trim().parse::<u32>().ok())
-        .or_else(|| window_pid_from_xprop(status, id));
-    let geometry_output = workspace_command(status, "xdotool")
-        .args(["getwindowgeometry", "--shell", id])
-        .output()
-        .with_context(|| format!("failed to read window geometry for {id}"))?;
-    let geometry_text = output_text(geometry_output, "xdotool getwindowgeometry")?;
-    let mut geometry = parse_window_geometry(&geometry_text)?;
-
-    // Prefer xwininfo's true absolute origin over xdotool's (which double-counts
-    // the reparent/title-bar offset under a reparenting WM). This keeps click
-    // coordinates aligned with window-screenshot pixels — see
-    // absolute_window_origin. Width/height/screen stay from xdotool; only the
-    // origin is corrected, and only when xwininfo resolves it.
-    if let Some((abs_x, abs_y)) = absolute_window_origin(status, id) {
-        geometry.x = abs_x;
-        geometry.y = abs_y;
-    }
-
-    Ok(WorkspaceWindow {
-        id: id.to_string(),
-        title,
-        wm_class,
-        wm_instance,
-        pid,
-        app_id: pid.and_then(|pid| workspace_app_id_for_pid(status, pid)),
-        visible,
-        geometry,
-    })
+    let id = sanitize_window_id(id)?;
+    desktop_control(status)
+        .window_info(&id)
+        .map(|window| annotate_workspace_window_for_status(status, window))
 }
 
 fn workspace_app_id_for_pid(status: &WorkspaceStatus, pid: u32) -> Option<String> {
@@ -8285,202 +7853,12 @@ fn workspace_app_id_for_pid(status: &WorkspaceStatus, pid: u32) -> Option<String
         .map(|app| app.id.clone())
 }
 
-fn window_pid_from_xprop(status: &WorkspaceStatus, id: &str) -> Option<u32> {
-    let output = workspace_command(status, "xprop")
-        .args(["-id", id, "_NET_WM_PID"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let text = String::from_utf8(output.stdout).ok()?;
-    text.rsplit_once('=')
-        .and_then(|(_, value)| value.trim().parse::<u32>().ok())
-}
-
-fn window_class_from_xprop(status: &WorkspaceStatus, id: &str) -> (Option<String>, Option<String>) {
-    let output = workspace_command(status, "xprop")
-        .args(["-id", id, "WM_CLASS"])
-        .output();
-    let Some(stdout) = output
-        .ok()
-        .and_then(|output| output.status.success().then_some(output.stdout))
-    else {
-        return (None, None);
-    };
-    let Some(text) = String::from_utf8(stdout).ok() else {
-        return (None, None);
-    };
-    let Some((_, values)) = text.split_once('=') else {
-        return (None, None);
-    };
-    let mut parts = values.split(',').map(parse_xprop_string);
-    let instance = parts.next().flatten();
-    let class = parts.next().flatten();
-    (instance, class)
-}
-
-fn parse_xprop_string(value: &str) -> Option<String> {
-    let trimmed = value.trim().trim_matches('"').trim();
-    (!trimmed.is_empty() && trimmed != "not found.").then(|| trimmed.to_string())
-}
-
-fn parse_window_geometry(text: &str) -> Result<WindowGeometry> {
-    let mut x = None;
-    let mut y = None;
-    let mut width = None;
-    let mut height = None;
-    let mut screen = None;
-
-    for line in text.lines() {
-        let Some((key, value)) = line.split_once('=') else {
-            continue;
-        };
-        match key {
-            "X" => x = value.parse::<i32>().ok(),
-            "Y" => y = value.parse::<i32>().ok(),
-            "WIDTH" => width = value.parse::<u32>().ok(),
-            "HEIGHT" => height = value.parse::<u32>().ok(),
-            "SCREEN" => screen = value.parse::<i32>().ok(),
-            _ => {}
-        }
-    }
-
-    Ok(WindowGeometry {
-        x: x.context("window geometry missing X")?,
-        y: y.context("window geometry missing Y")?,
-        width: width.context("window geometry missing WIDTH")?,
-        height: height.context("window geometry missing HEIGHT")?,
-        screen,
-    })
-}
-
-/// The window's TRUE root-absolute upper-left, from `xwininfo`'s
-/// "Absolute upper-left X/Y".
-///
-/// Why this exists: under a reparenting WM, `xdotool getwindowgeometry` reports
-/// an origin that double-counts the frame offset (client-absolute PLUS the
-/// client's offset within its frame — e.g. a 22px title bar counted twice), so
-/// its X/Y land ~titlebar-height below the real client origin. Meanwhile
-/// `import -window <id>` captures the CLIENT drawable, whose top-left is the true
-/// absolute origin. Keying clicks off xdotool's value while screenshots use the
-/// client origin makes a coordinate read off a window screenshot miss by the
-/// title-bar height. xwininfo's "Absolute upper-left" is the same origin import
-/// captures from, so using it aligns click coordinates with screenshot pixels:
-/// a point read at (x,y) in `workspace_screenshot_window` is exactly the
-/// `click_window` (x,y) that lands there.
-fn absolute_window_origin(status: &WorkspaceStatus, id: &str) -> Option<(i32, i32)> {
-    let output = workspace_command(status, "xwininfo")
-        .args(["-id", id])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    // Lossy: xwininfo echoes the window title, which can contain invalid UTF-8.
-    // The geometry lines we parse are pure ASCII, so a mangled title byte must
-    // not throw away the whole (valid) origin read.
-    let text = String::from_utf8_lossy(&output.stdout);
-    parse_absolute_window_origin(&text)
-}
-
-/// Parse `xwininfo`'s "Absolute upper-left X/Y" lines into a root-absolute
-/// origin. Split from the spawn so it can be unit-tested on captured output.
-fn parse_absolute_window_origin(text: &str) -> Option<(i32, i32)> {
-    let mut x = None;
-    let mut y = None;
-    for line in text.lines() {
-        let line = line.trim();
-        if let Some(rest) = line.strip_prefix("Absolute upper-left X:") {
-            x = rest.trim().parse::<i32>().ok();
-        } else if let Some(rest) = line.strip_prefix("Absolute upper-left Y:") {
-            y = rest.trim().parse::<i32>().ok();
-        }
-    }
-    match (x, y) {
-        (Some(x), Some(y)) => Some((x, y)),
-        _ => None,
-    }
-}
-
 fn capture_workspace_screenshot(
     status: &WorkspaceStatus,
     output_path: Option<PathBuf>,
     source: WorkspaceScreenshotSource,
 ) -> Result<WorkspaceScreenshot> {
-    let path = resolve_screenshot_path(status, output_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    // Prefer ffmpeg's x11grab: it is the only readily-available capture that can
-    // composite the pointer sprite (`-draw_mouse 1`) into the frame. Xvfb keeps
-    // the cursor in a separate XFIXES plane, so `import`/`scrot` (and therefore
-    // the live viewer that streams these frames) render no cursor at all.
-    //
-    // ffmpeg may be installed yet unusable here (built without x11grab, minimal
-    // container, …), so treat any failure as non-fatal and fall back to the
-    // cursor-less capture utilities rather than aborting the screenshot.
-    let mut captured = false;
-    if command_path_check("ffmpeg").ok {
-        let video_size = format!("{}x{}", status.width, status.height);
-        let run_ffmpeg = || -> Result<()> {
-            let output = workspace_command(status, "ffmpeg")
-                .args([
-                    "-y",
-                    "-loglevel",
-                    "error",
-                    "-f",
-                    "x11grab",
-                    "-draw_mouse",
-                    "1",
-                    "-video_size",
-                    &video_size,
-                    "-i",
-                    &status.display,
-                    "-frames:v",
-                    "1",
-                ])
-                .arg(&path)
-                .output()
-                .context("failed to run ffmpeg for workspace screenshot")?;
-            output_text(output, "ffmpeg x11grab")?;
-            Ok(())
-        };
-        match run_ffmpeg() {
-            Ok(()) => captured = true,
-            Err(err) => eprintln!("ffmpeg screenshot failed, falling back: {err:#}"),
-        }
-    }
-
-    if captured {
-        // Captured with the cursor composited in.
-    } else if command_path_check("import").ok {
-        let output = workspace_command(status, "import")
-            .args(["-window", "root"])
-            .arg(&path)
-            .output()
-            .context("failed to run import for workspace screenshot")?;
-        output_text(output, "import -window root")?;
-    } else if command_path_check("scrot").ok {
-        let output = workspace_command(status, "scrot")
-            .arg(&path)
-            .output()
-            .context("failed to run scrot for workspace screenshot")?;
-        output_text(output, "scrot")?;
-    } else {
-        bail!("missing screenshot command: install ffmpeg (cursor capture), ImageMagick import, or scrot");
-    }
-
-    workspace_screenshot_result(
-        path,
-        status.width,
-        status.height,
-        source,
-        WorkspaceScreenshotTarget::Root,
-        None,
-    )
+    desktop_control(status).capture_screenshot(output_path, source)
 }
 
 struct WindowScreenshotResult {
@@ -8512,42 +7890,10 @@ fn capture_workspace_window_screenshot(
     output_path: Option<PathBuf>,
     source: WorkspaceScreenshotSource,
 ) -> Result<WorkspaceScreenshot> {
-    let path = resolve_window_screenshot_path(status, &window.id, output_path);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)
-            .with_context(|| format!("failed to create {}", parent.display()))?;
-    }
-
-    if command_path_check("import").ok {
-        let output = workspace_command(status, "import")
-            .args(["-window", &window.id])
-            .arg(&path)
-            .output()
-            .context("failed to run import for workspace window screenshot")?;
-        output_text(output, "import -window")?;
-    } else if command_path_check("scrot").ok {
-        focus_workspace_window(status, &window.id)?;
-        let output = workspace_command(status, "scrot")
-            .args(["-u"])
-            .arg(&path)
-            .output()
-            .context("failed to run scrot for workspace window screenshot")?;
-        output_text(output, "scrot -u")?;
-    } else {
-        bail!("missing screenshot command: install ImageMagick import or scrot");
-    }
-
-    workspace_screenshot_result(
-        path,
-        window.geometry.width,
-        window.geometry.height,
-        source,
-        WorkspaceScreenshotTarget::Window,
-        Some(window.id.clone()),
-    )
+    desktop_control(status).capture_window_screenshot(window, output_path, source)
 }
 
-fn workspace_screenshot_result(
+pub(crate) fn workspace_screenshot_result(
     path: PathBuf,
     width: u32,
     height: u32,
@@ -8580,69 +7926,12 @@ fn screenshot_event_detail(screenshot: &WorkspaceScreenshot) -> serde_json::Valu
     })
 }
 
-fn resolve_screenshot_path(status: &WorkspaceStatus, output_path: Option<PathBuf>) -> PathBuf {
-    match output_path {
-        Some(path) if path.is_absolute() => path,
-        Some(path) => status.runtime_dir.join(path),
-        None => status
-            .runtime_dir
-            .join(format!("screenshot-{}.png", unix_now())),
-    }
-}
-
-fn resolve_window_screenshot_path(
-    status: &WorkspaceStatus,
-    window_id: &str,
-    output_path: Option<PathBuf>,
-) -> PathBuf {
-    match output_path {
-        Some(path) if path.is_absolute() => path,
-        Some(path) => status.runtime_dir.join(path),
-        None => status
-            .runtime_dir
-            .join(format!("screenshot-window-{window_id}-{}.png", unix_now())),
-    }
-}
-
 fn focus_workspace_window(status: &WorkspaceStatus, window_id: &str) -> Result<()> {
-    let window_id = sanitize_x11_id(window_id, "window id")?;
-    window_info(status, &window_id)?;
-    let exe = daemon_executable_path().context("resolve executable for native focus")?;
-    let output = workspace_command(status, &exe)
-        .args(["__xtest", "focus-check", &window_id])
-        .output()
-        .context("failed to query native workspace focus")?;
-    match output_text(output, "native workspace input focus")?.trim() {
-        "focused" => return Ok(()),
-        "direct" => {}
-        "managed" => {
-            // Let the window manager restore or activate its own top-level window.
-            // Native focus is still verified below instead of trusting EWMH alone.
-            workspace_command(status, "xdotool")
-                .args(["windowactivate", "--sync", &window_id])
-                .output()
-                .context("failed to run xdotool windowactivate")?;
-        }
-        _ => bail!("invalid native workspace focus response"),
-    }
-    // The child inherits this workspace's DISPLAY and XAUTHORITY, avoiding
-    // process-global environment changes in the daemon.
-    let output = workspace_command(status, exe)
-        .args(["__xtest", "focus", &window_id])
-        .output()
-        .context("failed to run native workspace focus helper")?;
-    output_text(output, "native workspace input focus")?;
-    Ok(())
+    desktop_control(status).focus_window(window_id)
 }
 
 fn close_workspace_window(status: &WorkspaceStatus, window_id: &str) -> Result<()> {
-    let window_id = sanitize_x11_id(window_id, "window id")?;
-    let output = workspace_command(status, "xdotool")
-        .args(["windowclose", &window_id])
-        .output()
-        .context("failed to run xdotool windowclose")?;
-    output_text(output, "xdotool windowclose")?;
-    Ok(())
+    desktop_control(status).close_window(window_id)
 }
 
 fn move_workspace_window(
@@ -8651,20 +7940,9 @@ fn move_workspace_window(
     x: i32,
     y: i32,
 ) -> Result<WorkspaceWindow> {
-    let window_id = sanitize_x11_id(window_id, "window id")?;
-    validate_workspace_coordinates(status, x, y, "window move")?;
-    let output = workspace_command(status, "xdotool")
-        .args([
-            "windowmove",
-            "--sync",
-            &window_id,
-            &x.to_string(),
-            &y.to_string(),
-        ])
-        .output()
-        .context("failed to run xdotool windowmove")?;
-    output_text(output, "xdotool windowmove")?;
-    window_info(status, &window_id)
+    desktop_control(status)
+        .move_window(window_id, x, y)
+        .map(|window| annotate_workspace_window_for_status(status, window))
 }
 
 fn resize_workspace_window(
@@ -8673,91 +7951,35 @@ fn resize_workspace_window(
     width: u32,
     height: u32,
 ) -> Result<WorkspaceWindow> {
-    let window_id = sanitize_x11_id(window_id, "window id")?;
-    validate_window_size(width, height)?;
-    validate_window_size_for_workspace(status, width, height)?;
-    let output = workspace_command(status, "xdotool")
-        .args([
-            "windowsize",
-            "--sync",
-            &window_id,
-            &width.to_string(),
-            &height.to_string(),
-        ])
-        .output()
-        .context("failed to run xdotool windowsize")?;
-    output_text(output, "xdotool windowsize")?;
-    window_info(status, &window_id)
+    desktop_control(status)
+        .resize_window(window_id, width, height)
+        .map(|window| annotate_workspace_window_for_status(status, window))
 }
 
 fn raise_workspace_window(status: &WorkspaceStatus, window_id: &str) -> Result<WorkspaceWindow> {
-    let window_id = sanitize_x11_id(window_id, "window id")?;
-    let output = workspace_command(status, "xdotool")
-        .args(["windowraise", &window_id])
-        .output()
-        .context("failed to run xdotool windowraise")?;
-    output_text(output, "xdotool windowraise")?;
-    window_info(status, &window_id)
+    desktop_control(status)
+        .raise_window(window_id)
+        .map(|window| annotate_workspace_window_for_status(status, window))
 }
 
 fn minimize_workspace_window(status: &WorkspaceStatus, window_id: &str) -> Result<WorkspaceWindow> {
-    let window_id = sanitize_x11_id(window_id, "window id")?;
-    let output = workspace_command(status, "xdotool")
-        .args(["windowminimize", "--sync", &window_id])
-        .output()
-        .context("failed to run xdotool windowminimize")?;
-    output_text(output, "xdotool windowminimize")?;
-    window_info(status, &window_id)
+    desktop_control(status)
+        .minimize_window(window_id)
+        .map(|window| annotate_workspace_window_for_status(status, window))
 }
 
 fn show_workspace_window(status: &WorkspaceStatus, window_id: &str) -> Result<WorkspaceWindow> {
-    let window_id = sanitize_x11_id(window_id, "window id")?;
-    let output = workspace_command(status, "xdotool")
-        .args(["windowmap", "--sync", &window_id])
-        .output()
-        .context("failed to run xdotool windowmap")?;
-    output_text(output, "xdotool windowmap")?;
-    window_info(status, &window_id)
-}
-
-/// Run the embedded `__xtest` synthetic-input helper as a child process so it
-/// inherits the workspace DISPLAY/XAUTHORITY. Motion is injected via
-/// `XTestFakeMotionEvent` (a real device event XInput2 apps like winit observe),
-/// unlike `xdotool mousemove` which warps the pointer without a motion event and
-/// leaves egui/winit clicking at a stale position.
-fn run_xtest_input(status: &WorkspaceStatus, args: &[String]) -> Result<()> {
-    // Reuse daemon_executable_path() so an updated/replaced binary (whose
-    // /proc/self/exe reads back as "… (deleted)") still resolves to the stable
-    // on-disk path; pass the PathBuf straight through to avoid rejecting
-    // non-UTF8 executable paths.
-    let exe = daemon_executable_path().context("resolve current executable for xtest input")?;
-    let output = workspace_command(status, &exe)
-        .arg("__xtest")
-        .args(args)
-        .output()
-        .context("failed to run __xtest input helper")?;
-    output_text(output, "xtest input")?;
-    Ok(())
+    desktop_control(status)
+        .show_window(window_id)
+        .map(|window| annotate_workspace_window_for_status(status, window))
 }
 
 fn click_workspace(status: &WorkspaceStatus, x: i32, y: i32, button: u8, count: u8) -> Result<()> {
-    validate_workspace_coordinates(status, x, y, "click")?;
-    validate_click_options(button, count)?;
-    run_xtest_input(
-        status,
-        &[
-            "click".to_string(),
-            x.to_string(),
-            y.to_string(),
-            button.to_string(),
-            count.to_string(),
-        ],
-    )
+    desktop_control(status).click(x, y, button, count)
 }
 
 fn move_workspace_pointer(status: &WorkspaceStatus, x: i32, y: i32) -> Result<()> {
-    validate_workspace_coordinates(status, x, y, "pointer")?;
-    run_xtest_input(status, &["move".to_string(), x.to_string(), y.to_string()])
+    desktop_control(status).move_pointer(x, y)
 }
 
 fn drag_workspace(
@@ -8768,20 +7990,7 @@ fn drag_workspace(
     to_y: i32,
     button: u8,
 ) -> Result<()> {
-    validate_workspace_coordinates(status, from_x, from_y, "drag start")?;
-    validate_workspace_coordinates(status, to_x, to_y, "drag end")?;
-    validate_click_options(button, DEFAULT_CLICK_COUNT)?;
-    run_xtest_input(
-        status,
-        &[
-            "drag".to_string(),
-            from_x.to_string(),
-            from_y.to_string(),
-            to_x.to_string(),
-            to_y.to_string(),
-            button.to_string(),
-        ],
-    )
+    desktop_control(status).drag(from_x, from_y, to_x, to_y, button)
 }
 
 fn scroll_workspace(
@@ -8791,42 +8000,15 @@ fn scroll_workspace(
     direction: ScrollDirection,
     amount: u8,
 ) -> Result<()> {
-    validate_workspace_coordinates(status, x, y, "scroll")?;
-    validate_scroll_options(direction, amount)?;
-    run_xtest_input(
-        status,
-        &[
-            "scroll".to_string(),
-            x.to_string(),
-            y.to_string(),
-            direction.x11_button().to_string(),
-            amount.to_string(),
-        ],
-    )
+    desktop_control(status).scroll(x, y, direction, amount)
 }
 
 fn key_workspace(status: &WorkspaceStatus, key: String) -> Result<()> {
-    if key.trim().is_empty() {
-        bail!("key cannot be empty");
-    }
-    let output = workspace_command(status, "xdotool")
-        .args(["key", "--clearmodifiers", key.trim()])
-        .output()
-        .context("failed to run xdotool key")?;
-    output_text(output, "xdotool key")?;
-    Ok(())
+    desktop_control(status).key(&key)
 }
 
 fn type_workspace_text(status: &WorkspaceStatus, text: String) -> Result<()> {
-    if text.is_empty() {
-        bail!("text cannot be empty");
-    }
-    let output = workspace_command(status, "xdotool")
-        .args(["type", "--clearmodifiers", "--delay", "1", &text])
-        .output()
-        .context("failed to run xdotool type")?;
-    output_text(output, "xdotool type")?;
-    Ok(())
+    desktop_control(status).type_text(&text)
 }
 
 fn paste_workspace_text(
@@ -8842,86 +8024,11 @@ fn paste_workspace_text(
 }
 
 fn set_workspace_clipboard(status: &WorkspaceStatus, text: &str) -> Result<WorkspaceClipboard> {
-    validate_clipboard_text(text)?;
-    if command_path_check("xclip").ok {
-        write_clipboard_command(
-            status,
-            "xclip",
-            &["-selection", "clipboard"],
-            text,
-            "xclip clipboard input",
-        )?;
-    } else if command_path_check("xsel").ok {
-        write_clipboard_command(
-            status,
-            "xsel",
-            &["--clipboard", "--input"],
-            text,
-            "xsel clipboard input",
-        )?;
-    } else {
-        bail!("missing clipboard command: install xclip or xsel");
-    }
-
-    Ok(WorkspaceClipboard {
-        selection: "clipboard".to_string(),
-        content: None,
-        bytes: text.len() as u64,
-    })
+    desktop_control(status).set_clipboard(text)
 }
 
 fn get_workspace_clipboard(status: &WorkspaceStatus) -> Result<WorkspaceClipboard> {
-    let content = if command_path_check("xclip").ok {
-        let output = workspace_command(status, "xclip")
-            .args(["-selection", "clipboard", "-out"])
-            .output()
-            .context("failed to run xclip clipboard output")?;
-        output_text(output, "xclip clipboard output")?
-    } else if command_path_check("xsel").ok {
-        let output = workspace_command(status, "xsel")
-            .args(["--clipboard", "--output"])
-            .output()
-            .context("failed to run xsel clipboard output")?;
-        output_text(output, "xsel clipboard output")?
-    } else {
-        bail!("missing clipboard command: install xclip or xsel");
-    };
-
-    Ok(WorkspaceClipboard {
-        selection: "clipboard".to_string(),
-        bytes: content.len() as u64,
-        content: Some(content),
-    })
-}
-
-fn write_clipboard_command(
-    status: &WorkspaceStatus,
-    command: &str,
-    args: &[&str],
-    text: &str,
-    label: &str,
-) -> Result<()> {
-    let mut child = workspace_command(status, command)
-        .args(args)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to run {label}"))?;
-    if let Some(mut stdin) = child.stdin.take() {
-        stdin
-            .write_all(text.as_bytes())
-            .with_context(|| format!("failed to write stdin for {label}"))?;
-    } else {
-        bail!("failed to open stdin for {label}");
-    }
-    let status = child
-        .wait()
-        .with_context(|| format!("failed to wait for {label}"))?;
-    if !status.success() {
-        bail!("{label} failed with {status}");
-    }
-    Ok(())
+    desktop_control(status).get_clipboard()
 }
 
 fn read_workspace_app_log(
@@ -9239,39 +8346,6 @@ fn app_exit_event_detail(app: &WorkspaceApp) -> serde_json::Value {
     })
 }
 
-fn workspace_command(status: &WorkspaceStatus, program: impl AsRef<OsStr>) -> Command {
-    let mut command = Command::new(program);
-    configure_x11_workspace_process_environment(&mut command, status);
-    command.stdin(Stdio::null());
-    command
-}
-
-fn configure_x11_workspace_process_environment(command: &mut Command, status: &WorkspaceStatus) {
-    command
-        .env("DISPLAY", &status.display)
-        .env("XAUTHORITY", &status.xauthority_path)
-        .env_remove("WAYLAND_DISPLAY")
-        .env_remove("WAYLAND_SOCKET")
-        .env("XDG_SESSION_TYPE", "x11")
-        .env("GDK_BACKEND", "x11")
-        .env("QT_QPA_PLATFORM", "xcb")
-        .env("SDL_VIDEODRIVER", "x11")
-        .env("CLUTTER_BACKEND", "x11")
-        .env("MOZ_ENABLE_WAYLAND", "0")
-        .env("ELECTRON_OZONE_PLATFORM_HINT", "x11");
-}
-
-fn output_text(output: std::process::Output, description: &str) -> Result<String> {
-    if output.status.success() {
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    } else {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        bail!("{description} failed: {detail}");
-    }
-}
-
 fn refresh_apps(state: &mut DaemonState) -> Result<()> {
     let mut exit_events = Vec::new();
     for app in &mut state.apps {
@@ -9308,56 +8382,6 @@ fn request(socket_path: &Path, request: IpcRequest) -> Result<IpcResponse> {
     let response: IpcResponse =
         serde_json::from_str(line.trim()).context("failed to parse workspace IPC response")?;
     Ok(response)
-}
-
-fn spawn_xvfb(options: &DaemonOptions) -> Result<Child> {
-    Command::new("Xvfb")
-        .arg(&options.display)
-        .args(["-screen", "0"])
-        .arg(format!("{}x{}x24", options.width, options.height))
-        .args(["-nolisten", "tcp"])
-        .arg("-auth")
-        .arg(&options.xauthority_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to start Xvfb")
-}
-
-fn spawn_window_manager(options: &DaemonOptions) -> Result<Option<Child>> {
-    let Some(command) = first_available_command_name(&["openbox", "i3", "fluxbox"]) else {
-        bail!("missing window manager: install openbox, i3, or fluxbox");
-    };
-    let child = Command::new(command)
-        .env("DISPLAY", &options.display)
-        .env("XAUTHORITY", &options.xauthority_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .with_context(|| format!("failed to start {command}"))?;
-    Ok(Some(child))
-}
-
-fn wait_for_display(display: &str, xauthority: &Path) -> Result<()> {
-    let deadline = std::time::Instant::now() + Duration::from_secs(5);
-    while std::time::Instant::now() < deadline {
-        let ok = Command::new("xdpyinfo")
-            .arg("-display")
-            .arg(display)
-            .env("XAUTHORITY", xauthority)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if ok {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(100));
-    }
-    bail!("timed out waiting for X display {display}");
 }
 
 fn wait_for_socket(socket_path: &Path) -> Result<()> {
@@ -9618,17 +8642,6 @@ fn normalize_workspace_purpose(purpose: Option<String>) -> Result<Option<String>
     Ok(Some(trimmed.to_string()))
 }
 
-fn sanitize_x11_id(id: &str, label: &str) -> Result<String> {
-    let trimmed = id.trim();
-    if trimmed.is_empty() {
-        bail!("{label} cannot be empty");
-    }
-    if !trimmed.chars().all(|ch| ch.is_ascii_digit()) {
-        bail!("{label} must be a decimal X11 id");
-    }
-    Ok(trimmed.to_string())
-}
-
 fn validate_app_list_filters(
     app_id: &Option<String>,
     name_contains: &Option<String>,
@@ -9715,7 +8728,7 @@ fn validate_window_target_options(
     app_id: &Option<String>,
 ) -> Result<()> {
     if let Some(window_id) = window_id {
-        sanitize_x11_id(window_id, "window id")?;
+        sanitize_window_id(window_id)?;
     }
     validate_window_match_options(
         title_contains,
@@ -9748,7 +8761,7 @@ fn validate_relative_click_coordinates(x: i32, y: i32) -> Result<()> {
     Ok(())
 }
 
-fn validate_workspace_coordinates(
+pub(crate) fn validate_workspace_coordinates(
     status: &WorkspaceStatus,
     x: i32,
     y: i32,
@@ -9764,14 +8777,14 @@ fn validate_workspace_coordinates(
     Ok(())
 }
 
-fn validate_window_size(width: u32, height: u32) -> Result<()> {
+pub(crate) fn validate_window_size(width: u32, height: u32) -> Result<()> {
     if width == 0 || height == 0 {
         bail!("window size must be positive");
     }
     Ok(())
 }
 
-fn validate_window_size_for_workspace(
+pub(crate) fn validate_window_size_for_workspace(
     status: &WorkspaceStatus,
     width: u32,
     height: u32,
@@ -9788,7 +8801,7 @@ fn validate_window_size_for_workspace(
     Ok(())
 }
 
-fn validate_click_options(button: u8, count: u8) -> Result<()> {
+pub(crate) fn validate_click_options(button: u8, count: u8) -> Result<()> {
     if !(1..=5).contains(&button) {
         bail!("click button must be between 1 and 5");
     }
@@ -9798,14 +8811,14 @@ fn validate_click_options(button: u8, count: u8) -> Result<()> {
     Ok(())
 }
 
-fn validate_scroll_options(_direction: ScrollDirection, amount: u8) -> Result<()> {
+pub(crate) fn validate_scroll_options(_direction: ScrollDirection, amount: u8) -> Result<()> {
     if amount == 0 || amount > MAX_SCROLL_AMOUNT {
         bail!("scroll amount must be between 1 and {MAX_SCROLL_AMOUNT}");
     }
     Ok(())
 }
 
-fn validate_clipboard_text(text: &str) -> Result<()> {
+pub(crate) fn validate_clipboard_text(text: &str) -> Result<()> {
     if text.is_empty() {
         bail!("clipboard text cannot be empty");
     }
@@ -9953,14 +8966,14 @@ fn policy_tool_check(command: &str) -> PolicyToolCheck {
     }
 }
 
-fn first_available_command_name<'a>(commands: &'a [&str]) -> Option<&'a str> {
+pub(crate) fn first_available_command_name<'a>(commands: &'a [&str]) -> Option<&'a str> {
     commands
         .iter()
         .find(|command| command_path_check(command).ok)
         .copied()
 }
 
-fn command_path_check(command: &str) -> Check {
+pub(crate) fn command_path_check(command: &str) -> Check {
     match Command::new("sh")
         .args(["-c", &format!("command -v {command}")])
         .output()
@@ -10105,32 +9118,6 @@ mod tests {
     }
 
     #[test]
-    fn parses_absolute_window_origin_from_xwininfo() {
-        // Real xwininfo output for a reparented window: the absolute upper-left
-        // is the true client origin (what `import -window` captures from), which
-        // differs from xdotool's double-counted geometry by the title-bar height.
-        let sample = "\
-xwininfo: Window id: 0x400005 \"Eigen\"
-
-  Absolute upper-left X:  111
-  Absolute upper-left Y:  142
-  Relative upper-left X:  1
-  Relative upper-left Y:  22
-  Width: 1180
-  Height: 760
-";
-        assert_eq!(parse_absolute_window_origin(sample), Some((111, 142)));
-    }
-
-    #[test]
-    fn absolute_window_origin_none_when_fields_absent() {
-        assert_eq!(parse_absolute_window_origin("no geometry here"), None);
-        // Negative coordinates (partially off-screen window) parse fine.
-        let sample = "  Absolute upper-left X:  -5\n  Absolute upper-left Y:  -10\n";
-        assert_eq!(parse_absolute_window_origin(sample), Some((-5, -10)));
-    }
-
-    #[test]
     fn legacy_screenshot_response_without_provenance_still_parses() {
         let json = r#"{
             "path": "/tmp/agent-window.png",
@@ -10154,6 +9141,7 @@ xwininfo: Window id: 0x400005 \"Eigen\"
     fn status_with_profile_defaults(policy: AppliedWorkspacePolicy) -> WorkspaceStatus {
         WorkspaceStatus {
             id: "qa-ws".to_string(),
+            session: SessionSpec::default(),
             session_id: "session-qa".to_string(),
             purpose: Some("QA".to_string()),
             profile_id: Some(policy.profile_id.clone()),
@@ -10188,9 +9176,57 @@ xwininfo: Window id: 0x400005 \"Eigen\"
     }
 
     #[test]
-    fn workspace_command_scrubs_host_wayland_hints() {
+    fn legacy_status_and_manifest_without_session_default_to_x11() {
         let status = status_with_profile_defaults(policy(NetworkPolicy::default(), true, true));
-        let command = workspace_command(&status, "true");
+        let manifest = workspace_manifest(&status, None);
+
+        let mut status_json = serde_json::to_value(&status).expect("serialize status");
+        status_json
+            .as_object_mut()
+            .expect("status object")
+            .remove("session");
+        let legacy_status: WorkspaceStatus =
+            serde_json::from_value(status_json).expect("legacy status should parse");
+
+        let mut manifest_json = serde_json::to_value(&manifest).expect("serialize manifest");
+        manifest_json
+            .as_object_mut()
+            .expect("manifest object")
+            .remove("session");
+        let legacy_manifest: WorkspaceManifest =
+            serde_json::from_value(manifest_json).expect("legacy manifest should parse");
+
+        assert_eq!(legacy_status.session, SessionSpec::default());
+        assert_eq!(legacy_manifest.session, SessionSpec::default());
+    }
+
+    #[test]
+    fn launch_environment_reserves_session_identity_and_allows_regular_env() {
+        let status = status_with_profile_defaults(policy(NetworkPolicy::default(), true, true));
+        let mut command = Command::new("true");
+        command.env("DBUS_SESSION_BUS_ADDRESS", "host-dbus");
+        let launch_env = [
+            "DISPLAY",
+            "XAUTHORITY",
+            "WAYLAND_DISPLAY",
+            "AGENT_WORKSPACE_ID",
+            "AGENT_WORKSPACE_SESSION_ID",
+            "AGENT_WORKSPACE_RUNTIME_DIR",
+            "AGENT_WORKSPACE_SOCKET",
+            "DBUS_SESSION_BUS_ADDRESS",
+        ]
+        .into_iter()
+        .map(|name| EnvVar {
+            name: name.to_string(),
+            value: "host-or-user-override".to_string(),
+        })
+        .chain([EnvVar {
+            name: "LEGITIMATE_NON_SESSION_ENV".to_string(),
+            value: "preserved".to_string(),
+        }])
+        .collect::<Vec<_>>();
+
+        crate::launch::configure_launch_environment(&mut command, &status, &launch_env);
         let envs = command
             .get_envs()
             .map(|(name, value)| {
@@ -10199,23 +9235,21 @@ xwininfo: Window id: 0x400005 \"Eigen\"
                     value.map(|value| value.to_string_lossy().to_string()),
                 )
             })
-            .collect::<Vec<_>>();
+            .collect::<BTreeMap<_, _>>();
+        let value = |name| envs.get(name).and_then(|value| value.as_deref());
 
-        assert!(envs
-            .iter()
-            .any(|(name, value)| name == "WAYLAND_DISPLAY" && value.is_none()));
+        assert_eq!(value("DISPLAY"), Some(":90"));
+        assert_eq!(value("XAUTHORITY"), Some("/tmp/qa-ws/Xauthority"));
+        assert_eq!(value("AGENT_WORKSPACE_ID"), Some("qa-ws"));
+        assert_eq!(value("AGENT_WORKSPACE_SESSION_ID"), Some("session-qa"));
+        assert_eq!(value("AGENT_WORKSPACE_RUNTIME_DIR"), Some("/tmp/qa-ws"));
         assert_eq!(
-            envs.iter()
-                .find_map(|(name, value)| (name == "DISPLAY").then_some(value.as_deref()))
-                .flatten(),
-            Some(":90")
+            value("AGENT_WORKSPACE_SOCKET"),
+            Some("/tmp/qa-ws/control.sock")
         );
-        assert_eq!(
-            envs.iter()
-                .find_map(|(name, value)| (name == "XDG_SESSION_TYPE").then_some(value.as_deref()))
-                .flatten(),
-            Some("x11")
-        );
+        assert_eq!(value("LEGITIMATE_NON_SESSION_ENV"), Some("preserved"));
+        assert!(matches!(envs.get("WAYLAND_DISPLAY"), Some(None)));
+        assert!(matches!(envs.get("DBUS_SESSION_BUS_ADDRESS"), Some(None)));
     }
 
     #[test]
@@ -10889,6 +9923,18 @@ xwininfo: Window id: 0x400005 \"Eigen\"
         // The existing fresh procfs is preserved.
         let proc_idx = index_of(&args, "--proc").expect("--proc present");
         assert_eq!(args.get(proc_idx + 1), Some(&"/proc".to_string()));
+
+        let xauthority = status.xauthority_path.display().to_string();
+        assert!(args
+            .windows(3)
+            .any(|window| window == ["--ro-bind", xauthority.as_str(), xauthority.as_str()]));
+        let runtime_dir = status.runtime_dir.display().to_string();
+        assert!(
+            !args
+                .windows(3)
+                .any(|window| window[1] == runtime_dir && window[2] == runtime_dir),
+            "sandbox must bind the Xauthority resource rather than the whole runtime directory"
+        );
 
         fs::remove_dir_all(host_dir).expect("cleanup");
     }

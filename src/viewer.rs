@@ -6331,6 +6331,7 @@ mod tests {
     ) -> workspace::WorkspaceStatus {
         workspace::WorkspaceStatus {
             id: id.to_string(),
+            session: Default::default(),
             session_id: format!("session-{id}"),
             purpose: Some(purpose.to_string()),
             profile_id: Some(profile_id.to_string()),
@@ -6364,6 +6365,7 @@ mod tests {
         profile::WorkspaceProfile {
             id: id.to_string(),
             description: None,
+            session: Default::default(),
             width: None,
             height: None,
             cwd: None,

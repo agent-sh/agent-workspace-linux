@@ -102,6 +102,11 @@ schemas for later phases until the plan reaches them.
 6. Stop: use `workspace_stop` when finished; use `workspace_cleanup_stale` for
    orphaned runtimes.
 
+Session selection is currently X11-only (`Xvfb` + Openbox). MCP callers can pass
+`session: {"backend":"x11"}`; explicit MCP input overrides the profile session,
+and omitting both uses the pinned X11 default. CLI start/open-profile accepts the
+equivalent `--session x11`. Unsupported values are rejected.
+
 Skip unless: each step's precondition is visible in the previous tool result
 (workspace id, app id, target window, browser target, or explicit user approval).
 

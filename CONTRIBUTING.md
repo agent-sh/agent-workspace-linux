@@ -68,6 +68,10 @@ agent-workspace-linux/
 │   ├── guardrails.rs   # Action guardrails
 │   ├── profile.rs      # Profile management
 │   ├── policy.rs       # Policy enforcement
+│   ├── launch.rs       # Shared launch environment and sandbox construction
+│   ├── session.rs      # Session model and backend dispatch
+│   ├── session/
+│   │   └── x11.rs      # X11/Xvfb/Openbox session adapter
 │   └── approval.rs     # Human approval gate
 ├── scripts/            # Shell and Python smoke/QA scripts
 ├── skills/             # MCP skill definitions

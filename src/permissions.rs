@@ -1,12 +1,14 @@
+use crate::launch::resolve_command_path;
 use crate::policy::{AppliedWorkspacePolicy, MountMode, NetworkMode, NetworkPolicy, ProfileMount};
 use crate::profile::WorkspaceProfile;
 use crate::workspace::{LaunchSpec, WorkspaceStartOptions};
 use anyhow::{bail, Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+#[cfg(test)]
+use std::env;
 use std::{
     collections::{BTreeSet, VecDeque},
-    env,
     ffi::OsString,
     fs, io,
     path::{Component, Path, PathBuf},
@@ -563,34 +565,6 @@ fn paths_equivalent(left: &Path, right: &Path) -> bool {
     }
 }
 
-fn resolve_command_path(program: &str) -> Option<PathBuf> {
-    if program.contains('/') {
-        return Some(PathBuf::from(program));
-    }
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|dir| dir.join(program))
-        .find(|candidate| is_executable_file(candidate))
-}
-
-fn is_executable_file(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
-        return false;
-    };
-    if !metadata.is_file() {
-        return false;
-    }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        metadata.permissions().mode() & 0o111 != 0
-    }
-    #[cfg(not(unix))]
-    {
-        true
-    }
-}
-
 fn network_mode_name(mode: &NetworkMode) -> &'static str {
     match mode {
         NetworkMode::InheritHost => "inherit_host",
@@ -925,6 +899,38 @@ mod tests {
         assert!(state
             .validate_launch_spec(&launch_spec(&["bash"], None))
             .is_err());
+    }
+
+    #[test]
+    fn absolute_and_bare_app_allow_entries_keep_distinct_matching_semantics() {
+        let absolute = configured_state(McpPermissionCeiling {
+            network: None,
+            mounts: Vec::new(),
+            apps: AppPermissionCeiling {
+                allow: vec![PathBuf::from("/bin/sh")],
+            },
+        });
+        absolute
+            .validate_launch_spec(&launch_spec(&["/bin/sh"], None))
+            .expect("absolute path should match itself");
+        absolute
+            .validate_launch_spec(&launch_spec(&["sh"], None))
+            .expect("bare command should resolve through PATH for an absolute allow entry");
+
+        let bare = configured_state(McpPermissionCeiling {
+            network: None,
+            mounts: Vec::new(),
+            apps: AppPermissionCeiling {
+                allow: vec![PathBuf::from("sh")],
+            },
+        });
+        bare.validate_launch_spec(&launch_spec(&["sh"], None))
+            .expect("bare command should match the same bare allow entry");
+        assert!(
+            bare.validate_launch_spec(&launch_spec(&["/bin/sh"], None))
+                .is_err(),
+            "a bare allow entry must not start matching arbitrary absolute spellings"
+        );
     }
 
     /// Create a unique scratch directory under the system temp dir without

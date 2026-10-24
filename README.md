@@ -99,6 +99,12 @@ agent-workspace-linux workspace observe --screenshot --output /tmp/ws.png
 agent-workspace-linux workspace stop
 ```
 
+`workspace start` and `workspace open-profile` accept `--session x11` for the
+current X11 (`Xvfb` + Openbox) backend. A profile can declare the same setting as
+`"session": {"backend":"x11"}`. Explicit CLI/MCP input overrides the profile;
+when both are omitted, the session remains pinned to `{"backend":"x11"}`.
+Unsupported session values are rejected.
+
 ### Browser automation
 
 Browser commands need a workspace-owned Chrome with loopback DevTools. `open-browser`
