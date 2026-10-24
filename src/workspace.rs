@@ -8150,7 +8150,24 @@ fn paste_workspace_text(
 }
 
 fn set_workspace_clipboard(status: &WorkspaceStatus, text: &str) -> Result<WorkspaceClipboard> {
-    desktop_control(status).set_clipboard(text)
+    let desktop = desktop_control(status);
+    let result = desktop.set_clipboard(text)?;
+    // Clipboard helpers may fork before the compositor has accepted the new
+    // selection. Observe it before a following paste chord can consume old data.
+    // Use the same five-second budget as the clipboard helper processes.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match desktop.get_clipboard() {
+            Ok(current) if current.content.as_deref() == Some(text) => return Ok(result),
+            Err(error) if Instant::now() >= deadline => {
+                return Err(error).context("verify workspace clipboard selection")
+            }
+            _ if Instant::now() >= deadline => {
+                bail!("workspace clipboard did not publish the requested text")
+            }
+            _ => thread::sleep(Duration::from_millis(20)),
+        }
+    }
 }
 
 fn get_workspace_clipboard(status: &WorkspaceStatus) -> Result<WorkspaceClipboard> {

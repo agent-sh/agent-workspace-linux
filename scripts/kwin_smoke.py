@@ -215,6 +215,8 @@ for scale in (1, 1.5):
             assert killed["ok"], killed
         print(f"KWin {scale}: native Qt, Unicode input, clipboard, window control, pointer, capture and viewer frames passed", flush=True)
     finally:
+        if note.exists():
+            (ARTIFACTS / f"{id}-note.txt").write_text(note.read_text())
         if mcp:
             mcp.close()
         for path in runtime.glob("*.log"):
