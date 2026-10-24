@@ -1,6 +1,7 @@
 pub(crate) mod gnome;
 pub(crate) mod hyprland;
 pub(crate) mod i3;
+pub(crate) mod input_keys;
 pub(crate) mod kwin;
 pub(crate) mod x11;
 

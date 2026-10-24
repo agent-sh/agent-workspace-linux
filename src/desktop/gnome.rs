@@ -292,7 +292,7 @@ impl DesktopControl for GnomeDesktopControl<'_> {
         Ok(())
     }
     fn key(&self, key: &str) -> Result<()> {
-        let keys = super::kwin::keysyms(key)?;
+        let keys = super::input_keys::keysyms(key)?;
         self.call(json!({"op":"keys","keys":keys}))?;
         Ok(())
     }
