@@ -211,6 +211,17 @@ pub(crate) fn bubblewrap_sandbox_for_launch(
             "--proc".to_string(),
             "/proc".to_string(),
         ];
+        // Host desktop/system IPC is not part of ordinary host file access.
+        // Rebind only this workspace's display endpoints below.
+        for path in [
+            PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() })),
+            PathBuf::from("/run/dbus"),
+            PathBuf::from("/tmp/.X11-unix"),
+        ] {
+            if path.is_dir() {
+                args.extend(["--tmpfs".to_string(), path.display().to_string()]);
+            }
+        }
         // Keep desktop control/configuration private even for network-only
         // profiles whose ordinary host files remain visible. Fresh procfs in the
         // app PID namespace also prevents /proc/<host-pid>/root/fd bypasses.

@@ -10,13 +10,18 @@ use std::{
 
 pub(crate) const CHROME_OZONE_PLATFORM: &str = "x11";
 
-pub(crate) fn sandbox_resources(xauthority_path: &Path) -> SessionSandboxResources {
-    let mut read_only_binds = Vec::new();
-    let x11_socket_dir = Path::new("/tmp/.X11-unix");
-    if x11_socket_dir.exists() {
-        read_only_binds.push(x11_socket_dir.to_path_buf());
+pub(crate) fn sandbox_resources(xauthority_path: &Path, display: &str) -> SessionSandboxResources {
+    let mut read_only_binds = vec![xauthority_path.to_path_buf()];
+    if let Some(number) = display
+        .strip_prefix(':')
+        .and_then(|value| value.split('.').next())
+        .filter(|number| !number.is_empty() && number.bytes().all(|c| c.is_ascii_digit()))
+    {
+        let socket = std::path::PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
+        if socket.exists() {
+            read_only_binds.push(socket);
+        }
     }
-    read_only_binds.push(xauthority_path.to_path_buf());
     SessionSandboxResources {
         read_only_binds,
         read_write_binds: Vec::new(),
@@ -233,7 +238,7 @@ mod tests {
 
     #[test]
     fn x11_sandbox_resources_do_not_request_read_write_runtime_binds() {
-        let resources = sandbox_resources(Path::new("/tmp/workspace/Xauthority"));
+        let resources = sandbox_resources(Path::new("/tmp/workspace/Xauthority"), ":90");
 
         assert!(resources
             .read_only_binds

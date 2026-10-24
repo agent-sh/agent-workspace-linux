@@ -127,7 +127,9 @@ impl SessionSpec {
         display: &str,
     ) -> crate::launch::SessionSandboxResources {
         match self.backend {
-            SessionBackend::X11 | SessionBackend::I3 => x11::sandbox_resources(xauthority_path),
+            SessionBackend::X11 | SessionBackend::I3 => {
+                x11::sandbox_resources(xauthority_path, display)
+            }
             SessionBackend::Gnome => {
                 gnome::sandbox_resources(runtime_dir, xauthority_path, display)
             }
