@@ -277,6 +277,11 @@ fn start_private_bus(
         .stderr(Stdio::from(fs::File::create(
             runtime.join(format!("{kind}-bus.log")),
         )?));
+    if kind == "accessibility" {
+        // Registry activation must connect to this bus before atspi-address is
+        // published for app launches. Never discover it through a session bus.
+        command.env("AT_SPI_BUS_ADDRESS", address);
+    }
     prepare_child(&mut command);
     let mut child = command
         .spawn()
