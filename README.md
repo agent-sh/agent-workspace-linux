@@ -128,6 +128,11 @@ Install `i3-wm` and the X11 dependencies, including ImageMagick `import`.
 `doctor` reports i3 readiness separately. Run `scripts/i3_smoke.py` against a built
 binary with `AGENT_WORKSPACE_BIN` to check the real private session and restricted apps.
 
+Sandboxed apps use private process namespaces and receive only the workspace
+display, application bus, accessibility bus, and shared client data. Network-only
+profiles retain normal host file access while hiding this workspace's control
+sockets and compositor settings. Compositor methods stay on a separate control bus.
+
 Managed terminal sessions end when their workspace stops, even after the terminal
 window has closed. Stale cleanup uses the saved launch and session identity.
 Verified terminal cleanup uses Linux pidfds. Older kernels without `SO_PEERPIDFD`

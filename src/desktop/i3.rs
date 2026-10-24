@@ -35,16 +35,30 @@ pub(crate) fn request(runtime: &Path, pid: u32, kind: u32, payload: &str) -> Res
         return Err(std::io::Error::last_os_error().into());
     }
     let fd = unsafe { OwnedFd::from_raw_fd(raw) };
-    if unsafe {
-        libc::connect(
-            fd.as_raw_fd(),
-            (&address as *const libc::sockaddr_un).cast(),
-            std::mem::size_of_val(&address) as libc::socklen_t,
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error())
-            .context("connect private i3 IPC without blocking");
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        let result = unsafe {
+            libc::connect(
+                fd.as_raw_fd(),
+                (&address as *const libc::sockaddr_un).cast(),
+                std::mem::size_of_val(&address) as libc::socklen_t,
+            )
+        };
+        if result == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        // A loaded WM may temporarily fill its listen backlog. Retry only the
+        // connect, before any command is sent, within the normal IPC deadline.
+        if matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+        ) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
+            continue;
+        }
+        return Err(error).context("connect private i3 IPC without blocking");
     }
     let mut socket = UnixStream::from(fd);
     socket.set_nonblocking(false)?;

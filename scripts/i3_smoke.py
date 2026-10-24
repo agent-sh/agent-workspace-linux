@@ -107,7 +107,7 @@ try:
     mcp=Mcp(BIN,ROOT/"mcp.log",env=ENV,headless=True)
     terminal=mcp.tool("workspace_run_in_terminal",{"id":ID,"terminal_id":"acceptance","title":"i3 terminal","command":["sh","-c","printf I3_TERMINAL; exec tail -f /dev/null"]})
     assert terminal["ok"],terminal
-    terminal_socket=runtime/"terminal-acceptance.tmux.sock"
+    terminal_socket=Path(terminal["terminal"]["tmux_socket_path"])
     pane=run("tmux","-S",terminal_socket,"display-message","-p","#{pid}:#{pane_pid}").stdout.strip()
     terminal_pids=list(map(int,pane.split(":")))
     assert "I3_TERMINAL" in run("tmux","-S",terminal_socket,"capture-pane","-p").stdout
