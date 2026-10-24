@@ -1,3 +1,4 @@
+pub(crate) mod private;
 pub(crate) mod kwin;
 pub(crate) mod x11;
 
