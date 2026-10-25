@@ -592,28 +592,55 @@ pub(crate) fn resolve_command_path(program: &str) -> Option<PathBuf> {
 /// come from the setuid newuidmap/newgidmap (so setgroups stays allowed),
 /// drops every supplementary group and execs bubblewrap as the same uid with
 /// no capabilities. Inner root maps to one subordinate id nothing runs as.
-pub(crate) fn sandbox_launcher_prefix() -> Result<Vec<String>> {
+/// Best effort: when the groups cannot be dropped on this host, launches
+/// behave as before and keep them; `doctor` reports why.
+pub(crate) fn sandbox_launcher_prefix() -> Vec<String> {
+    group_drop_prefix().unwrap_or_default()
+}
+
+/// Whether sandboxed launches drop the owner's supplementary groups here, and
+/// why not when they cannot.
+pub(crate) fn group_drop_status() -> std::result::Result<bool, String> {
+    match group_drop_prefix() {
+        Ok(prefix) => Ok(!prefix.is_empty()),
+        Err(error) => Err(format!("{error:#}")),
+    }
+}
+
+fn group_drop_prefix() -> Result<Vec<String>> {
     let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
     if supplementary_groups()?.iter().all(|group| *group == gid) {
         return Ok(Vec::new());
     }
     let missing = |what: &str| {
         anyhow::anyhow!(
-            "sandboxed launch refused: your supplementary groups cannot be dropped ({what}). \
-             Install uidmap and give your user a subordinate range, e.g. \
+            "supplementary groups are kept in sandboxed launches ({what}); \
+             install uidmap and give your user a subordinate range, e.g. \
              `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER`"
         )
     };
-    for tool in ["unshare", "newuidmap", "newgidmap"] {
+    for tool in ["newuidmap", "newgidmap"] {
         resolve_executable_path(tool).ok_or_else(|| missing(&format!("{tool} not found")))?;
+    }
+    let unshare = resolve_executable_path("unshare").ok_or_else(|| missing("unshare not found"))?;
+    // Repeated --map-users/--map-groups ranges arrived in util-linux 2.40.
+    let version = Command::new(&unshare)
+        .arg("--version")
+        .env_clear()
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| util_linux_version(&text));
+    if version.is_none_or(|version| version < (2, 40)) {
+        return Err(missing("util-linux 2.40 or newer is required for unshare"));
     }
     let name = user_name(uid);
     let sub_uid = subordinate_start(Path::new("/etc/subuid"), uid, name.as_deref())
         .ok_or_else(|| missing("no /etc/subuid range"))?;
     let sub_gid = subordinate_start(Path::new("/etc/subgid"), uid, name.as_deref())
         .ok_or_else(|| missing("no /etc/subgid range"))?;
-    Ok(vec![
-        "unshare".to_string(),
+    let prefix = vec![
+        unshare.display().to_string(),
         "--user".to_string(),
         format!("--map-users={uid}:{uid}:1"),
         format!("--map-users=0:{sub_uid}:1"),
@@ -624,7 +651,138 @@ pub(crate) fn sandbox_launcher_prefix() -> Result<Vec<String>> {
         "--setgid".to_string(),
         gid.to_string(),
         "--".to_string(),
-    ])
+    ];
+    group_drop_preflight(&prefix)?;
+    Ok(prefix)
+}
+
+fn util_linux_version(text: &str) -> Option<(u32, u32)> {
+    let version = text.split_whitespace().last()?;
+    let mut parts = version.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// Runs the wrapper once per process with `true`, so a host that refuses it
+/// (user namespaces restricted by AppArmor, newuidmap denied) fails the
+/// launch with the reason instead of every app exiting right after spawn.
+fn group_drop_preflight(prefix: &[String]) -> Result<()> {
+    static RESULT: std::sync::OnceLock<std::result::Result<(), String>> =
+        std::sync::OnceLock::new();
+    RESULT
+        .get_or_init(|| {
+            let truth =
+                resolve_executable_path("true").ok_or_else(|| "true not found".to_string())?;
+            let output = Command::new(&prefix[0])
+                .args(&prefix[1..])
+                .arg(truth)
+                .env_clear()
+                .output()
+                .map_err(|error| format!("could not run unshare: {error}"))?;
+            if output.status.success() {
+                return Ok(());
+            }
+            let restricted =
+                fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+                    .is_ok_and(|value| value.trim() == "1");
+            Err(format!(
+                "supplementary groups are kept in sandboxed launches: dropping them failed ({}){}",
+                String::from_utf8_lossy(&output.stderr).trim(),
+                if restricted {
+                    ". AppArmor restricts unprivileged user namespaces here \
+                     (kernel.apparmor_restrict_unprivileged_userns=1); see the README section \
+                     on supplementary groups"
+                } else {
+                    ""
+                }
+            ))
+        })
+        .clone()
+        .map_err(|error| anyhow::anyhow!(error))
+}
+
+/// A sandboxed launch command and the private descriptor carrying its
+/// arguments. Keep `args_fd` alive until the command is spawned.
+pub(crate) struct SandboxedCommand {
+    pub(crate) command: Command,
+    pub(crate) args_fd: std::os::fd::OwnedFd,
+}
+
+/// Builds a sandboxed launch. The launcher and bubblewrap run from absolute
+/// paths with an empty environment; the app's environment and argv reach
+/// bubblewrap through `--args` on a close-on-exec memfd that only this child
+/// inherits. Launch variables such as LD_PRELOAD or PATH therefore never
+/// apply to the launcher, and stay out of the world-readable command line.
+pub(crate) fn sandboxed_command(
+    sandbox_args: &[String],
+    program: &str,
+    program_args: &[String],
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<SandboxedCommand> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let bwrap = resolve_executable_path("bwrap").context("bwrap not found")?;
+    let args_fd = bwrap_args_memfd(sandbox_args, env)?;
+    let prefix = sandbox_launcher_prefix();
+    let mut command = match prefix.split_first() {
+        Some((launcher, args)) => {
+            let mut command = Command::new(launcher);
+            command.args(args).arg(&bwrap);
+            command
+        }
+        None => Command::new(&bwrap),
+    };
+    let fd = args_fd.as_raw_fd();
+    // bubblewrap reads only options from --args; the program stays on the
+    // command line after `--`.
+    command
+        .arg("--args")
+        .arg(fd.to_string())
+        .arg("--")
+        .arg(program)
+        .args(program_args)
+        .env_clear();
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(SandboxedCommand { command, args_fd })
+}
+
+/// `--clearenv`, the environment and the sandbox options, as NUL-separated
+/// bubblewrap arguments in a close-on-exec memfd.
+fn bwrap_args_memfd(
+    sandbox_args: &[String],
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    let raw = unsafe { libc::memfd_create(c"bwrap-args".as_ptr(), libc::MFD_CLOEXEC) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error()).context("create bwrap argument memfd");
+    }
+    let args_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    let mut bytes = Vec::new();
+    let mut push = |value: &[u8]| {
+        bytes.extend_from_slice(value);
+        bytes.push(0);
+    };
+    push(b"--clearenv");
+    for (name, value) in env {
+        push(b"--setenv");
+        push(name.as_bytes());
+        push(value.as_bytes());
+    }
+    for arg in sandbox_args {
+        push(arg.as_bytes());
+    }
+    let mut file = std::fs::File::from(args_fd.try_clone()?);
+    std::io::Write::write_all(&mut file, &bytes).context("write bwrap arguments")?;
+    std::io::Seek::rewind(&mut file).context("rewind bwrap arguments")?;
+    Ok(args_fd)
 }
 
 fn supplementary_groups() -> Result<Vec<libc::gid_t>> {
@@ -693,6 +851,40 @@ fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_environment_reaches_bubblewrap_only_through_private_arguments() {
+        let env = [
+            ("LD_PRELOAD".into(), "/tmp/inject.so".into()),
+            ("PATH".into(), "/nonexistent".into()),
+        ];
+        let fd = bwrap_args_memfd(
+            &["--ro-bind".to_string(), "/".to_string(), "/".to_string()],
+            &env,
+        )
+        .expect("memfd");
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::fs::File::from(fd), &mut bytes).expect("read");
+        let args = bytes
+            .split(|byte| *byte == 0)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &args[..10],
+            [
+                "--clearenv",
+                "--setenv",
+                "LD_PRELOAD",
+                "/tmp/inject.so",
+                "--setenv",
+                "PATH",
+                "/nonexistent",
+                "--ro-bind",
+                "/",
+                "/",
+            ]
+        );
+    }
+
     #[test]
     fn subordinate_ranges_match_by_name_or_uid() {
         let path = test_runtime("subuid");
