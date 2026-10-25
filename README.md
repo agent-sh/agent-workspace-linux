@@ -35,6 +35,34 @@ sudo apt install xvfb openbox xdotool xauth x11-utils imagemagick xclip \
 ./install.sh
 ```
 
+That covers the default X11 backend. Each native backend needs its own packages on
+top. Package names are for Ubuntu 26.04; `agent-workspace-linux doctor` reports
+`ready_for_<backend>_workspace` and lists what is missing.
+
+| Backend | Extra packages | GPU |
+|---|---|---|
+| `i3` | `i3-wm` | none |
+| `kwin` | `kwin-wayland kwin-common libkscreen-bin libkf6service-bin wl-clipboard xwayland dbus-daemon` | a readable DRM render node |
+| `gnome` | `gnome-shell xwayland libglib2.0-bin dbus-daemon` | none (software rendering) |
+| `hyprland` | `hyprland kwin-wayland xwayland grim wtype wl-clipboard dbus-daemon` | a readable DRM render node; with NVIDIA plus another GPU, the other GPU is used |
+| `cosmic` | `cosmic-comp` (see below), `weston xwayland x11-xserver-utils wl-clipboard dbus-daemon` | none (Mesa software rendering) |
+
+Ubuntu does not package `cosmic-comp`. Install the build from the Pop!_OS
+archive that the COSMIC probe pins, with its `libdisplay-info1` dependency:
+
+```bash
+curl -fLO https://apt.pop-os.org/release/pool/noble/cosmic-comp/8cb1802caada438bb5cc7670dfabdaca5fad0502/cosmic-comp_0.1~1792508925~24.04~8cb1802_amd64.deb
+curl -fLO https://archive.ubuntu.com/ubuntu/pool/universe/libd/libdisplay-info/libdisplay-info1_0.1.1-2build1_amd64.deb
+sha256sum -c <<'EOF'
+f493771502e56245158906e92b4da0b5a7f0bc2fb1926f3feb81d6294541b427  cosmic-comp_0.1~1792508925~24.04~8cb1802_amd64.deb
+a3bfce18d53aa9d635d899f1f555e84bbbf2c859d80cef3b4eb1c36b2c772026  libdisplay-info1_0.1.1-2build1_amd64.deb
+EOF
+sudo apt install ./cosmic-comp_0.1~1792508925~24.04~8cb1802_amd64.deb ./libdisplay-info1_0.1.1-2build1_amd64.deb
+```
+
+A readable render node means `/dev/dri/renderD*` is readable and writable by
+your user, usually through the `render` group.
+
 `./install.sh` builds the release binary, installs it to `~/.local/bin/`, and installs the bundled skill to `~/.codex/skills/` by default. It is safe to rerun. Codex MCP registration is opt-in: use `--codex-configure` only for generic MCP-host workflows. In Codex for Linux, use the dedicated **Agent Workspaces** feature page to configure the backend and permission ceiling so the generic MCP settings/configuration pages stay clean. If an older install still appears in generic MCP/configuration pages, run `./install.sh --clean-codex-config` to remove the stale `agent-workspace-linux` server and tool tables. See [`install.sh --help`](install.sh) for flags (`--permissions`, `--clean-codex-config`, `--skills-dir`, `--no-skill`, `--dry-run`).
 
 ### Install with cargo (from source)
