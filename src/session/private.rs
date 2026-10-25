@@ -337,6 +337,22 @@ fn start_private_bus(
     Ok(child)
 }
 
+/// Restrict EGL to Mesa for a software-rendered process. glvnd otherwise
+/// tries the NVIDIA vendor first, which fails or crashes without its devices.
+/// Hosts without Mesa's vendor file keep the default vendor list.
+pub(crate) fn use_mesa_egl(command: &mut Command) {
+    if let Some(vendor) = [
+        "/usr/share/glvnd/egl_vendor.d/50_mesa.json",
+        "/etc/glvnd/egl_vendor.d/50_mesa.json",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|path| path.is_file())
+    {
+        command.env("__EGL_VENDOR_LIBRARY_FILENAMES", vendor);
+    }
+}
+
 pub(crate) fn prepare_child(command: &mut Command) {
     let parent = std::process::id();
     command.stdin(Stdio::null()).process_group(0);

@@ -27,7 +27,8 @@ output scale and EI input checks succeed.
 
 The backend uses COSMIC toplevel information and management, ext image-copy
 capture, wlr output management, and COSMIC's private D-Bus EI input socket.
-Capture uses shared memory and does not require a GPU. Window identifiers are
+Capture uses shared memory and does not require a GPU. The compositor, its Weston parent and XWayland
+load only Mesa's EGL vendor, so an installed NVIDIA driver is never used. Window identifiers are
 COSMIC's stable foreign-toplevel identifiers. PID is unavailable from this
 protocol and remains unset.
 
