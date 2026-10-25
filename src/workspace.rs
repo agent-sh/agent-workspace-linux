@@ -3890,10 +3890,10 @@ fn create_private_runtime_dir(path: &Path) -> Result<()> {
             .with_context(|| format!("failed to create {}", root.display()))?;
     }
     let metadata = verify_owned_dir(root, "workspace runtime root")?;
-    // Group write is only safe when the group is this user's own (the
-    // usual 002 umask on user-private-group systems).
-    let mode = metadata.mode();
-    if mode & 0o002 != 0 || (mode & 0o020 != 0 && !user_private_group(metadata.gid())) {
+    // XDG requires the runtime root to be private to its user. Group
+    // membership cannot be proven private (members by primary gid are not
+    // listed), so any group or world write is refused.
+    if metadata.mode() & 0o022 != 0 {
         bail!(
             "workspace runtime root {} is writable by other users; use a private XDG_RUNTIME_DIR",
             root.display()
@@ -3909,64 +3909,6 @@ fn create_private_runtime_dir(path: &Path) -> Result<()> {
             .with_context(|| format!("failed to set private permissions on {}", dir.display()))?;
     }
     Ok(())
-}
-
-/// True when `gid` is this user's own group: their primary group, named after
-/// them, with no other listed members (the user-private-group convention).
-/// Users whose primary group is this gid are not listed in the group entry;
-/// that convention assumes none besides the owner.
-fn user_private_group(gid: u32) -> bool {
-    if gid != unsafe { libc::getegid() } {
-        return false;
-    }
-    let Some(user) = lookup_entry(
-        |buffer, length, result: &mut *mut libc::passwd, entry| unsafe {
-            libc::getpwuid_r(libc::geteuid(), entry, buffer, length, result)
-        },
-    ) else {
-        return false;
-    };
-    let Some(group) = lookup_entry(
-        |buffer, length, result: &mut *mut libc::group, entry| unsafe {
-            libc::getgrgid_r(gid, entry, buffer, length, result)
-        },
-    ) else {
-        return false;
-    };
-    let (user_entry, _user_buffer) = &user;
-    let (group_entry, _group_buffer) = &group;
-    unsafe {
-        let name = std::ffi::CStr::from_ptr(user_entry.pw_name);
-        if std::ffi::CStr::from_ptr(group_entry.gr_name) != name {
-            return false;
-        }
-        let mut members = group_entry.gr_mem;
-        while !members.is_null() && !(*members).is_null() {
-            if std::ffi::CStr::from_ptr(*members) != name {
-                return false;
-            }
-            members = members.add(1);
-        }
-    }
-    true
-}
-
-/// Calls a reentrant passwd/group lookup, growing its buffer on ERANGE. The
-/// entry's strings point into the returned buffer, so both are returned.
-fn lookup_entry<T>(
-    mut call: impl FnMut(*mut libc::c_char, usize, &mut *mut T, *mut T) -> libc::c_int,
-) -> Option<(T, Vec<libc::c_char>)> {
-    let mut length = 16 * 1024;
-    loop {
-        let mut buffer = vec![0 as libc::c_char; length];
-        let mut entry: T = unsafe { std::mem::zeroed() };
-        let mut result = std::ptr::null_mut();
-        match call(buffer.as_mut_ptr(), buffer.len(), &mut result, &mut entry) {
-            0 if !result.is_null() => return Some((entry, buffer)),
-            libc::ERANGE if length < 1 << 20 => length *= 2,
-            _ => return None,
-        }
-    }
 }
 
 fn verify_owned_dir(path: &Path, what: &str) -> Result<fs::Metadata> {
@@ -10018,9 +9960,8 @@ mod tests {
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("chmod");
         assert!(create_private_runtime_dir(&runtime(&shared)).is_err());
         assert!(!shared.join("agent-workspace-linux").exists());
-        // Group write by this user's own group is the common 002 umask.
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).expect("chmod");
-        create_private_runtime_dir(&runtime(&shared)).expect("own-group writable root");
+        assert!(create_private_runtime_dir(&runtime(&shared)).is_err());
 
         let linked = scratch.join("linked");
         std::os::unix::fs::symlink(&owned, &linked).expect("symlink root");

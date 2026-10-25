@@ -44,7 +44,8 @@ fi
 SMOKE_DIR="$(mktemp -d)"
 CONFIG_DIR="$SMOKE_DIR/config"
 RUNTIME_DIR="$SMOKE_DIR/runtime"
-mkdir -p "$CONFIG_DIR" "$RUNTIME_DIR"
+mkdir -p "$CONFIG_DIR"
+mkdir -m 700 -p "$RUNTIME_DIR"
 
 WORKSPACE_IDS=()
 STALE_CLEANUP_IDS=()

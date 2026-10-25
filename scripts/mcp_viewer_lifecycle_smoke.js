@@ -19,7 +19,8 @@ const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "awl-vlc-"));
 const configDir = path.join(tempDir, "c");
 const runtimeDir = path.join(tempDir, "r");
 fs.mkdirSync(configDir, { recursive: true });
-fs.mkdirSync(runtimeDir, { recursive: true });
+fs.mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
+fs.chmodSync(runtimeDir, 0o700);
 fs.chmodSync(runtimeDir, 0o700);
 
 const env = {

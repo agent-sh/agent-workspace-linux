@@ -501,7 +501,8 @@ async function main() {
   const runtimeDir = path.join(tempDir, "runtime");
   const copyDir = args.copyDir ? resolvePath(args.copyDir) : path.join(tempDir, "browser-user-data-copy");
   fs.mkdirSync(configDir, { recursive: true });
-  fs.mkdirSync(runtimeDir, { recursive: true });
+  fs.mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
+  fs.chmodSync(runtimeDir, 0o700);
   fs.chmodSync(runtimeDir, 0o700);
 
   printCommand(args, browser);
