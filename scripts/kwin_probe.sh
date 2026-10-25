@@ -58,6 +58,7 @@ docker run \
   --security-opt no-new-privileges \
   --security-opt seccomp=unconfined \
   --security-opt apparmor=unconfined \
+  --security-opt systempaths=unconfined \
   --user 65534:65534 \
   --group-add "$(stat -c %g "$RENDER_NODE")" \
   --device "$RENDER_NODE" \

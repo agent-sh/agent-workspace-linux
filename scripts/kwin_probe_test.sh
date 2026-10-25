@@ -53,6 +53,7 @@ run_call="${calls[3]}"
 [[ "$run_call" == *"--read-only"* ]]
 [[ "$run_call" == *"--cap-drop ALL"* ]]
 [[ "$run_call" == *"--security-opt no-new-privileges"* ]]
+[[ "$run_call" == *"--security-opt systempaths=unconfined"* ]]
 [[ "$run_call" == *"--user 65534:65534"* ]]
 [[ "$run_call" == *"--tmpfs /tmp:rw,nosuid,nodev,size=1g"* ]]
 [[ "$run_call" == *"type=bind,src=$TEST_DIR/artifacts,dst=/artifacts"* ]]

@@ -100,7 +100,7 @@ agent-workspace-linux workspace stop
 ```
 
 `workspace start` and `workspace open-profile` accept `--session x11`,
-`--session kwin`, or `--session gnome`. MCP and saved profiles accept `"session": {"backend":"kwin"}`.
+`--session kwin`, `--session gnome`, or `--session i3`. MCP and saved profiles accept `"session": {"backend":"kwin"}`.
 Explicit CLI/MCP input overrides the profile. Omitting both keeps the pinned
 Xvfb + Openbox default (`{"backend":"x11"}`).
 
@@ -119,6 +119,19 @@ KWin aligns output sizes to logical pixels; status reports the effective size.
 Apps use native Wayland by default; rootless XWayland remains available for
 legacy clients. The existing viewer, IPC, permission ceiling and explicit
 Chrome profile import rules apply to every backend.
+
+i3 sessions use a private Xvfb display and i3 window manager at scale 1.
+The private i3 configuration has no launcher bindings, bar, or startup commands.
+Moving or resizing a tiled window makes it floating. Minimize uses the i3 scratchpad;
+show returns the window to the current workspace. Window capture leaves focus unchanged.
+Install `i3-wm` and the X11 dependencies, including ImageMagick `import`.
+`doctor` reports i3 readiness separately. Run `scripts/i3_smoke.py` against a built
+binary with `AGENT_WORKSPACE_BIN` to check the real private session and restricted apps.
+
+Sandboxed apps use private process namespaces and receive only the workspace
+display, application bus, accessibility bus, and shared client data. Network-only
+profiles retain normal host file access while hiding this workspace's control
+sockets and compositor settings. Compositor methods stay on a separate control bus.
 
 Managed terminal sessions end when their workspace stops, even after the terminal
 window has closed. Stale cleanup uses the saved launch and session identity.

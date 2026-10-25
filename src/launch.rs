@@ -133,7 +133,7 @@ pub(crate) fn configure_launch_environment(
 
 fn configure_application_bus(command: &mut Command, status: &WorkspaceStatus) {
     let bus = status.runtime_dir.join("client-bus");
-    if bus.exists() {
+    if status.session.backend.requires_client_application_bus() || bus.exists() {
         command.env(
             "DBUS_SESSION_BUS_ADDRESS",
             crate::session::private::socket_address(&bus),
@@ -211,6 +211,17 @@ pub(crate) fn bubblewrap_sandbox_for_launch(
             "--proc".to_string(),
             "/proc".to_string(),
         ];
+        // Host desktop/system IPC is not part of ordinary host file access.
+        // Rebind only this workspace's display endpoints below.
+        for path in [
+            PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() })),
+            PathBuf::from("/run/dbus"),
+            PathBuf::from("/tmp/.X11-unix"),
+        ] {
+            if path.is_dir() {
+                args.extend(["--tmpfs".to_string(), path.display().to_string()]);
+            }
+        }
         // Keep desktop control/configuration private even for network-only
         // profiles whose ordinary host files remain visible. Fresh procfs in the
         // app PID namespace also prevents /proc/<host-pid>/root/fd bypasses.
@@ -224,7 +235,7 @@ pub(crate) fn bubblewrap_sandbox_for_launch(
                 .unwrap_or_else(|_| path.to_path_buf())
         };
         args.extend(["--tmpfs".to_string(), runtime_target.display().to_string()]);
-        let resources = app_session_resources(status);
+        let resources = app_session_resources(status)?;
         let mut dirs = BTreeSet::new();
         for path in resources
             .read_only_binds
@@ -318,7 +329,7 @@ pub(crate) fn uses_bubblewrap_mount_isolation(policy: Option<&AppliedWorkspacePo
     })
 }
 
-fn app_session_resources(status: &WorkspaceStatus) -> SessionSandboxResources {
+fn app_session_resources(status: &WorkspaceStatus) -> Result<SessionSandboxResources> {
     let mut resources = status.session.sandbox_resources(
         &status.xauthority_path,
         &status.runtime_dir,
@@ -326,22 +337,27 @@ fn app_session_resources(status: &WorkspaceStatus) -> SessionSandboxResources {
     );
     let control_bus = status.runtime_dir.join("session-bus");
     let client_bus = status.runtime_dir.join("client-bus");
-    if client_bus.exists() {
-        for path in resources
-            .read_only_binds
-            .iter_mut()
-            .chain(&mut resources.read_write_binds)
-        {
-            if *path == control_bus {
-                *path = client_bus.clone();
-            }
+    if status.session.backend.requires_client_application_bus() && !client_bus.exists() {
+        bail!(
+            "{:?} client bus is unavailable at {}; refusing to launch a sandboxed app",
+            status.session.backend,
+            client_bus.display()
+        );
+    }
+    for path in resources
+        .read_only_binds
+        .iter_mut()
+        .chain(&mut resources.read_write_binds)
+    {
+        if *path == control_bus {
+            *path = client_bus.clone();
         }
     }
     let client = status.runtime_dir.join("client");
     if client.is_dir() {
         resources.read_write_binds.push(client);
     }
-    resources
+    Ok(resources)
 }
 
 pub(crate) fn restricted_mount_namespace_args(
@@ -350,7 +366,7 @@ pub(crate) fn restricted_mount_namespace_args(
     cwd: Option<&Path>,
     network: LaunchNetworkPlan,
 ) -> Result<Vec<String>> {
-    let resources = app_session_resources(status);
+    let resources = app_session_resources(status)?;
     restricted_mount_namespace_args_with_resources(policy, cwd, network, resources)
 }
 
@@ -512,6 +528,190 @@ fn is_executable_file(path: &Path) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_status(
+        runtime_dir: &Path,
+        backend: crate::session::SessionBackend,
+    ) -> WorkspaceStatus {
+        WorkspaceStatus {
+            id: "native-launch-test".to_string(),
+            session: crate::session::SessionSpec {
+                backend,
+                scale: 1.0,
+            },
+            session_id: "session-test".to_string(),
+            purpose: None,
+            profile_id: None,
+            applied_policy: None,
+            profile_cwd: None,
+            profile_env: Vec::new(),
+            user_acknowledged_hidden_workspace: true,
+            user_acknowledged_unenforced_policy: true,
+            ready: true,
+            started_at_unix: 1,
+            display: ":90".to_string(),
+            width: 1280,
+            height: 720,
+            runtime_dir: runtime_dir.to_path_buf(),
+            socket_path: runtime_dir.join("control.sock"),
+            xauthority_path: runtime_dir.join("Xauthority"),
+            daemon_pid: None,
+            x_server_pid: 0,
+            window_manager_pid: None,
+            last_event_sequence: 0,
+            apps: Vec::new(),
+        }
+    }
+
+    fn sandbox_policy(
+        mounts: Vec<crate::policy::ProfileMount>,
+        mode: NetworkMode,
+    ) -> AppliedWorkspacePolicy {
+        AppliedWorkspacePolicy::new_with_capabilities(
+            "native-launch-test".to_string(),
+            mounts,
+            crate::policy::NetworkPolicy {
+                mode,
+                allow_hosts: Vec::new(),
+            },
+            false,
+            0,
+            crate::policy::PolicyRuntimeCapabilities {
+                bubblewrap: crate::policy::PolicyToolCheck {
+                    ok: true,
+                    detail: "test capability".to_string(),
+                },
+                ..Default::default()
+            },
+        )
+    }
+
+    fn test_runtime(name: &str) -> PathBuf {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        env::temp_dir().join(format!(
+            "agent-workspace-{name}-{}-{unique}",
+            std::process::id()
+        ))
+    }
+
+    fn assert_environment_uses_client_bus(backend: crate::session::SessionBackend) {
+        let runtime = test_runtime(&format!("missing-client-env-{backend:?}"));
+        let status = native_status(&runtime, backend);
+        let mut command = Command::new("true");
+        command.env("DBUS_SESSION_BUS_ADDRESS", "host-dbus");
+
+        configure_launch_environment(&mut command, &status, &[]);
+
+        let address = command
+            .get_envs()
+            .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
+            .and_then(|(_, value)| value)
+            .expect("client bus address");
+        assert_eq!(
+            address.to_string_lossy(),
+            crate::session::private::socket_address(&runtime.join("client-bus"))
+        );
+    }
+
+    fn assert_sandboxes_reject_missing_client_bus(backend: crate::session::SessionBackend) {
+        let runtime = test_runtime(&format!("missing-client-sandbox-{backend:?}"));
+        let mount_host = runtime.join("mount-host");
+        fs::create_dir_all(&mount_host).expect("runtime and mount host");
+        let status = native_status(&runtime, backend);
+        let policies = [
+            sandbox_policy(Vec::new(), NetworkMode::Disabled),
+            sandbox_policy(
+                vec![crate::policy::ProfileMount {
+                    host_path: mount_host,
+                    workspace_path: PathBuf::from("/workspace/data"),
+                    mode: crate::policy::MountMode::ReadOnly,
+                }],
+                NetworkMode::InheritHost,
+            ),
+        ];
+
+        for policy in &policies {
+            let error = match bubblewrap_sandbox_for_launch(&status, Some(policy), None) {
+                Err(error) => error,
+                Ok(_) => panic!("missing client bus must fail closed"),
+            };
+            assert!(error.to_string().contains("client bus is unavailable"));
+        }
+
+        fs::remove_dir_all(runtime).expect("remove test runtime");
+    }
+
+    fn assert_sandboxes_bind_client_bus(backend: crate::session::SessionBackend) {
+        let runtime = test_runtime(&format!("working-client-sandbox-{backend:?}"));
+        let mount_host = runtime.join("mount-host");
+        fs::create_dir_all(&mount_host).expect("runtime and mount host");
+        let client_bus = runtime.join("client-bus");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&client_bus).expect("working client bus socket");
+        let status = native_status(&runtime, backend);
+        let policies = [
+            sandbox_policy(Vec::new(), NetworkMode::Disabled),
+            sandbox_policy(
+                vec![crate::policy::ProfileMount {
+                    host_path: mount_host,
+                    workspace_path: PathBuf::from("/workspace/data"),
+                    mode: crate::policy::MountMode::ReadOnly,
+                }],
+                NetworkMode::InheritHost,
+            ),
+        ];
+        let client = client_bus.display().to_string();
+        let control = runtime.join("session-bus").display().to_string();
+
+        for policy in &policies {
+            let sandbox = bubblewrap_sandbox_for_launch(&status, Some(policy), None)
+                .expect("working client bus sandbox")
+                .expect("sandbox");
+            assert!(sandbox.args.windows(3).any(|window| {
+                window[0] == "--bind" && window[1] == client && window[2] == client
+            }));
+            assert!(!sandbox.args.windows(3).any(|window| {
+                matches!(window[0].as_str(), "--bind" | "--ro-bind")
+                    && (window[1] == control || window[2] == control)
+            }));
+        }
+
+        drop(listener);
+        fs::remove_dir_all(runtime).expect("remove test runtime");
+    }
+
+    #[test]
+    fn kwin_environment_uses_client_bus_even_when_socket_is_missing() {
+        assert_environment_uses_client_bus(crate::session::SessionBackend::Kwin);
+    }
+
+    #[test]
+    fn gnome_environment_uses_client_bus_even_when_socket_is_missing() {
+        assert_environment_uses_client_bus(crate::session::SessionBackend::Gnome);
+    }
+
+    #[test]
+    fn kwin_sandboxes_reject_missing_client_bus() {
+        assert_sandboxes_reject_missing_client_bus(crate::session::SessionBackend::Kwin);
+    }
+
+    #[test]
+    fn gnome_sandboxes_reject_missing_client_bus() {
+        assert_sandboxes_reject_missing_client_bus(crate::session::SessionBackend::Gnome);
+    }
+
+    #[test]
+    fn kwin_sandboxes_bind_client_bus_not_control_bus() {
+        assert_sandboxes_bind_client_bus(crate::session::SessionBackend::Kwin);
+    }
+
+    #[test]
+    fn gnome_sandboxes_bind_client_bus_not_control_bus() {
+        assert_sandboxes_bind_client_bus(crate::session::SessionBackend::Gnome);
+    }
 
     #[test]
     fn merged_env_preserves_non_session_values_and_override_order() {

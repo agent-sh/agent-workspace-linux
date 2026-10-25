@@ -40,7 +40,7 @@ try:
         try:
             probe="""import os,sys,json,socket
 from pathlib import Path
-runtime=Path(sys.argv[1]); hostpid=sys.argv[2]
+runtime=Path(sys.argv[1]); hostpid=sys.argv[2]; own_x_socket='X'+sys.argv[3].split(':',1)[1].split('.')[0]
 paths=[runtime/'control.sock',runtime/'session-bus',runtime/'i3.sock',Path('/proc')/hostpid/'root'/str(runtime).lstrip('/')/'control.sock']
 reachable=[]
 for path in paths:
@@ -48,10 +48,12 @@ for path in paths:
  try: s.connect(str(path));reachable.append(str(path))
  except OSError: pass
  finally: s.close()
-print(json.dumps({'reachable':reachable,'pid':os.getpid(),'host_proc':Path('/proc',hostpid).exists()}))
-raise SystemExit(42 if reachable or Path('/proc',hostpid).exists() else 0)
+foreign_x=[p.name for p in Path('/tmp/.X11-unix').iterdir() if p.name!=own_x_socket]
+host_bus=any(p.exists() for p in [Path('/run/dbus/system_bus_socket'),Path('/run/user')/str(os.getuid())/'bus'])
+print(json.dumps({'reachable':reachable,'pid':os.getpid(),'host_proc':Path('/proc',hostpid).exists(),'foreign_x':foreign_x,'host_bus':host_bus}))
+raise SystemExit(42 if reachable or Path('/proc',hostpid).exists() or foreign_x or host_bus else 0)
 """
-            run=cmd("workspace","run","--id",id,"--timeout-ms",10000,"--","python3","-c",probe,status["runtime_dir"],status["daemon_pid"])
+            run=cmd("workspace","run","--id",id,"--timeout-ms",10000,"--","python3","-c",probe,status["runtime_dir"],status["daemon_pid"],status["display"])
             assert run["exit_code"]==0,run
             terminal=mcp.tool("workspace_run_in_terminal",{"id":id,"terminal_id":"private","command":["sh","-c","printf PRIVATE_TERMINAL_OK; exec tail -f /dev/null"],"wait_window":True,"timeout_ms":10000})
             assert terminal["ok"],terminal

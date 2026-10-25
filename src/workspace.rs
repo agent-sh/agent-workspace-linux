@@ -127,6 +127,8 @@ pub struct DoctorReport {
     pub runtime: RuntimeReport,
     pub viewer: ViewerRuntimeReport,
     pub ready_for_x11_workspace: bool,
+    pub ready_for_i3_workspace: bool,
+    pub i3_blockers: Vec<String>,
     pub ready_for_kwin_workspace: bool,
     pub ready_for_gnome_workspace: bool,
     pub gnome_blockers: Vec<String>,
@@ -1172,7 +1174,10 @@ pub fn doctor_report() -> DoctorReport {
 
     let gnome_blockers = crate::session::gnome::blockers();
     let kwin_blockers = crate::session::kwin::blockers();
+    let i3_blockers = crate::session::i3::blockers();
     DoctorReport {
+        ready_for_i3_workspace: i3_blockers.is_empty(),
+        i3_blockers,
         ready_for_gnome_workspace: gnome_blockers.is_empty(),
         gnome_blockers,
         ready_for_kwin_workspace: kwin_blockers.is_empty(),
@@ -3600,7 +3605,10 @@ fn prepare_workspace_start(mut options: WorkspaceStartOptions) -> Result<Workspa
     create_client_runtime(&runtime_dir)?;
     remove_stale_socket(&socket_path)?;
     let xauthority_path = runtime_dir.join("Xauthority");
-    let display = if options.session.backend == crate::session::SessionBackend::X11 {
+    let display = if matches!(
+        options.session.backend,
+        crate::session::SessionBackend::X11 | crate::session::SessionBackend::I3
+    ) {
         let display = pick_display()?;
         create_xauthority(&display, &xauthority_path)?;
         display
@@ -7655,7 +7663,7 @@ fn show_workspace_window_target(
     show_workspace_window(&state.status, &window.id)
         .map(|window| annotate_workspace_window(state, window))
         .map(Some)
-        .with_context(|| format!("failed to show workspace window {}", window.id))
+        .map_err(|error| anyhow!("failed to show workspace window {}: {error:#}", window.id))
 }
 
 struct WindowClickResult {
@@ -8142,7 +8150,24 @@ fn paste_workspace_text(
 }
 
 fn set_workspace_clipboard(status: &WorkspaceStatus, text: &str) -> Result<WorkspaceClipboard> {
-    desktop_control(status).set_clipboard(text)
+    let desktop = desktop_control(status);
+    let result = desktop.set_clipboard(text)?;
+    // Clipboard helpers may fork before the compositor has accepted the new
+    // selection. Observe it before a following paste chord can consume old data.
+    // Use the same five-second budget as the clipboard helper processes.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match desktop.get_clipboard() {
+            Ok(current) if current.content.as_deref() == Some(text) => return Ok(result),
+            Err(error) if Instant::now() >= deadline => {
+                return Err(error).context("verify workspace clipboard selection")
+            }
+            _ if Instant::now() >= deadline => {
+                bail!("workspace clipboard did not publish the requested text")
+            }
+            _ => thread::sleep(Duration::from_millis(20)),
+        }
+    }
 }
 
 fn get_workspace_clipboard(status: &WorkspaceStatus) -> Result<WorkspaceClipboard> {
