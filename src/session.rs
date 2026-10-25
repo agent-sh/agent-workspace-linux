@@ -4,6 +4,7 @@ pub(crate) mod hyprland;
 pub(crate) mod i3;
 pub(crate) mod kwin;
 pub(crate) mod private;
+pub(crate) mod wayland_filter;
 pub(crate) mod x11;
 
 use crate::desktop::DesktopControl;
@@ -179,6 +180,28 @@ impl SessionSpec {
             SessionBackend::Cosmic => {
                 cosmic::sandbox_resources(runtime_dir, xauthority_path, display)
             }
+        }
+    }
+
+    /// The filtered Wayland socket a backend binds into sandboxes in place
+    /// of its main socket, and that main socket's app-visible path.
+    pub(crate) fn sandbox_wayland_socket(
+        self,
+        runtime_dir: &Path,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        match self.backend {
+            SessionBackend::Kwin => Some(wayland_filter::sandbox_socket(
+                runtime_dir,
+                kwin::WAYLAND_SOCKET,
+            )),
+            SessionBackend::Hyprland => Some(wayland_filter::sandbox_socket(
+                runtime_dir,
+                hyprland::WAYLAND_SOCKET,
+            )),
+            SessionBackend::X11
+            | SessionBackend::I3
+            | SessionBackend::Gnome
+            | SessionBackend::Cosmic => None,
         }
     }
 

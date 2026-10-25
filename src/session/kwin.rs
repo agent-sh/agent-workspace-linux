@@ -125,6 +125,7 @@ pub(crate) fn sandbox_resources(
 
 pub(crate) struct KwinSession {
     private: PrivateSession,
+    filter: Option<super::wayland_filter::WaylandFilter>,
 }
 impl KwinSession {
     pub(crate) fn start(options: &mut DaemonOptions) -> Result<Self> {
@@ -178,6 +179,7 @@ impl KwinSession {
                 },
                 "",
             )?,
+            filter: None,
         };
         let client_env = runtime.join("kwin-client.json");
         if client_env.exists() {
@@ -338,12 +340,18 @@ impl KwinSession {
         let (width, height) = crate::desktop::kwin::probe(&options.runtime_dir)?;
         options.width = width;
         options.height = height;
+        // Sandboxed apps connect through the filter, never the main socket.
+        session.filter = Some(super::wayland_filter::WaylandFilter::start(
+            runtime,
+            &runtime.join(WAYLAND_SOCKET),
+        )?);
         Ok(session)
     }
     pub(crate) fn pid(&self) -> Option<u32> {
         self.private.pid()
     }
     pub(crate) fn shutdown(&mut self) {
+        self.filter = None;
         self.private.shutdown();
     }
 }

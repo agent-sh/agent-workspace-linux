@@ -180,6 +180,7 @@ pub(crate) struct HyprlandSession {
     compositor: Option<Child>,
     parent: Option<Child>,
     private: PrivateSession,
+    filter: Option<super::wayland_filter::WaylandFilter>,
 }
 impl HyprlandSession {
     pub(crate) fn start(options: &mut DaemonOptions) -> Result<Self> {
@@ -203,6 +204,7 @@ impl HyprlandSession {
             compositor: None,
             parent: None,
             private,
+            filter: None,
         };
         let mut parent = Command::new("kwin_wayland");
         configure_process_environment(&mut parent, runtime, "", &options.xauthority_path);
@@ -446,12 +448,18 @@ impl HyprlandSession {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
+        // Sandboxed apps connect through the filter, never the main socket.
+        session.filter = Some(super::wayland_filter::WaylandFilter::start(
+            runtime,
+            &socket_path,
+        )?);
         Ok(session)
     }
     pub(crate) fn pid(&self) -> Option<u32> {
         self.compositor.as_ref().map(Child::id)
     }
     pub(crate) fn shutdown(&mut self) {
+        self.filter = None;
         // Do not signal while Hyprland is already in its IPC-triggered cleanup.
         // Keep its renderer alive until the child has completed teardown.
         if self.ipc_ready
