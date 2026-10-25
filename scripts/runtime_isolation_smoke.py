@@ -56,8 +56,9 @@ for path in paths:
  finally: s.close()
 foreign_x=[p.name for p in Path('/tmp/.X11-unix').iterdir() if p.name!=own_x_socket]
 host_bus=any(p.exists() for p in [Path('/run/dbus/system_bus_socket'),Path('/run/user')/str(os.getuid())/'bus'])
-print(json.dumps({'reachable':reachable,'pid':os.getpid(),'host_proc':Path('/proc',hostpid).exists(),'foreign_x':foreign_x,'host_bus':host_bus}))
-raise SystemExit(42 if reachable or Path('/proc',hostpid).exists() or foreign_x or host_bus else 0)
+groups=[g for g in os.getgroups() if g!=os.getgid()]
+print(json.dumps({'reachable':reachable,'pid':os.getpid(),'host_proc':Path('/proc',hostpid).exists(),'foreign_x':foreign_x,'host_bus':host_bus,'groups':groups}))
+raise SystemExit(42 if reachable or Path('/proc',hostpid).exists() or foreign_x or host_bus or groups else 0)
 """
             terminal=mcp.tool("workspace_run_in_terminal",{"id":id,"terminal_id":"private","command":["sh","-c","printf PRIVATE_TERMINAL_OK; exec tail -f /dev/null"],"wait_window":True,"timeout_ms":10000})
             assert terminal["ok"],terminal

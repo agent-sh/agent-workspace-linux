@@ -7109,7 +7109,15 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
     let (mount_isolation, network_isolation) =
         launch_isolation_labels_from_sandbox(sandbox.as_ref());
     let mut child_command = if let Some(sandbox) = &sandbox {
-        let mut command = Command::new("bwrap");
+        let prefix = crate::launch::sandbox_launcher_prefix()?;
+        let mut command = match prefix.split_first() {
+            Some((program, args)) => {
+                let mut command = Command::new(program);
+                command.args(args).arg("bwrap");
+                command
+            }
+            None => Command::new("bwrap"),
+        };
         command
             .args(&sandbox.args)
             .arg("--")

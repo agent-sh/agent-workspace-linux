@@ -586,6 +586,96 @@ pub(crate) fn resolve_command_path(program: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable_file(candidate))
 }
 
+/// Unprivileged bubblewrap keeps the caller's supplementary groups, and groups
+/// such as docker or lxd are root-equivalent. When the owner has any, a
+/// sandboxed launch starts through `unshare` with a user namespace whose maps
+/// come from the setuid newuidmap/newgidmap (so setgroups stays allowed),
+/// drops every supplementary group and execs bubblewrap as the same uid with
+/// no capabilities. Inner root maps to one subordinate id nothing runs as.
+pub(crate) fn sandbox_launcher_prefix() -> Result<Vec<String>> {
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    if supplementary_groups()?.iter().all(|group| *group == gid) {
+        return Ok(Vec::new());
+    }
+    let missing = |what: &str| {
+        anyhow::anyhow!(
+            "sandboxed launch refused: your supplementary groups cannot be dropped ({what}). \
+             Install uidmap and give your user a subordinate range, e.g. \
+             `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER`"
+        )
+    };
+    for tool in ["unshare", "newuidmap", "newgidmap"] {
+        resolve_executable_path(tool).ok_or_else(|| missing(&format!("{tool} not found")))?;
+    }
+    let name = user_name(uid);
+    let sub_uid = subordinate_start(Path::new("/etc/subuid"), uid, name.as_deref())
+        .ok_or_else(|| missing("no /etc/subuid range"))?;
+    let sub_gid = subordinate_start(Path::new("/etc/subgid"), uid, name.as_deref())
+        .ok_or_else(|| missing("no /etc/subgid range"))?;
+    Ok(vec![
+        "unshare".to_string(),
+        "--user".to_string(),
+        format!("--map-users={uid}:{uid}:1"),
+        format!("--map-users=0:{sub_uid}:1"),
+        format!("--map-groups={gid}:{gid}:1"),
+        format!("--map-groups=0:{sub_gid}:1"),
+        "--setuid".to_string(),
+        uid.to_string(),
+        "--setgid".to_string(),
+        gid.to_string(),
+        "--".to_string(),
+    ])
+}
+
+fn supplementary_groups() -> Result<Vec<libc::gid_t>> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error()).context("read supplementary groups");
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error()).context("read supplementary groups");
+    }
+    groups.truncate(count as usize);
+    Ok(groups)
+}
+
+fn user_name(uid: libc::uid_t) -> Option<String> {
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() {
+        return None;
+    }
+    unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }
+        .to_str()
+        .ok()
+        .map(str::to_string)
+}
+
+/// The first id of the user's range in an /etc/subuid-style file, matched by
+/// name or numeric uid.
+fn subordinate_start(path: &Path, uid: libc::uid_t, name: Option<&str>) -> Option<u64> {
+    let uid = uid.to_string();
+    fs::read_to_string(path).ok()?.lines().find_map(|line| {
+        let mut fields = line.trim().split(':');
+        let owner = fields.next()?;
+        let start = fields.next()?.parse::<u64>().ok()?;
+        let count = fields.next()?.parse::<u64>().ok()?;
+        (count >= 1 && (owner == uid || Some(owner) == name)).then_some(start)
+    })
+}
+
 pub(crate) fn resolve_executable_path(program: &str) -> Option<PathBuf> {
     if program.contains('/') {
         let path = PathBuf::from(program);
@@ -603,6 +693,20 @@ fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn subordinate_ranges_match_by_name_or_uid() {
+        let path = test_runtime("subuid");
+        fs::write(
+            &path,
+            "other:200000:65536\nalice:100000:0\nalice:300000:65536\n1000:400000:10\n",
+        )
+        .expect("write subuid");
+        assert_eq!(subordinate_start(&path, 1001, Some("alice")), Some(300000));
+        assert_eq!(subordinate_start(&path, 1000, None), Some(400000));
+        assert_eq!(subordinate_start(&path, 1002, Some("bob")), None);
+        fs::remove_file(path).expect("remove subuid");
+    }
+
     use super::*;
 
     fn native_status(
