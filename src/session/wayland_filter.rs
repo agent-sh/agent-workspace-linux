@@ -162,6 +162,8 @@ pub(crate) fn window_pid(pid: Option<u32>) -> Option<u32> {
 struct Limits {
     connections: usize,
     queued_fds: usize,
+    /// Descriptors one connection may queue without their messages.
+    per_connection_fds: usize,
 }
 
 impl Limits {
@@ -177,6 +179,7 @@ impl Limits {
         Self {
             connections: MAX_CONNECTIONS.min(soft / 48).max(1),
             queued_fds: MAX_QUEUED_FDS.min(soft / 4),
+            per_connection_fds: MAX_QUEUED_FDS,
         }
     }
 }
@@ -385,11 +388,12 @@ fn connect_through_holder(
         pid,
         control: Some(control),
     };
-    // Register before the compositor can see a window from this connection.
+    // Register before the holder connects, then let it connect.
     if let Ok(mut peers) = PEERS.lock() {
         peers.insert(pid as u32, client_pid);
     }
-    let control = holder.control.as_ref().unwrap();
+    let mut control = holder.control.as_ref().unwrap();
+    std::io::Write::write_all(&mut control, &[1])?;
     control.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut fds = Vec::new();
     let mut byte = [0u8; 1];
@@ -420,6 +424,12 @@ unsafe fn holder(control: RawFd, upstream: &SocketAddress) -> ! {
         if signal != libc::SIGKILL && signal != libc::SIGSTOP {
             libc::sigaction(signal, &default, std::ptr::null_mut());
         }
+    }
+    // Connect only after the parent has recorded this holder's mapping, so
+    // the compositor never sees a connection without one.
+    let mut go = [0u8; 1];
+    if libc::read(control, go.as_mut_ptr().cast(), 1) != 1 {
+        libc::_exit(1);
     }
     let socket = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
     if socket < 0
@@ -493,6 +503,7 @@ fn accept_loop(
     let budget = Arc::new(Budget {
         queued: AtomicUsize::new(0),
         limit: limits.queued_fds,
+        per_connection: limits.per_connection_fds,
     });
     for (id, client) in (0u64..).zip(listener.incoming()) {
         if stop.load(Ordering::SeqCst) {
@@ -540,6 +551,7 @@ fn accept_loop(
 struct Budget {
     queued: AtomicUsize,
     limit: usize,
+    per_connection: usize,
 }
 
 struct Link {
@@ -627,7 +639,7 @@ fn pump(
                     return Err(invalid("sandboxed clients queued too many descriptors"));
                 }
             }
-            if fds.len() > MAX_QUEUED_FDS {
+            if fds.len() > budget.map_or(MAX_QUEUED_FDS, |budget| budget.per_connection) {
                 return Err(invalid(
                     "too many descriptors queued without their messages",
                 ));
@@ -994,12 +1006,35 @@ mod tests {
     const OPEN: Limits = Limits {
         connections: MAX_CONNECTIONS,
         queued_fds: MAX_QUEUED_FDS,
+        per_connection_fds: MAX_QUEUED_FDS,
     };
 
+    /// Waits until the relay has read everything `stream` sent, so the
+    /// descriptors it carried are counted before the test goes on.
+    fn drained(stream: &UnixStream) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut queued: libc::c_int = 0;
+            let ok = unsafe { libc::ioctl(stream.as_raw_fd(), libc::TIOCOUTQ, &mut queued) };
+            assert_eq!(ok, 0, "SIOCOUTQ");
+            if queued == 0 {
+                return;
+            }
+            assert!(std::time::Instant::now() < deadline, "relay did not read");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[track_caller]
     fn closed(stream: &UnixStream) -> Vec<u8> {
         use std::io::Read;
         let mut rest = Vec::new();
-        (&*stream).read_to_end(&mut rest).unwrap();
+        // Closing a socket with unread data resets it; that is closed too.
+        match (&*stream).read_to_end(&mut rest) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(error) => panic!("reading a closed relay connection: {error}"),
+        }
         rest
     }
 
@@ -1200,28 +1235,41 @@ mod tests {
 
     #[test]
     fn closes_clients_that_queue_descriptors_without_messages() {
+        // Descriptors in flight over Unix sockets count against a per-user
+        // limit on the host (ETOOMANYREFS past it), which a desktop session
+        // shares: a flood of them here crashed a running terminal. Keep every
+        // case to a few dozen descriptors with small caps.
         let partial = &message(5, 0, &[0; 4088])[..8];
         // Past the per-connection cap.
-        let harness = Harness::new("flood", OPEN);
+        let harness = Harness::new(
+            "flood",
+            Limits {
+                connections: 4,
+                queued_fds: MAX_QUEUED_FDS,
+                per_connection_fds: 56,
+            },
+        );
         let (client, server) = harness.connect();
         let mut sent = 0;
         let mut result = send_fds(&client, partial, 28);
-        while result.is_ok() && sent <= MAX_QUEUED_FDS {
+        while result.is_ok() && sent <= 56 {
             sent += 28;
             result = send_fds(&client, &[0], 28);
         }
         assert!(closed(&server).is_empty());
-        assert!(sent <= MAX_QUEUED_FDS + 28, "{sent} descriptors queued");
+        assert!(sent <= 56 + 28, "{sent} descriptors queued");
         // Past the budget shared by every connection of one filter.
         let harness = Harness::new(
             "budget",
             Limits {
                 connections: 4,
                 queued_fds: 56,
+                per_connection_fds: 56,
             },
         );
         let (first, first_server) = harness.connect();
         send_fds(&first, partial, 28).unwrap();
+        drained(&first);
         let (second, second_server) = harness.connect();
         send_fds(&second, partial, 28).unwrap();
         let _ = send_fds(&second, &[0], 28);
@@ -1246,6 +1294,7 @@ mod tests {
             Limits {
                 connections: 1,
                 queued_fds: MAX_QUEUED_FDS,
+                per_connection_fds: MAX_QUEUED_FDS,
             },
         );
         let (client, server) = harness.connect();
