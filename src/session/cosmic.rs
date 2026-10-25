@@ -637,7 +637,10 @@ impl CosmicSession {
         wait_for(
             Duration::from_secs(20),
             || {
-                if let Some(status) = session.private.compositor.as_mut().unwrap().try_wait()? {
+                let pid = session.private.compositor.as_ref().unwrap().id();
+                if let super::private::UnreapedExit::Exited(status) =
+                    super::private::unreaped_exit(pid)
+                {
                     bail!("private COSMIC compositor exited: {status}; inspect cosmic.log");
                 }
                 Ok(env_file.exists())
@@ -700,14 +703,24 @@ impl CosmicSession {
         let _ = fs::remove_file(self.runtime.join(APP_SOCKET));
         self.lifetime.take();
         let socket = wayland_socket(&self.runtime).ok();
-        if let Some(child) = self.private.compositor.as_mut() {
+        if let Some(pid) = self
+            .private
+            .compositor
+            .as_ref()
+            .map(std::process::Child::id)
+        {
+            // Leave the leader unreaped so the group signal in
+            // `private.shutdown` cannot reach a recycled process group.
             let _ = wait_for(
                 Duration::from_secs(3),
                 || {
                     if let Some(socket) = socket.as_ref() {
                         let _ = UnixStream::connect(socket);
                     }
-                    Ok(child.try_wait()?.is_some())
+                    Ok(!matches!(
+                        super::private::unreaped_exit(pid),
+                        super::private::UnreapedExit::Running
+                    ))
                 },
                 "COSMIC graceful stop",
             );
