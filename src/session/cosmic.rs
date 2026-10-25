@@ -611,7 +611,11 @@ impl CosmicSession {
         wait_for(
             Duration::from_secs(10),
             || {
-                if let Some(status) = session.parent.as_mut().unwrap().try_wait()? {
+                // Observe without reaping, so shutdown's group signals cannot
+                // reach a recycled process group.
+                if let super::private::UnreapedExit::Exited(status) =
+                    super::private::unreaped_exit(session.parent.as_ref().unwrap().id())
+                {
                     bail!("private COSMIC parent exited: {status}");
                 }
                 Ok(parent_socket.exists())
