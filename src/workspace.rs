@@ -1634,7 +1634,7 @@ pub fn cleanup_stale_workspaces(id: Option<String>, dry_run: bool) -> Result<Wor
             continue;
         }
 
-        match fs::remove_dir_all(&workspace.runtime_dir) {
+        match remove_stale_runtime(&workspace.runtime_dir) {
             Ok(()) => removed.push(WorkspaceCleanupEntry {
                 id: workspace.id,
                 runtime_dir: workspace.runtime_dir,
@@ -1741,6 +1741,24 @@ fn cleanup_stale_workspace_processes(
     }
 
     Ok(actions)
+}
+
+/// Processes cleanup just signalled may still add entries while they exit
+/// (a log line, a socket being unlinked), so a non-empty error is retried
+/// within the same grace period they get to exit.
+fn remove_stale_runtime(runtime_dir: &Path) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_millis(APP_TERMINATE_GRACE_MS);
+    loop {
+        match fs::remove_dir_all(runtime_dir) {
+            Err(error)
+                if error.kind() == io::ErrorKind::DirectoryNotEmpty
+                    && Instant::now() < deadline =>
+            {
+                thread::sleep(Duration::from_millis(50));
+            }
+            result => return result,
+        }
+    }
 }
 
 fn cleanup_stale_app_process_group(
