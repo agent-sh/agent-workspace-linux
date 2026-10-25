@@ -3893,7 +3893,7 @@ fn create_private_runtime_dir(path: &Path) -> Result<()> {
     // Group write is only safe when the group is this user's own (the
     // usual 002 umask on user-private-group systems).
     let mode = metadata.mode();
-    if mode & 0o002 != 0 || (mode & 0o020 != 0 && metadata.gid() != unsafe { libc::getegid() }) {
+    if mode & 0o002 != 0 || (mode & 0o020 != 0 && !user_private_group(metadata.gid())) {
         bail!(
             "workspace runtime root {} is writable by other users; use a private XDG_RUNTIME_DIR",
             root.display()
@@ -3909,6 +3909,52 @@ fn create_private_runtime_dir(path: &Path) -> Result<()> {
             .with_context(|| format!("failed to set private permissions on {}", dir.display()))?;
     }
     Ok(())
+}
+
+/// True when `gid` is this user's own group: their primary group, named after
+/// them, with no other listed members (the user-private-group convention).
+fn user_private_group(gid: u32) -> bool {
+    if gid != unsafe { libc::getegid() } {
+        return false;
+    }
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    let mut user: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut user_result = std::ptr::null_mut();
+    let mut group: libc::group = unsafe { std::mem::zeroed() };
+    let mut group_result = std::ptr::null_mut();
+    let mut group_buffer = vec![0 as libc::c_char; 16 * 1024];
+    unsafe {
+        if libc::getpwuid_r(
+            libc::geteuid(),
+            &mut user,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut user_result,
+        ) != 0
+            || user_result.is_null()
+            || libc::getgrgid_r(
+                gid,
+                &mut group,
+                group_buffer.as_mut_ptr(),
+                group_buffer.len(),
+                &mut group_result,
+            ) != 0
+            || group_result.is_null()
+        {
+            return false;
+        }
+        let same_name =
+            std::ffi::CStr::from_ptr(user.pw_name) == std::ffi::CStr::from_ptr(group.gr_name);
+        let mut members = group.gr_mem;
+        let mut others = false;
+        while !members.is_null() && !(*members).is_null() {
+            if std::ffi::CStr::from_ptr(*members) != std::ffi::CStr::from_ptr(user.pw_name) {
+                others = true;
+            }
+            members = members.add(1);
+        }
+        same_name && !others
+    }
 }
 
 fn verify_owned_dir(path: &Path, what: &str) -> Result<fs::Metadata> {
@@ -8951,9 +8997,19 @@ fn remove_dead_x11_display_artifacts(number: u32, socket: &Path, lock: &Path) ->
     if process_exists(pid) {
         return Ok(false);
     }
+    // A concurrent start (or Xvfb itself) may replace the stale lock with a
+    // live one; only remove artifacts while the same stale lock is in place.
+    let stale = fs::symlink_metadata(lock).map(|meta| meta.ino()).ok();
+    let still_stale = || {
+        fs::symlink_metadata(lock).map(|meta| meta.ino()).ok() == stale
+            && read_x11_lock_pid(lock) == Some(pid)
+    };
     // Concurrent starts may find the same stale artifacts; already gone is
     // the result we want.
     for (path, what) in [(socket, "socket"), (lock, "lock")] {
+        if !still_stale() {
+            return Ok(false);
+        }
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
