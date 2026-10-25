@@ -586,6 +586,9 @@ CRASH_APP_PID="$(jq -r '.apps[0].pid' "$SMOKE_DIR/crash-launch.json")"
 CRASH_APP_PGID="$(jq -r '.apps[0].process_group_id' "$SMOKE_DIR/crash-launch.json")"
 kill -9 "$CRASH_DAEMON_PID"
 wait_pid_gone "workspace daemon" "$CRASH_DAEMON_PID"
+# The X server and window manager die with their daemon; only apps remain.
+wait_pid_gone "window manager" "$CRASH_WM_PID"
+wait_pid_gone "X server" "$CRASH_X_PID"
 for _ in {1..40}; do
   run_awl workspace list > "$SMOKE_DIR/crash-list.json"
   if jq -e --arg id "$CRASH_ID" '.workspaces[] | select(.id == $id and .running == false)' "$SMOKE_DIR/crash-list.json" >/dev/null; then
@@ -595,13 +598,11 @@ for _ in {1..40}; do
 done
 assert_json '.workspaces[] | select(.id == $id and .running == false)' "$SMOKE_DIR/crash-list.json" --arg id "$CRASH_ID"
 run_awl workspace cleanup --dry-run --id "$CRASH_ID" > "$SMOKE_DIR/crash-cleanup-dry.json"
-assert_json '.candidates[] | select(.id == $id and (.process_cleanup[] | contains("would terminate app sleepy process group")) and (.process_cleanup[] | contains("would terminate X server pid")))' "$SMOKE_DIR/crash-cleanup-dry.json" --arg id "$CRASH_ID"
+assert_json '.candidates[] | select(.id == $id and (.process_cleanup[] | contains("would terminate app sleepy process group")) and ([.process_cleanup[] | select(contains("X server"))] | length == 0))' "$SMOKE_DIR/crash-cleanup-dry.json" --arg id "$CRASH_ID"
 run_awl workspace cleanup --id "$CRASH_ID" > "$SMOKE_DIR/crash-cleanup.json"
 assert_json '.removed[] | select(.id == $id and (.process_cleanup[] | contains("terminated app sleepy process group")))' "$SMOKE_DIR/crash-cleanup.json" --arg id "$CRASH_ID"
 wait_pgid_gone "sleepy app" "$CRASH_APP_PGID"
 wait_pid_gone "sleepy app" "$CRASH_APP_PID"
-wait_pid_gone "window manager" "$CRASH_WM_PID"
-wait_pid_gone "X server" "$CRASH_X_PID"
 test ! -d "$RUNTIME_DIR/agent-workspace-linux/$CRASH_ID"
 
 echo "== self-stop from workspace app =="
