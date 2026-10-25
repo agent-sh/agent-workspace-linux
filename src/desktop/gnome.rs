@@ -190,7 +190,7 @@ impl<'a> GnomeDesktopControl<'a> {
             stdin.write_all(text.as_bytes())?;
             drop(stdin);
             expect("owned")?;
-            let keys = super::kwin::keysyms("shift+Insert")?;
+            let keys = super::input_keys::keysyms("shift+Insert")?;
             self.call(json!({"op":"keys","keys":keys,"focus":window_id}))?;
             expect("served")
         })();
