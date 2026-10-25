@@ -661,6 +661,22 @@ pub struct WorkspaceTerminal {
     pub width: u32,
     #[serde(default)]
     pub height: u32,
+    /// Where host-side tmux clients for this terminal must run.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) client_sandbox: TmuxClientSandbox,
+}
+
+/// The tmux server of a sandboxed terminal is code the sandbox controls, and a
+/// tmux client obeys server messages that run commands and open files. Host
+/// clients for such a terminal therefore run inside the same sandbox.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) enum TmuxClientSandbox {
+    /// Not resolved from the workspace; refuse to run a client.
+    #[default]
+    Unknown,
+    Host,
+    Bubblewrap(Vec<String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -7179,10 +7195,12 @@ fn terminal_info(id: &str, terminal_id: &str, app_id: Option<String>) -> Result<
     let status = status_workspace(&id)?;
     let terminal_id = sanitize_terminal_id(terminal_id)?;
     let tmux_socket_path = terminal_socket_path(&status.runtime_dir, &terminal_id);
+    let client_sandbox = terminal_client_sandbox(&status, &tmux_socket_path)?;
     let session_name = terminal_id.clone();
     let target = session_name.clone();
     let output = tmux_output(
         &tmux_socket_path,
+        &client_sandbox,
         &[
             "display-message",
             "-p",
@@ -7213,7 +7231,26 @@ fn terminal_info(id: &str, terminal_id: &str, app_id: Option<String>) -> Result<
         current_path: non_empty_field(fields.get(5).copied()),
         width,
         height,
+        client_sandbox,
     })
+}
+
+/// Managed terminals launch with the workspace default policy (their launch
+/// spec carries none), so their client sandbox is that policy's sandbox with
+/// only the terminal's own client directory bound.
+fn terminal_client_sandbox(status: &WorkspaceStatus, socket: &Path) -> Result<TmuxClientSandbox> {
+    let terminal_dir = socket
+        .parent()
+        .filter(|dir| dir.parent() == Some(status.runtime_dir.join("client").as_path()));
+    match bubblewrap_sandbox_for_launch(status, status.applied_policy.as_ref(), None, terminal_dir)?
+    {
+        None => Ok(TmuxClientSandbox::Host),
+        Some(_) if terminal_dir.is_none() => bail!(
+            "terminal socket {} predates per-terminal sandboxes; restart the workspace to use it",
+            socket.display()
+        ),
+        Some(sandbox) => Ok(TmuxClientSandbox::Bubblewrap(sandbox.args)),
+    }
 }
 
 fn tmux_capture_pane(
@@ -7224,11 +7261,12 @@ fn tmux_capture_pane(
     if preserve_trailing_spaces {
         args.insert(2, "-N");
     }
-    match tmux_output(&terminal.tmux_socket_path, &args) {
+    match tmux_output(&terminal.tmux_socket_path, &terminal.client_sandbox, &args) {
         Ok(output) => Ok(output),
         Err(error) if preserve_trailing_spaces => {
             let fallback = tmux_output(
                 &terminal.tmux_socket_path,
+                &terminal.client_sandbox,
                 &["capture-pane", "-p", "-t", terminal.target.as_str()],
             )?;
             Ok(format!(
@@ -7242,6 +7280,7 @@ fn tmux_capture_pane(
 fn tmux_send_literal_text(terminal: &WorkspaceTerminal, text: &str) -> Result<()> {
     tmux_status(
         &terminal.tmux_socket_path,
+        &terminal.client_sandbox,
         &[
             "send-keys",
             "-t",
@@ -7256,11 +7295,11 @@ fn tmux_send_literal_text(terminal: &WorkspaceTerminal, text: &str) -> Result<()
 fn tmux_send_keys(terminal: &WorkspaceTerminal, keys: &[String]) -> Result<()> {
     let mut args = vec!["send-keys", "-t", terminal.target.as_str()];
     args.extend(keys.iter().map(String::as_str));
-    tmux_status(&terminal.tmux_socket_path, &args)
+    tmux_status(&terminal.tmux_socket_path, &terminal.client_sandbox, &args)
 }
 
-fn tmux_output(socket_path: &Path, args: &[&str]) -> Result<String> {
-    let output = tmux_command(socket_path, args)?
+fn tmux_output(socket_path: &Path, sandbox: &TmuxClientSandbox, args: &[&str]) -> Result<String> {
+    let output = tmux_command(socket_path, sandbox, args)?
         .output()
         .with_context(|| format!("failed to run tmux {}", args.join(" ")))?;
     if !output.status.success() {
@@ -7273,8 +7312,8 @@ fn tmux_output(socket_path: &Path, args: &[&str]) -> Result<String> {
     String::from_utf8(output.stdout).context("tmux output was not UTF-8")
 }
 
-fn tmux_status(socket_path: &Path, args: &[&str]) -> Result<()> {
-    let output = tmux_command(socket_path, args)?
+fn tmux_status(socket_path: &Path, sandbox: &TmuxClientSandbox, args: &[&str]) -> Result<()> {
+    let output = tmux_command(socket_path, sandbox, args)?
         .output()
         .with_context(|| format!("failed to run tmux {}", args.join(" ")))?;
     if !output.status.success() {
@@ -7287,66 +7326,31 @@ fn tmux_status(socket_path: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn tmux_command(socket_path: &Path, args: &[&str]) -> Result<Command> {
+fn tmux_command(socket_path: &Path, sandbox: &TmuxClientSandbox, args: &[&str]) -> Result<Command> {
     let tmux = resolve_executable_path(DEFAULT_TMUX_PROGRAM)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_TMUX_PROGRAM));
-    let mut command = Command::new(tmux);
-    command
-        .arg("-S")
-        .arg(trusted_tmux_socket(socket_path)?)
-        .args(args);
-    Ok(command)
-}
-
-/// A sandboxed terminal owns `runtime/client/terminal-ID/` and could replace
-/// its `tmux.sock` with a symlink to a host tmux server, which the host-side
-/// client would follow. Reach the server through a hard link in a directory
-/// the sandbox cannot see instead: `link` never follows symlinks, and a
-/// sandbox can only link socket inodes it can already reach itself.
-fn trusted_tmux_socket(socket_path: &Path) -> Result<PathBuf> {
-    let Some(terminal_dir) = socket_path.parent() else {
-        return Ok(socket_path.to_path_buf());
-    };
-    let Some(runtime) = terminal_dir
-        .parent()
-        .filter(|client| client.file_name() == Some(std::ffi::OsStr::new("client")))
-        .and_then(Path::parent)
-    else {
-        // Legacy sockets live at the runtime root, which sandboxes never see.
-        return Ok(socket_path.to_path_buf());
-    };
-    let name = terminal_dir
-        .file_name()
-        .and_then(|name| name.to_str())
-        .and_then(|name| name.strip_prefix("terminal-"))
-        .context("managed terminal directory has no terminal id")?;
-    // No longer than the socket it stands in for, so any path the terminal
-    // could bind also fits here.
-    let links = runtime.join("tlinks");
-    create_owned_private_dir(&links, "managed terminal link directory")?;
-    let link = links.join(name);
-    validate_unix_socket_path(&link)?;
-    let source = owned_socket_identity(socket_path)
-        .with_context(|| format!("managed terminal socket {}", socket_path.display()))?;
-    if owned_socket_identity(&link).ok() != Some(source) {
-        match fs::remove_file(&link) {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error).context("remove stale terminal link"),
+    let mut command = match sandbox {
+        TmuxClientSandbox::Unknown => bail!("terminal client sandbox was not resolved"),
+        TmuxClientSandbox::Host => Command::new(tmux),
+        TmuxClientSandbox::Bubblewrap(sandbox_args) => {
+            let mut command = Command::new("bwrap");
+            command
+                .args(sandbox_args)
+                .arg("--die-with-parent")
+                .arg("--")
+                .arg(tmux);
+            command
         }
-        fs::hard_link(socket_path, &link).context("link managed terminal socket")?;
+    };
+    // The client sends its environment to the server; send nothing private.
+    command.env_clear();
+    for name in ["PATH", "LANG", "LC_ALL", "LC_CTYPE"] {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
+        }
     }
-    owned_socket_identity(&link).context("managed terminal socket changed while linking")?;
-    Ok(link)
-}
-
-/// (device, inode) of a socket owned by this user, without following symlinks.
-fn owned_socket_identity(path: &Path) -> Result<(u64, u64)> {
-    let metadata = fs::symlink_metadata(path)?;
-    if !metadata.file_type().is_socket() || metadata.uid() != unsafe { libc::geteuid() } {
-        bail!("{} is not a socket owned by this user", path.display());
-    }
-    Ok((metadata.dev(), metadata.ino()))
+    command.arg("-S").arg(socket_path).args(args);
+    Ok(command)
 }
 
 fn non_empty_field(value: Option<&str>) -> Option<String> {
@@ -9909,31 +9913,53 @@ mod tests {
     }
 
     #[test]
-    fn tmux_clients_never_follow_a_planted_terminal_symlink() {
+    fn sandboxed_terminals_get_sandboxed_tmux_clients() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock after epoch")
             .as_nanos();
-        let runtime =
-            std::env::temp_dir().join(format!("awl-link-{}-{unique}", std::process::id()));
-        let socket = client_terminal_socket_path(&runtime, "t");
-        fs::create_dir_all(socket.parent().expect("terminal dir")).expect("terminal dir");
-        let server = UnixListener::bind(&socket).expect("terminal server");
+        let mut status = status_with_profile_defaults(policy(
+            NetworkPolicy {
+                mode: NetworkMode::Disabled,
+                allow_hosts: Vec::new(),
+            },
+            true,
+            false,
+        ));
+        status.runtime_dir =
+            std::env::temp_dir().join(format!("awl-tclient-{}-{unique}", std::process::id()));
+        let socket = client_terminal_socket_path(&status.runtime_dir, "t");
+        let terminal_dir = socket.parent().expect("terminal dir").to_path_buf();
+        fs::create_dir_all(&terminal_dir).expect("terminal dir");
 
-        let link = trusted_tmux_socket(&socket).expect("link real socket");
-        assert_eq!(link, runtime.join("tlinks").join("t"));
-        UnixStream::connect(&link).expect("link reaches the terminal server");
-        server.accept().expect("accepted through link");
+        let TmuxClientSandbox::Bubblewrap(args) =
+            terminal_client_sandbox(&status, &socket).expect("sandboxed client")
+        else {
+            panic!("sandboxed terminal must get a sandboxed tmux client");
+        };
+        let canonical_dir = fs::canonicalize(&terminal_dir).expect("canonical dir");
+        assert!(args
+            .windows(3)
+            .any(|window| window[0] == "--bind" && Path::new(&window[2]) == canonical_dir));
+        let command = tmux_command(&socket, &TmuxClientSandbox::Bubblewrap(args), &["ls"])
+            .expect("client command");
+        assert_eq!(command.get_program(), "bwrap");
+        assert!(command.get_args().any(|arg| arg == "--die-with-parent"));
+        assert!(command
+            .get_envs()
+            .all(|(name, _)| ["PATH", "LANG", "LC_ALL", "LC_CTYPE"]
+                .contains(&name.to_str().unwrap_or_default())));
 
-        let host = runtime.join("host-tmux.sock");
-        let _host_server = UnixListener::bind(&host).expect("host server");
-        fs::remove_file(&socket).expect("remove terminal socket");
-        std::os::unix::fs::symlink(&host, &socket).expect("planted symlink");
-        assert!(trusted_tmux_socket(&socket).is_err());
+        let legacy = status.runtime_dir.join("terminal-t.tmux.sock");
+        assert!(terminal_client_sandbox(&status, &legacy).is_err());
 
-        let legacy = runtime.join("terminal-t.tmux.sock");
-        assert_eq!(trusted_tmux_socket(&legacy).expect("legacy"), legacy);
-        fs::remove_dir_all(runtime).expect("remove test runtime");
+        status.applied_policy = None;
+        assert_eq!(
+            terminal_client_sandbox(&status, &socket).expect("host client"),
+            TmuxClientSandbox::Host
+        );
+        assert!(tmux_command(&socket, &TmuxClientSandbox::Unknown, &["ls"]).is_err());
+        fs::remove_dir_all(&status.runtime_dir).expect("remove test runtime");
     }
 
     #[test]
