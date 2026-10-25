@@ -111,10 +111,15 @@ pub(crate) fn workspace_environment_variables(status: &WorkspaceStatus) -> Vec<E
     variables
 }
 
+/// Sandboxed launches get the client bus, which carries no compositor
+/// control services. Unsandboxed launches run as the same user with full file
+/// access and could open the control bus anyway; they keep it, as desktop
+/// services such as xdg-desktop-portal-kde need the compositor.
 pub(crate) fn configure_launch_environment(
     command: &mut Command,
     status: &WorkspaceStatus,
     launch_env: &[EnvVar],
+    sandboxed: bool,
 ) {
     scrub_host_session_environment(command);
     for env_var in launch_env {
@@ -130,7 +135,9 @@ pub(crate) fn configure_launch_environment(
         &status.xauthority_path,
         &status.runtime_dir,
     );
-    configure_application_bus(command, status);
+    if sandboxed {
+        configure_application_bus(command, status);
+    }
 }
 
 fn configure_application_bus(command: &mut Command, status: &WorkspaceStatus) {
@@ -646,7 +653,7 @@ mod tests {
         let mut command = Command::new("true");
         command.env("DBUS_SESSION_BUS_ADDRESS", "host-dbus");
 
-        configure_launch_environment(&mut command, &status, &[]);
+        configure_launch_environment(&mut command, &status, &[], true);
 
         let address = command
             .get_envs()
@@ -688,7 +695,7 @@ mod tests {
     }
 
     #[test]
-    fn controllers_attach_to_control_bus_while_apps_get_client_bus() {
+    fn only_sandboxed_apps_get_the_client_bus() {
         let runtime = test_runtime("controller-bus");
         fs::create_dir_all(&runtime).expect("runtime");
         let status = native_status(&runtime, crate::session::SessionBackend::Kwin);
@@ -701,13 +708,22 @@ mod tests {
         assert_eq!(attach.value, control);
 
         let mut command = Command::new("true");
-        configure_launch_environment(&mut command, &status, &[]);
+        configure_launch_environment(&mut command, &status, &[], true);
         let launched = command
             .get_envs()
             .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
             .and_then(|(_, value)| value)
             .expect("app bus");
         assert_eq!(launched.to_string_lossy(), client);
+
+        let mut command = Command::new("true");
+        configure_launch_environment(&mut command, &status, &[], false);
+        let unsandboxed = command
+            .get_envs()
+            .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
+            .and_then(|(_, value)| value)
+            .expect("unsandboxed app bus");
+        assert_eq!(unsandboxed.to_string_lossy(), control);
         fs::remove_dir_all(runtime).expect("remove test runtime");
     }
 
@@ -844,7 +860,7 @@ mod tests {
             std::os::unix::net::UnixListener::bind(&client_bus).expect("native client bus socket");
         let native = native_status(&runtime, crate::session::SessionBackend::Hyprland);
         let mut native_command = Command::new("true");
-        configure_launch_environment(&mut native_command, &native, &[]);
+        configure_launch_environment(&mut native_command, &native, &[], true);
         assert!(native_command
             .get_envs()
             .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
@@ -855,7 +871,7 @@ mod tests {
         let x11 = native_status(&runtime, crate::session::SessionBackend::X11);
         let mut command = Command::new("true");
         command.env("DBUS_SESSION_BUS_ADDRESS", "host-dbus");
-        configure_launch_environment(&mut command, &x11, &[]);
+        configure_launch_environment(&mut command, &x11, &[], true);
 
         let address = command
             .get_envs()

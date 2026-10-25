@@ -198,6 +198,20 @@ impl PrivateSession {
     }
 }
 fn exited_unreaped(pid: u32) -> bool {
+    !matches!(unreaped_exit(pid), UnreapedExit::Running)
+}
+
+pub(crate) enum UnreapedExit {
+    Running,
+    Exited(String),
+    /// Already reaped or not our child.
+    Unknown,
+}
+
+/// Observe a child's exit without reaping it. Startup checks use this so a
+/// dead compositor stays a zombie: its PID, and therefore its process group
+/// number, cannot be recycled before the group is signalled on shutdown.
+pub(crate) fn unreaped_exit(pid: u32) -> UnreapedExit {
     let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
     let result = unsafe {
         libc::waitid(
@@ -207,8 +221,18 @@ fn exited_unreaped(pid: u32) -> bool {
             libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
         )
     };
-    // An error means the child is gone or not ours; stop waiting either way.
-    result != 0 || unsafe { info.si_pid() } != 0
+    if result != 0 {
+        return UnreapedExit::Unknown;
+    }
+    if unsafe { info.si_pid() } == 0 {
+        return UnreapedExit::Running;
+    }
+    let status = unsafe { info.si_status() };
+    UnreapedExit::Exited(if info.si_code == libc::CLD_EXITED {
+        format!("exit status: {status}")
+    } else {
+        format!("signal: {status}")
+    })
 }
 impl Drop for PrivateSession {
     fn drop(&mut self) {

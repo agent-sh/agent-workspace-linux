@@ -156,30 +156,34 @@ pub(crate) fn cleanup_stale_processes(
 }
 
 fn spawn_xvfb(options: &DaemonOptions) -> Result<Child> {
-    Command::new("Xvfb")
+    let mut command = Command::new("Xvfb");
+    command
         .arg(&options.display)
         .args(["-screen", "0"])
         .arg(format!("{}x{}x24", options.width, options.height))
         .args(["-nolisten", "tcp"])
         .arg("-auth")
         .arg(&options.xauthority_path)
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to start Xvfb")
+        .stderr(Stdio::null());
+    // Die with the daemon, like the native compositors, so a killed or crashed
+    // daemon never leaves the display held.
+    super::private::prepare_child(&mut command);
+    command.spawn().context("failed to start Xvfb")
 }
 
 fn spawn_window_manager(options: &DaemonOptions) -> Result<Option<Child>> {
     let Some(command) = first_available_command_name(&["openbox", "i3", "fluxbox"]) else {
         bail!("missing window manager: install openbox, i3, or fluxbox");
     };
-    let child = Command::new(command)
+    let mut child = Command::new(command);
+    child
         .env("DISPLAY", &options.display)
         .env("XAUTHORITY", &options.xauthority_path)
-        .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::null());
+    super::private::prepare_child(&mut child);
+    let child = child
         .spawn()
         .with_context(|| format!("failed to start {command}"))?;
     Ok(Some(child))
@@ -208,7 +212,9 @@ fn wait_for_display(x_server: &mut Child, display: &str, xauthority: &Path) -> R
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if ok {
+        // Another user's server may answer on this number before ours has
+        // failed; only our own lock proves the display is ours.
+        if ok && display_lock_pid(display) == Some(x_server.id()) {
             return Ok(DisplayWait::Ready);
         }
         thread::sleep(Duration::from_millis(100));
@@ -218,16 +224,17 @@ fn wait_for_display(x_server: &mut Child, display: &str, xauthority: &Path) -> R
 
 /// True when the display's X lock names a live server other than ours.
 fn display_held_by_other_server(display: &str, ours: u32) -> bool {
-    let Some(number) = display
-        .strip_prefix(':')
-        .and_then(|n| n.parse::<u32>().ok())
-    else {
-        return false;
-    };
-    std::fs::read_to_string(format!("/tmp/.X{number}-lock"))
-        .ok()
-        .and_then(|text| text.trim().parse::<u32>().ok())
+    display_lock_pid(display)
         .is_some_and(|pid| pid != ours && Path::new(&format!("/proc/{pid}")).exists())
+}
+
+fn display_lock_pid(display: &str) -> Option<u32> {
+    let number = display.strip_prefix(':')?.parse::<u32>().ok()?;
+    std::fs::read_to_string(format!("/tmp/.X{number}-lock"))
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
 }
 
 #[cfg(test)]

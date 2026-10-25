@@ -244,7 +244,10 @@ impl KwinSession {
         wait_for(
             Duration::from_secs(15),
             || {
-                if let Some(status) = session.private.compositor.as_mut().unwrap().try_wait()? {
+                let pid = session.private.compositor.as_ref().unwrap().id();
+                if let super::private::UnreapedExit::Exited(status) =
+                    super::private::unreaped_exit(pid)
+                {
                     bail!(
                         "KWin exited with {status}; see {}",
                         runtime.join("kwin.log").display()

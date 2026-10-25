@@ -145,9 +145,12 @@ Install `i3-wm` and the X11 dependencies, including ImageMagick `import`.
 binary with `AGENT_WORKSPACE_BIN` to check the real private session and restricted apps.
 
 Sandboxed apps use private process namespaces and receive only the workspace
-display, application bus, accessibility bus, and shared client data. Network-only
-profiles retain normal host file access while hiding this workspace's control
-sockets and compositor settings. Compositor methods stay on a separate control bus.
+display, an application bus without compositor methods, the accessibility bus,
+and, for a managed terminal, that terminal's own socket directory. Network-only
+profiles keep normal host file access but hide every workspace runtime and the
+host desktop IPC (session and system bus, X11 sockets, IBus). Unsandboxed apps
+and attached controllers such as computer-use-linux use the compositor control
+bus, as in a regular desktop session.
 
 Managed terminal sessions end when their workspace stops, even after the terminal
 window has closed. Stale cleanup uses the saved launch and session identity.
