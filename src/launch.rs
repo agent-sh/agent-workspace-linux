@@ -61,6 +61,9 @@ pub(crate) fn scrub_host_session_environment(command: &mut Command) {
     }
 }
 
+/// The attach environment for trusted external controllers (the agent host,
+/// computer-use-linux). It keeps the compositor-facing session bus; only apps
+/// launched into the workspace are switched to the client bus.
 pub(crate) fn workspace_environment_variables(status: &WorkspaceStatus) -> Vec<EnvVar> {
     let mut variables = vec![
         EnvVar {
@@ -95,7 +98,6 @@ pub(crate) fn workspace_environment_variables(status: &WorkspaceStatus) -> Vec<E
         &status.xauthority_path,
         &status.runtime_dir,
     );
-    configure_application_bus(&mut command, status);
     for (name, value) in command.get_envs() {
         let name = name.to_string_lossy().to_string();
         variables.retain(|entry| entry.name != name);
@@ -682,6 +684,30 @@ mod tests {
             assert!(error.to_string().contains("client bus is unavailable"));
         }
 
+        fs::remove_dir_all(runtime).expect("remove test runtime");
+    }
+
+    #[test]
+    fn controllers_attach_to_control_bus_while_apps_get_client_bus() {
+        let runtime = test_runtime("controller-bus");
+        fs::create_dir_all(&runtime).expect("runtime");
+        let status = native_status(&runtime, crate::session::SessionBackend::Kwin);
+        let control = crate::session::private::socket_address(&runtime.join("session-bus"));
+        let client = crate::session::private::socket_address(&runtime.join("client-bus"));
+        let attach = workspace_environment_variables(&status)
+            .into_iter()
+            .find(|var| var.name == "DBUS_SESSION_BUS_ADDRESS")
+            .expect("attach bus");
+        assert_eq!(attach.value, control);
+
+        let mut command = Command::new("true");
+        configure_launch_environment(&mut command, &status, &[]);
+        let launched = command
+            .get_envs()
+            .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
+            .and_then(|(_, value)| value)
+            .expect("app bus");
+        assert_eq!(launched.to_string_lossy(), client);
         fs::remove_dir_all(runtime).expect("remove test runtime");
     }
 

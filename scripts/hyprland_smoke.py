@@ -104,7 +104,9 @@ for scale in (1, 1.5):
         env = workspace(id, "env")["environment"]["variables"]
         env = {entry["name"]: entry["value"] for entry in env}
         assert env["XDG_SESSION_TYPE"] == "wayland"
-        assert env["DBUS_SESSION_BUS_ADDRESS"].endswith(f"/{id}/client-bus")
+        # Attached controllers (computer-use-linux) need the compositor bus;
+        # launched apps get client-bus instead (runtime_isolation_smoke.py).
+        assert env["DBUS_SESSION_BUS_ADDRESS"].endswith(f"/{id}/session-bus")
         assert env["WAYLAND_DISPLAY"] == "workspace-wayland"
         assert env["QT_QPA_PLATFORM"] == "wayland"
         bus_env = dict(os.environ, **env)
