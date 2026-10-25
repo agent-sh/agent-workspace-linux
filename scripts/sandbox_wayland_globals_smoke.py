@@ -42,6 +42,15 @@ def cmd(*args):
     return value
 
 
+def descends(pid, ancestor):
+    while pid and pid != ancestor:
+        try:
+            pid = int(Path(f"/proc/{pid}/stat").read_text().rsplit(") ", 1)[1].split()[1])
+        except (FileNotFoundError, ValueError):
+            return False
+    return pid == ancestor
+
+
 def run_probe(id, profile):
     start = ["workspace", "start", "--id", id, "--ack-hidden-workspace"]
     if profile is None:
@@ -55,8 +64,13 @@ def run_probe(id, profile):
     try:
         # The test process itself reaches the unfiltered main socket. Its
         # privileged names are what a sandboxed app would try to guess.
+        runtime = Path(status["runtime_dir"])
+        display = "workspace-wayland"
+        if not (runtime / display).exists():
+            # COSMIC names its compositor socket at startup.
+            display = json.loads((runtime / "cosmic-client.json").read_text())["WAYLAND_DISPLAY"]
         main = subprocess.run(["python3", "-c", PROBE], capture_output=True, text=True, timeout=30,
-                              env=dict(ENV, XDG_RUNTIME_DIR=status["runtime_dir"], WAYLAND_DISPLAY="workspace-wayland"))
+                              env=dict(ENV, XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY=display))
         assert main.returncode == 0, main
         names = json.loads(main.stdout)["names"]
         guesses = {name: interface for name, interface in names.items() if interface in PRIVILEGED}
@@ -80,8 +94,13 @@ def run_probe(id, profile):
             host_note = ROOT / "project" / f"{id}.txt"
             host_note.write_text("")
             note = f"/workspace/project/{id}.txt" if profile.get("mounts") else str(host_note)
-            cmd("workspace", "launch", "--id", id, "--wait-window", "--window-timeout-ms", 15000, "--", "kwrite", note)
+            launch = cmd("workspace", "launch", "--id", id, "--wait-window", "--window-timeout-ms", 15000,
+                         "--", "kwrite", note)
             window = next(w for w in cmd("workspace", "windows", "--id", id)["windows"] if host_note.name in w["title"])
+            # The compositor sees the relay; the window must still report
+            # the sandboxed app's own process, never the daemon.
+            assert window["pid"] != status["daemon_pid"], window
+            assert descends(window["pid"], launch["apps"][0]["pid"]), (window, launch["apps"][0])
             cmd("workspace", "focus-window", "--id", id, window["id"])
             cmd("workspace", "type", "--id", id, "filtered Wayland input")
             cmd("workspace", "paste", "--id", id, " and paste")

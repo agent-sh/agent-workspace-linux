@@ -11,5 +11,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-xfixes0 libxcb-randr0 libxcb-shape0 libxcb-xkb1 libxcb-render0 \
     libxcb-present0 libxcb-dri3-0 libx11-xcb1 procps wayland-utils \
     && rm -rf /var/lib/apt/lists/*
-COPY cosmic_smoke.py cosmic_fixture.py kwin_mcp.py runtime_isolation_smoke.py /opt/cosmic-probe/
+COPY cosmic_smoke.py cosmic_fixture.py kwin_mcp.py runtime_isolation_smoke.py sandbox_wayland_globals_smoke.py wayland_globals_probe.py /opt/cosmic-probe/
 ENTRYPOINT ["python3", "/opt/cosmic-probe/cosmic_smoke.py"]

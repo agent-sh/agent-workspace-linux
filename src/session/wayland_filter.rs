@@ -8,18 +8,26 @@
 //! sandboxed client is therefore relayed over a security-context connection,
 //! and the relay forwards only allow-listed globals and refuses binds of any
 //! other name. The daemon's own helpers keep the unfiltered main socket.
+//!
+//! Compositors take a window's pid from the credentials of its connection.
+//! The relay's upstream connection is therefore made by a small holder
+//! process forked per client, and window pids are mapped from that holder
+//! back to the sandboxed client, so no window reports the daemon's pid.
 use anyhow::{bail, Context, Result};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fs, io,
     mem::{size_of, zeroed},
     os::{
         fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd},
-        unix::net::{UnixListener, UnixStream},
+        unix::{
+            ffi::OsStrExt,
+            net::{UnixListener, UnixStream},
+        },
     },
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     thread::JoinHandle,
@@ -42,8 +50,22 @@ const UPSTREAM: &str = "sandbox-wayland-sc";
 const ENGINE: &str = "org.agent_sh.workspace";
 // Must not name a desktop entry: KWin grants X-KDE-Wayland-Interfaces by it.
 const APP_ID: &str = "org.agent_sh.Workspace.Sandbox";
-/// libwayland reads at most 28 file descriptors per recvmsg.
+/// libwayland's MAX_FDS_OUT: a peer reads at most 28 descriptors per recvmsg.
 const MAX_FDS: usize = 28;
+/// libwayland's WL_MAX_MESSAGE_SIZE; both ends drop larger messages.
+const MAX_MESSAGE: usize = 4096;
+/// A libwayland peer's whole descriptor ring (WL_BUFFER_DEFAULT_MAX_SIZE
+/// bytes of 4-byte fds). libwayland sends queued descriptors 28 at a time with
+/// one byte each before the messages that carry them, so a well-behaved
+/// client can have this many queued while its next message is incomplete.
+const MAX_QUEUED_FDS: usize = 1024;
+/// Each sandboxed Wayland client process holds one connection; an agent
+/// workspace runs a handful of GUI apps. Every connection costs three
+/// descriptors, two threads and a holder process.
+const MAX_CONNECTIONS: usize = 64;
+/// The holder's process name (at most 15 bytes), so a holder pid without a
+/// live mapping is never reported as a window's pid.
+const HOLDER_NAME: &str = "awl-wl-holder";
 
 /// Globals an ordinary app window needs. Anything else, including protocols
 /// a future compositor adds, stays hidden from sandboxed apps.
@@ -114,11 +136,56 @@ pub(crate) fn sandbox_socket(runtime: &Path, main: &str) -> (PathBuf, PathBuf) {
     (runtime.join(SOCKET), runtime.join(main))
 }
 
+/// Holder pid -> sandboxed client pid, for every live relayed connection.
+static PEERS: Mutex<BTreeMap<u32, u32>> = Mutex::new(BTreeMap::new());
+
+/// The pid a window should report, given the pid its compositor reports.
+/// Relayed windows map to their sandboxed client; the daemon itself and
+/// holders without a live mapping report none.
+pub(crate) fn window_pid(pid: Option<u32>) -> Option<u32> {
+    let pid = pid?;
+    if pid == std::process::id() {
+        return None;
+    }
+    if let Some(client) = PEERS.lock().ok().and_then(|peers| peers.get(&pid).copied()) {
+        return (client != 0).then_some(client);
+    }
+    let holder = fs::read_to_string(format!("/proc/{pid}/comm"))
+        .is_ok_and(|comm| comm.trim_end() == HOLDER_NAME);
+    (!holder).then_some(pid)
+}
+
+/// Descriptor budgets, from the daemon's soft RLIMIT_NOFILE, so relayed
+/// clients cannot exhaust the descriptors the daemon needs for its own IPC,
+/// spawns and capture.
+#[derive(Clone, Copy)]
+struct Limits {
+    connections: usize,
+    queued_fds: usize,
+}
+
+impl Limits {
+    fn from_rlimit() -> Self {
+        let mut limit: libc::rlimit = unsafe { zeroed() };
+        let soft = if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) } == 0 {
+            limit.rlim_cur as usize
+        } else {
+            1024
+        };
+        // At most a quarter of the descriptors for queued client fds and a
+        // sixteenth (three each) for connections; the rest stays the daemon's.
+        Self {
+            connections: MAX_CONNECTIONS.min(soft / 48).max(1),
+            queued_fds: MAX_QUEUED_FDS.min(soft / 4),
+        }
+    }
+}
+
 pub(crate) struct WaylandFilter {
     runtime: PathBuf,
     listener: Arc<UnixListener>,
     stop: Arc<AtomicBool>,
-    clients: Arc<Mutex<HashMap<u64, UnixStream>>>,
+    links: Arc<Mutex<HashMap<u64, Arc<Link>>>>,
     accept: Option<JoinHandle<()>>,
     // The compositor stops accepting on the security context once this
     // write end of its close_fd pipe is gone.
@@ -126,15 +193,14 @@ pub(crate) struct WaylandFilter {
 }
 
 impl WaylandFilter {
+    /// Creates a security context on `main` and relays sandboxed clients over it.
     pub(crate) fn start(runtime: &Path, main: &Path) -> Result<Self> {
-        for name in [SOCKET, UPSTREAM] {
-            let path = runtime.join(name);
-            if path.symlink_metadata().is_ok() {
-                fs::remove_file(&path)?;
-            }
+        let upstream_path = runtime.join(UPSTREAM);
+        if upstream_path.symlink_metadata().is_ok() {
+            fs::remove_file(&upstream_path)?;
         }
-        let upstream = UnixListener::bind(runtime.join(UPSTREAM))
-            .context("bind sandbox security-context socket")?;
+        let upstream =
+            UnixListener::bind(&upstream_path).context("bind sandbox security-context socket")?;
         let mut pipe = [0; 2];
         if unsafe { libc::pipe2(pipe.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
             return Err(io::Error::last_os_error().into());
@@ -149,25 +215,36 @@ impl WaylandFilter {
             .context("create the sandbox Wayland security context")?;
         // The compositor holds its own copies of both descriptors now.
         drop((upstream, close_read));
-        let listener = Arc::new(
-            UnixListener::bind(runtime.join(SOCKET)).context("bind sandbox Wayland socket")?,
-        );
+        let mut filter = Self::relay(runtime, &upstream_path)?;
+        filter.close = Some(close_write);
+        Ok(filter)
+    }
+
+    /// Relays sandboxed clients to an existing security-context socket.
+    pub(crate) fn relay(runtime: &Path, upstream: &Path) -> Result<Self> {
+        let path = runtime.join(SOCKET);
+        if path.symlink_metadata().is_ok() {
+            fs::remove_file(&path)?;
+        }
+        let address = SocketAddress::new(upstream)?;
+        let listener = Arc::new(UnixListener::bind(&path).context("bind sandbox Wayland socket")?);
         let stop = Arc::new(AtomicBool::new(false));
-        let clients = Arc::new(Mutex::new(HashMap::new()));
+        let links = Arc::new(Mutex::new(HashMap::new()));
         let accept = {
-            let (listener, stop, clients) = (listener.clone(), stop.clone(), clients.clone());
-            let upstream = runtime.join(UPSTREAM);
+            let (listener, stop, links) = (listener.clone(), stop.clone(), links.clone());
             std::thread::Builder::new()
                 .name("sandbox-wayland".into())
-                .spawn(move || accept_loop(&listener, &upstream, &stop, &clients))?
+                .spawn(move || {
+                    accept_loop(&listener, &address, &stop, &links, Limits::from_rlimit())
+                })?
         };
         Ok(Self {
             runtime: runtime.to_path_buf(),
             listener,
             stop,
-            clients,
+            links,
             accept: Some(accept),
-            close: Some(close_write),
+            close: None,
         })
     }
 
@@ -180,13 +257,13 @@ impl WaylandFilter {
         if let Some(accept) = self.accept.take() {
             let _ = accept.join();
         }
-        let clients = self
-            .clients
+        let links = self
+            .links
             .lock()
             .map(|mut list| std::mem::take(&mut *list))
             .unwrap_or_default();
-        for client in clients.values() {
-            let _ = client.shutdown(std::net::Shutdown::Both);
+        for link in links.values() {
+            link.close();
         }
         self.close.take();
         for name in [SOCKET, UPSTREAM] {
@@ -243,12 +320,178 @@ fn security_context(
     Ok(())
 }
 
+/// A sockaddr_un built before fork, so the holder needs no allocation.
+struct SocketAddress {
+    address: libc::sockaddr_un,
+    length: libc::socklen_t,
+}
+
+impl SocketAddress {
+    fn new(path: &Path) -> Result<Self> {
+        let mut address: libc::sockaddr_un = unsafe { zeroed() };
+        address.sun_family = libc::AF_UNIX as libc::sa_family_t;
+        let bytes = path.as_os_str().as_bytes();
+        if bytes.len() >= address.sun_path.len() {
+            bail!(
+                "sandbox Wayland upstream path is too long: {}",
+                path.display()
+            );
+        }
+        for (target, byte) in address.sun_path.iter_mut().zip(bytes) {
+            *target = *byte as libc::c_char;
+        }
+        let length = (size_of::<libc::sa_family_t>() + bytes.len() + 1) as libc::socklen_t;
+        Ok(Self { address, length })
+    }
+}
+
+/// The holder process whose credentials the compositor sees for one client.
+struct Holder {
+    pid: libc::pid_t,
+    control: Option<UnixStream>,
+}
+
+impl Drop for Holder {
+    fn drop(&mut self) {
+        if let Ok(mut peers) = PEERS.lock() {
+            peers.remove(&(self.pid as u32));
+        }
+        // A holder still blocked in connect(2) never reads its control
+        // socket, so end it outright before reaping.
+        self.control.take();
+        unsafe {
+            libc::kill(self.pid, libc::SIGKILL);
+            libc::waitpid(self.pid, std::ptr::null_mut(), 0);
+        }
+    }
+}
+
+/// Forks a holder that connects to `upstream` and passes the connection back.
+fn connect_through_holder(
+    upstream: &SocketAddress,
+    client_pid: u32,
+) -> io::Result<(UnixStream, Holder)> {
+    let (control, child) = UnixStream::pair()?;
+    let child_fd = child.as_raw_fd();
+    let pid = unsafe { libc::fork() };
+    if pid == 0 {
+        unsafe { holder(child_fd, upstream) }
+    }
+    if pid < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    drop(child);
+    let holder = Holder {
+        pid,
+        control: Some(control),
+    };
+    // Register before the compositor can see a window from this connection.
+    if let Ok(mut peers) = PEERS.lock() {
+        peers.insert(pid as u32, client_pid);
+    }
+    let control = holder.control.as_ref().unwrap();
+    control.set_read_timeout(Some(Duration::from_secs(5)))?;
+    let mut fds = Vec::new();
+    let mut byte = [0u8; 1];
+    let read = receive(control.as_raw_fd(), &mut byte, &mut fds)?;
+    match (read, fds.pop()) {
+        (1, Some(fd)) if fds.is_empty() => Ok((UnixStream::from(fd), holder)),
+        _ => Err(invalid("sandbox Wayland holder did not connect")),
+    }
+}
+
+/// The forked holder. The daemon is multi-threaded, so this uses only
+/// async-signal-safe system calls and never returns.
+unsafe fn holder(control: RawFd, upstream: &SocketAddress) -> ! {
+    // Keep only the control socket: inherited copies of other relays'
+    // descriptors would hold their connections open.
+    if control > 0 {
+        libc::close_range(0, control as libc::c_uint - 1, 0);
+    }
+    libc::close_range(control as libc::c_uint + 1, libc::c_uint::MAX, 0);
+    let mut name = [0u8; 16];
+    name[..HOLDER_NAME.len()].copy_from_slice(HOLDER_NAME.as_bytes());
+    libc::prctl(libc::PR_SET_NAME, name.as_ptr());
+    // Daemon signal handlers must not run in the holder.
+    let default: libc::sigaction = zeroed();
+    for signal in 1..32 {
+        if signal != libc::SIGKILL && signal != libc::SIGSTOP {
+            libc::sigaction(signal, &default, std::ptr::null_mut());
+        }
+    }
+    let socket = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
+    if socket < 0
+        || libc::connect(
+            socket,
+            (&upstream.address as *const libc::sockaddr_un).cast(),
+            upstream.length,
+        ) < 0
+    {
+        libc::_exit(1);
+    }
+    let mut byte = [0u8; 1];
+    let mut iov = libc::iovec {
+        iov_base: byte.as_mut_ptr().cast(),
+        iov_len: 1,
+    };
+    let mut control_buffer = [0u64; 4];
+    let mut message: libc::msghdr = zeroed();
+    message.msg_iov = &mut iov;
+    message.msg_iovlen = 1;
+    message.msg_control = control_buffer.as_mut_ptr().cast();
+    message.msg_controllen = libc::CMSG_SPACE(size_of::<libc::c_int>() as u32) as usize;
+    let header = libc::CMSG_FIRSTHDR(&message);
+    (*header).cmsg_level = libc::SOL_SOCKET;
+    (*header).cmsg_type = libc::SCM_RIGHTS;
+    (*header).cmsg_len = libc::CMSG_LEN(size_of::<libc::c_int>() as u32) as usize;
+    libc::CMSG_DATA(header)
+        .cast::<libc::c_int>()
+        .write_unaligned(socket);
+    if libc::sendmsg(control, &message, libc::MSG_NOSIGNAL) != 1 {
+        libc::_exit(1);
+    }
+    libc::close(socket);
+    // Stay alive, so the pid the compositor recorded stays this process,
+    // until the daemon closes the control socket or exits.
+    loop {
+        let read = libc::read(control, byte.as_mut_ptr().cast(), 1);
+        if read == 0 || (read < 0 && *libc::__errno_location() != libc::EINTR) {
+            libc::_exit(0);
+        }
+    }
+}
+
+fn peer_pid(stream: &UnixStream) -> u32 {
+    let mut credentials: libc::ucred = unsafe { zeroed() };
+    let mut length = size_of::<libc::ucred>() as libc::socklen_t;
+    let ok = unsafe {
+        libc::getsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_PEERCRED,
+            (&mut credentials as *mut libc::ucred).cast(),
+            &mut length,
+        )
+    };
+    // Credentials are translated into the daemon's pid namespace.
+    if ok == 0 {
+        credentials.pid as u32
+    } else {
+        0
+    }
+}
+
 fn accept_loop(
     listener: &UnixListener,
-    upstream: &Path,
+    upstream: &SocketAddress,
     stop: &AtomicBool,
-    clients: &Arc<Mutex<HashMap<u64, UnixStream>>>,
+    links: &Arc<Mutex<HashMap<u64, Arc<Link>>>>,
+    limits: Limits,
 ) {
+    let budget = Arc::new(Budget {
+        queued: AtomicUsize::new(0),
+        limit: limits.queued_fds,
+    });
     for (id, client) in (0u64..).zip(listener.incoming()) {
         if stop.load(Ordering::SeqCst) {
             return;
@@ -258,90 +501,144 @@ fn accept_loop(
             std::thread::sleep(Duration::from_millis(50));
             continue;
         };
-        let Ok(server) = UnixStream::connect(upstream) else {
+        if links
+            .lock()
+            .map_or(true, |list| list.len() >= limits.connections)
+        {
+            continue;
+        }
+        let Ok((server, holder)) = connect_through_holder(upstream, peer_pid(&client)) else {
             continue;
         };
-        let Ok(copy) = client.try_clone() else {
-            continue;
-        };
-        if let Ok(mut list) = clients.lock() {
-            list.insert(id, copy);
+        let link = Arc::new(Link { client, server });
+        if let Ok(mut list) = links.lock() {
+            list.insert(id, link.clone());
         }
         let forget = {
-            let clients = clients.clone();
+            let links = links.clone();
             move || {
-                if let Ok(mut list) = clients.lock() {
+                if let Ok(mut list) = links.lock() {
                     list.remove(&id);
                 }
             }
         };
-        if relay(client, server, forget).is_err() {
-            if let Ok(mut list) = clients.lock() {
+        if relay(link, holder, budget.clone(), forget).is_err() {
+            if let Ok(mut list) = links.lock() {
                 list.remove(&id);
             }
         }
     }
 }
 
+/// Queued client descriptors across every connection of one filter.
+struct Budget {
+    queued: AtomicUsize,
+    limit: usize,
+}
+
+struct Link {
+    client: UnixStream,
+    server: UnixStream,
+}
+
+impl Link {
+    fn close(&self) {
+        let _ = self.client.shutdown(std::net::Shutdown::Both);
+        let _ = self.server.shutdown(std::net::Shutdown::Both);
+    }
+}
+
 #[derive(Default)]
 struct State {
-    registries: HashSet<u32>,
-    names: HashSet<u32>,
+    /// Names each registry was shown, with their interfaces. A removed name
+    /// stays bindable: a bind can race global_remove, and the compositor
+    /// gives such a bind an inert object.
+    registries: HashMap<u32, HashMap<u32, String>>,
 }
 
 /// Relays one client in two threads. Either direction ending closes both.
 fn relay(
-    client: UnixStream,
-    server: UnixStream,
+    link: Arc<Link>,
+    holder: Holder,
+    budget: Arc<Budget>,
     finished: impl FnOnce() + Send + 'static,
 ) -> io::Result<()> {
     let state = Arc::new(Mutex::new(State::default()));
-    let close = |streams: &[&UnixStream; 2]| {
-        for stream in streams {
-            let _ = stream.shutdown(std::net::Shutdown::Both);
-        }
+    let (requests_link, requests) = (link.clone(), state.clone());
+    let thread = |name: &str| {
+        std::thread::Builder::new()
+            .name(name.into())
+            .stack_size(256 * 1024)
     };
-    let (client_in, server_out) = (client.try_clone()?, server.try_clone()?);
-    let requests = state.clone();
-    std::thread::Builder::new()
-        .name("sandbox-wayland-requests".into())
-        .spawn(move || {
-            let _ = pump(&client_in, &server_out, |buffer| {
-                filter_requests(buffer, &requests)
-            });
-            close(&[&client_in, &server_out]);
-        })?;
-    std::thread::Builder::new()
-        .name("sandbox-wayland-events".into())
-        .spawn(move || {
-            let _ = pump(&server, &client, |buffer| filter_events(buffer, &state));
-            close(&[&client, &server]);
-            finished();
-        })?;
+    thread("sandbox-wayland-requests").spawn(move || {
+        let _ = pump(
+            &requests_link.client,
+            &requests_link.server,
+            Some(&budget),
+            |buffer| filter_requests(buffer, &requests),
+        );
+        requests_link.close();
+    })?;
+    thread("sandbox-wayland-events").spawn(move || {
+        let _ = pump(&link.server, &link.client, None, |buffer| {
+            filter_events(buffer, &state)
+        });
+        link.close();
+        drop(holder);
+        finished();
+    })?;
     Ok(())
 }
 
 /// Moves complete messages from `from` to `to`. `filter` takes the buffer,
 /// returns the bytes to forward and leaves any partial message in place.
+/// Queued descriptors count against `budget`, when given, and the
+/// per-connection cap.
 fn pump(
     from: &UnixStream,
     to: &UnixStream,
+    budget: Option<&Budget>,
     mut filter: impl FnMut(&mut Vec<u8>) -> io::Result<Vec<u8>>,
 ) -> io::Result<()> {
     let mut buffer = Vec::new();
     let mut fds = Vec::new();
-    let mut chunk = vec![0u8; 65536];
-    loop {
-        let read = receive(from.as_raw_fd(), &mut chunk, &mut fds)?;
-        if read == 0 {
-            return Ok(());
+    let mut counted = 0;
+    let result = (|| {
+        let mut chunk = vec![0u8; 65536];
+        loop {
+            let read = receive(from.as_raw_fd(), &mut chunk, &mut fds)?;
+            if let Some(budget) = budget {
+                let added = fds.len() - counted;
+                counted = fds.len();
+                if budget.queued.fetch_add(added, Ordering::SeqCst) + added > budget.limit {
+                    return Err(invalid("sandboxed clients queued too many descriptors"));
+                }
+            }
+            if fds.len() > MAX_QUEUED_FDS {
+                return Err(invalid(
+                    "too many descriptors queued without their messages",
+                ));
+            }
+            if read == 0 {
+                return Ok(());
+            }
+            buffer.extend_from_slice(&chunk[..read]);
+            let out = filter(&mut buffer)?;
+            if !out.is_empty() {
+                transmit(to.as_raw_fd(), &out, &mut fds)?;
+                if let Some(budget) = budget {
+                    budget
+                        .queued
+                        .fetch_sub(counted - fds.len(), Ordering::SeqCst);
+                    counted = fds.len();
+                }
+            }
         }
-        buffer.extend_from_slice(&chunk[..read]);
-        let out = filter(&mut buffer)?;
-        if !out.is_empty() {
-            transmit(to.as_raw_fd(), &out, &mut fds)?;
-        }
+    })();
+    if let Some(budget) = budget {
+        budget.queued.fetch_sub(counted, Ordering::SeqCst);
     }
+    result
 }
 
 fn word(buffer: &[u8], offset: usize) -> u32 {
@@ -363,7 +660,7 @@ fn messages(
     while buffer.len() - offset >= 8 {
         let header = word(buffer, offset + 4);
         let size = (header >> 16) as usize;
-        if size < 8 || !size.is_multiple_of(4) {
+        if size < 8 || !size.is_multiple_of(4) || size > MAX_MESSAGE {
             return Err(invalid("malformed Wayland message"));
         }
         if buffer.len() - offset < size {
@@ -387,23 +684,27 @@ fn string(body: &[u8], offset: usize) -> Option<&str> {
     std::str::from_utf8(bytes).ok()
 }
 
+fn name(body: &[u8]) -> io::Result<u32> {
+    let name = body
+        .get(..4)
+        .ok_or_else(|| invalid("short registry message"))?;
+    Ok(u32::from_ne_bytes(name.try_into().unwrap()))
+}
+
 fn filter_requests(buffer: &mut Vec<u8>, state: &Mutex<State>) -> io::Result<Vec<u8>> {
     messages(buffer, |object, opcode, body| {
         let mut state = state.lock().map_err(|_| invalid("filter state poisoned"))?;
         if object == 1 && opcode == 1 {
             // wl_display.get_registry(new_id)
-            let id = body.get(..4).ok_or_else(|| invalid("short get_registry"))?;
-            state
-                .registries
-                .insert(u32::from_ne_bytes(id.try_into().unwrap()));
-        } else if opcode == 0 && state.registries.contains(&object) {
-            // wl_registry.bind(name, interface, version, new_id): only names
-            // this client was shown, under the advertised interface.
-            let name = body.get(..4).ok_or_else(|| invalid("short bind"))?;
-            let name = u32::from_ne_bytes(name.try_into().unwrap());
-            let interface = string(body, 4).ok_or_else(|| invalid("bad bind"))?;
-            if !state.names.contains(&name) || !ALLOWED.contains(&interface) {
-                return Err(invalid("sandboxed client bound a hidden global"));
+            state.registries.entry(name(body)?).or_default();
+        } else if opcode == 0 {
+            if let Some(shown) = state.registries.get(&object) {
+                // wl_registry.bind(name, interface, version, new_id): only
+                // names this registry was shown, under that interface.
+                let interface = string(body, 4).ok_or_else(|| invalid("bad bind"))?;
+                if shown.get(&name(body)?).map(String::as_str) != Some(interface) {
+                    return Err(invalid("sandboxed client bound a hidden global"));
+                }
             }
         }
         Ok(true)
@@ -413,24 +714,22 @@ fn filter_requests(buffer: &mut Vec<u8>, state: &Mutex<State>) -> io::Result<Vec
 fn filter_events(buffer: &mut Vec<u8>, state: &Mutex<State>) -> io::Result<Vec<u8>> {
     messages(buffer, |object, opcode, body| {
         let mut state = state.lock().map_err(|_| invalid("filter state poisoned"))?;
-        if !state.registries.contains(&object) || opcode > 1 {
+        let Some(shown) = state.registries.get_mut(&object) else {
             return Ok(true);
-        }
-        let name = body
-            .get(..4)
-            .ok_or_else(|| invalid("short registry event"))?;
-        let name = u32::from_ne_bytes(name.try_into().unwrap());
-        if opcode == 0 {
-            // wl_registry.global(name, interface, version)
-            let interface = string(body, 4).ok_or_else(|| invalid("bad global"))?;
-            if !ALLOWED.contains(&interface) {
-                return Ok(false);
+        };
+        match opcode {
+            0 => {
+                // wl_registry.global(name, interface, version)
+                let interface = string(body, 4).ok_or_else(|| invalid("bad global"))?;
+                if !ALLOWED.contains(&interface) {
+                    return Ok(false);
+                }
+                shown.insert(name(body)?, interface.to_owned());
+                Ok(true)
             }
-            state.names.insert(name);
-            Ok(true)
-        } else {
-            // wl_registry.global_remove(name): only for names shown.
-            Ok(state.names.remove(&name))
+            // wl_registry.global_remove(name): only for names this registry showed.
+            1 => Ok(shown.contains_key(&name(body)?)),
+            _ => Ok(true),
         }
     })
 }
@@ -476,14 +775,19 @@ fn receive(fd: RawFd, buffer: &mut [u8], fds: &mut Vec<OwnedFd>) -> io::Result<u
     Ok(read)
 }
 
-/// Sends `data`, attaching queued descriptors at most MAX_FDS per sendmsg.
-/// A descriptor may arrive before the message that uses it, never after.
+/// Sends `data`, attaching queued descriptors at most MAX_FDS per sendmsg,
+/// with one byte per batch while more data follows, as libwayland does. A
+/// descriptor may arrive before the message that uses it, never after, so
+/// descriptors left when the data runs out stay queued for later messages.
 fn transmit(fd: RawFd, data: &[u8], fds: &mut Vec<OwnedFd>) -> io::Result<()> {
     let mut sent = 0;
     while sent < data.len() {
         let batch: Vec<OwnedFd> = fds.drain(..fds.len().min(MAX_FDS)).collect();
-        // Carry each descriptor batch with a single byte while more remain.
-        let end = if fds.is_empty() { data.len() } else { sent + 1 };
+        let end = if !fds.is_empty() && data.len() - sent > 1 {
+            sent + 1
+        } else {
+            data.len()
+        };
         let mut iov = libc::iovec {
             iov_base: data[sent..end].as_ptr() as *mut _,
             iov_len: end - sent,
@@ -520,9 +824,6 @@ fn transmit(fd: RawFd, data: &[u8], fds: &mut Vec<OwnedFd>) -> io::Result<()> {
         sent += written;
         // The kernel duplicated the batch into the peer; ours close here.
         drop(batch);
-    }
-    if !fds.is_empty() {
-        return Err(invalid("descriptors left without data"));
     }
     Ok(())
 }
@@ -575,6 +876,81 @@ mod tests {
         message(registry, 0, &body)
     }
 
+    fn send_fds(stream: &UnixStream, data: &[u8], count: usize) -> io::Result<()> {
+        let null = fs::File::open("/dev/null").unwrap();
+        let mut fds = (0..count)
+            .map(|_| OwnedFd::from(null.try_clone().unwrap()))
+            .collect::<Vec<_>>();
+        transmit(stream.as_raw_fd(), data, &mut fds)
+    }
+
+    /// An accept loop relaying to a local upstream listener.
+    struct Harness {
+        dir: PathBuf,
+        upstream: UnixListener,
+        listener: Arc<UnixListener>,
+        stop: Arc<AtomicBool>,
+        thread: Option<JoinHandle<()>>,
+    }
+
+    impl Harness {
+        fn new(name: &str, limits: Limits) -> Self {
+            let dir = std::env::temp_dir().join(format!("awl-wf-{name}-{}", std::process::id()));
+            let _ = fs::remove_dir_all(&dir);
+            fs::create_dir_all(&dir).unwrap();
+            let upstream = UnixListener::bind(dir.join("up")).unwrap();
+            let listener = Arc::new(UnixListener::bind(dir.join("in")).unwrap());
+            let address = SocketAddress::new(&dir.join("up")).unwrap();
+            let stop = Arc::new(AtomicBool::new(false));
+            let thread = {
+                let (listener, stop) = (listener.clone(), stop.clone());
+                let links = Arc::new(Mutex::new(HashMap::new()));
+                std::thread::spawn(move || accept_loop(&listener, &address, &stop, &links, limits))
+            };
+            Self {
+                dir,
+                upstream,
+                listener,
+                stop,
+                thread: Some(thread),
+            }
+        }
+
+        fn connect(&self) -> (UnixStream, UnixStream) {
+            let client = UnixStream::connect(self.dir.join("in")).unwrap();
+            let (server, _) = self.upstream.accept().unwrap();
+            for stream in [&client, &server] {
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(5)))
+                    .unwrap();
+            }
+            (client, server)
+        }
+    }
+
+    impl Drop for Harness {
+        fn drop(&mut self) {
+            self.stop.store(true, Ordering::SeqCst);
+            unsafe {
+                libc::shutdown(self.listener.as_raw_fd(), libc::SHUT_RDWR);
+            }
+            let _ = self.thread.take().unwrap().join();
+            let _ = fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    const OPEN: Limits = Limits {
+        connections: MAX_CONNECTIONS,
+        queued_fds: MAX_QUEUED_FDS,
+    };
+
+    fn closed(stream: &UnixStream) -> Vec<u8> {
+        use std::io::Read;
+        let mut rest = Vec::new();
+        (&*stream).read_to_end(&mut rest).unwrap();
+        rest
+    }
+
     #[test]
     fn hides_privileged_globals_and_refuses_their_names() {
         let state = Mutex::new(State::default());
@@ -588,21 +964,13 @@ mod tests {
             global(2, 7, "zwlr_screencopy_manager_v1"),
             global(2, 9, "zwp_virtual_keyboard_manager_v1"),
             message(2, 1, &7u32.to_ne_bytes()),
-            message(2, 1, &1u32.to_ne_bytes()),
         ]
         .concat();
         // A partial trailing message waits for the rest of its bytes.
         let tail = global(2, 3, "xdg_wm_base");
         events.extend_from_slice(&tail[..6]);
         let forwarded = filter_events(&mut events, &state).unwrap();
-        assert_eq!(
-            forwarded,
-            [
-                global(2, 1, "wl_compositor"),
-                message(2, 1, &1u32.to_ne_bytes())
-            ]
-            .concat()
-        );
+        assert_eq!(forwarded, global(2, 1, "wl_compositor"));
         assert_eq!(events, tail[..6]);
         events.extend_from_slice(&tail[6..]);
         assert_eq!(filter_events(&mut events, &state).unwrap(), tail);
@@ -613,7 +981,6 @@ mod tests {
         for request in [
             bind(2, 9, "zwp_virtual_keyboard_manager_v1", 4),
             bind(2, 3, "zwlr_screencopy_manager_v1", 4),
-            bind(2, 1, "wl_compositor", 4),
         ] {
             assert!(filter_requests(&mut request.clone(), &state).is_err());
         }
@@ -624,10 +991,40 @@ mod tests {
     }
 
     #[test]
-    fn relays_descriptors_with_their_messages() {
-        let (client, client_peer) = UnixStream::pair().unwrap();
-        let (server_peer, server) = UnixStream::pair().unwrap();
-        relay(client_peer, server_peer, || {}).unwrap();
+    fn tracks_names_per_registry_and_tolerates_removal_races() {
+        let state = Mutex::new(State::default());
+        for registry in [2u32, 3] {
+            filter_requests(&mut message(1, 1, &registry.to_ne_bytes()), &state).unwrap();
+        }
+        let mut events = [global(2, 1, "wl_output"), global(3, 1, "wl_output")].concat();
+        assert_eq!(filter_events(&mut events.clone(), &state).unwrap(), events);
+        // An output unplug reaches every registry that showed it.
+        let removes = [
+            message(2, 1, &1u32.to_ne_bytes()),
+            message(3, 1, &1u32.to_ne_bytes()),
+        ]
+        .concat();
+        assert_eq!(
+            filter_events(&mut removes.clone(), &state).unwrap(),
+            removes
+        );
+        // A bind that raced the removal stays legal; the compositor makes it inert.
+        assert!(filter_requests(&mut bind(3, 1, "wl_output", 4), &state).is_ok());
+        // A name is bindable only on the registry that showed it.
+        events = global(2, 5, "wl_seat");
+        filter_events(&mut events, &state).unwrap();
+        assert!(filter_requests(&mut bind(3, 5, "wl_seat", 5), &state).is_err());
+        assert!(filter_requests(&mut bind(2, 5, "wl_seat", 5), &state).is_ok());
+    }
+
+    #[test]
+    fn relays_descriptors_and_reports_the_client_pid_for_the_holder() {
+        let harness = Harness::new("relay", OPEN);
+        let (client, server) = harness.connect();
+        let holder = peer_pid(&server);
+        assert_ne!(holder, std::process::id());
+        assert_eq!(window_pid(Some(holder)), Some(std::process::id()));
+        assert_eq!(window_pid(Some(std::process::id())), None);
         let (read, mut write) = {
             let mut pipe = [0; 2];
             assert_eq!(unsafe { libc::pipe(pipe.as_mut_ptr()) }, 0);
@@ -654,17 +1051,112 @@ mod tests {
             .unwrap();
         assert_eq!(text, "ok");
         // A bind of a name the client was never shown closes both directions.
-        server
-            .set_read_timeout(Some(Duration::from_secs(5)))
-            .unwrap();
         let registry = message(1, 1, &2u32.to_ne_bytes());
         transmit(client.as_raw_fd(), &registry, &mut Vec::new()).unwrap();
         let count = receive(server.as_raw_fd(), &mut buffer, &mut fds).unwrap();
         assert_eq!(&buffer[..count], registry.as_slice());
-        let hidden = bind(2, 40, "zwlr_layer_shell_v1", 3);
-        transmit(client.as_raw_fd(), &hidden, &mut Vec::new()).unwrap();
-        let mut rest = Vec::new();
-        (&server).read_to_end(&mut rest).unwrap();
-        assert!(rest.is_empty());
+        transmit(
+            client.as_raw_fd(),
+            &bind(2, 40, "zwlr_layer_shell_v1", 3),
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(closed(&server).is_empty());
+        // The holder is unmapped and reaped with its connection.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while Path::new(&format!("/proc/{holder}")).exists() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "holder {holder} survived"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(!PEERS.lock().unwrap().contains_key(&holder));
+    }
+
+    #[test]
+    fn forwards_libwaylands_descriptor_bursts() {
+        // libwayland sends 28 descriptors with one byte while more remain,
+        // before the bytes of the messages that carry them.
+        let harness = Harness::new("burst", OPEN);
+        let (client, server) = harness.connect();
+        let messages = [0, 1, 2, 3].map(|n| message(5, n, &[0; 4])).concat();
+        for byte in 0..3 {
+            send_fds(&client, &messages[byte..byte + 1], 28).unwrap();
+        }
+        send_fds(&client, &messages[3..], 16).unwrap();
+        let mut received = Vec::new();
+        let mut fds = Vec::new();
+        let mut buffer = vec![0u8; 256];
+        while received.len() < messages.len() {
+            let count = receive(server.as_raw_fd(), &mut buffer, &mut fds).unwrap();
+            assert!(count > 0);
+            received.extend_from_slice(&buffer[..count]);
+        }
+        assert_eq!(received, messages);
+        assert_eq!(fds.len(), 100);
+    }
+
+    #[test]
+    fn closes_clients_that_queue_descriptors_without_messages() {
+        let partial = &message(5, 0, &[0; 4088])[..8];
+        // Past the per-connection cap.
+        let harness = Harness::new("flood", OPEN);
+        let (client, server) = harness.connect();
+        let mut sent = 0;
+        let mut result = send_fds(&client, partial, 28);
+        while result.is_ok() && sent <= MAX_QUEUED_FDS {
+            sent += 28;
+            result = send_fds(&client, &[0], 28);
+        }
+        assert!(closed(&server).is_empty());
+        assert!(sent <= MAX_QUEUED_FDS + 28, "{sent} descriptors queued");
+        // Past the budget shared by every connection of one filter.
+        let harness = Harness::new(
+            "budget",
+            Limits {
+                connections: 4,
+                queued_fds: 56,
+            },
+        );
+        let (first, first_server) = harness.connect();
+        send_fds(&first, partial, 28).unwrap();
+        let (second, second_server) = harness.connect();
+        send_fds(&second, partial, 28).unwrap();
+        let _ = send_fds(&second, &[0], 28);
+        assert!(closed(&second_server).is_empty());
+        // The budget comes back when the flooding connection ends.
+        let (third, third_server) = harness.connect();
+        send_fds(&third, &message(5, 0, &[0; 4]), 28).unwrap();
+        let mut buffer = vec![0u8; 64];
+        let mut fds = Vec::new();
+        assert_eq!(
+            receive(third_server.as_raw_fd(), &mut buffer, &mut fds).unwrap(),
+            12
+        );
+        assert_eq!(fds.len(), 28);
+        drop((first, first_server));
+    }
+
+    #[test]
+    fn closes_oversized_messages_and_connections_past_the_cap() {
+        let harness = Harness::new(
+            "cap",
+            Limits {
+                connections: 1,
+                queued_fds: MAX_QUEUED_FDS,
+            },
+        );
+        let (client, server) = harness.connect();
+        let refused = UnixStream::connect(harness.dir.join("in")).unwrap();
+        refused
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        assert!(closed(&refused).is_empty());
+        // A header longer than WL_MAX_MESSAGE_SIZE ends the connection.
+        let mut oversized = message(5, 0, &[0; 4]);
+        oversized[4..8].copy_from_slice(&(8192u32 << 16).to_ne_bytes());
+        transmit(client.as_raw_fd(), &oversized, &mut Vec::new()).unwrap();
+        assert!(closed(&server).is_empty());
     }
 }

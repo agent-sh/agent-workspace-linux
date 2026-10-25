@@ -198,10 +198,12 @@ impl SessionSpec {
                 runtime_dir,
                 hyprland::WAYLAND_SOCKET,
             )),
-            SessionBackend::X11
-            | SessionBackend::I3
-            | SessionBackend::Gnome
-            | SessionBackend::Cosmic => None,
+            // COSMIC's own security-context socket is the filter's upstream.
+            SessionBackend::Cosmic => Some(wayland_filter::sandbox_socket(
+                runtime_dir,
+                cosmic::APP_SOCKET,
+            )),
+            SessionBackend::X11 | SessionBackend::I3 | SessionBackend::Gnome => None,
         }
     }
 

@@ -24,15 +24,20 @@ use std::{
     time::Duration,
 };
 const ENV_FILE: &str = "cosmic-client.json";
-/// Sandboxed applications connect here. COSMIC gives clients of this socket a
-/// security context, so it withholds its privileged globals from them. The
+/// COSMIC gives clients of this socket a security context, so it withholds
+/// its privileged globals from them. Sandboxed applications see the Wayland
+/// filter at this path, which relays to this socket and forwards only its
+/// allow-listed globals, so a global a cosmic-comp update adds without a
+/// security-context gate stays hidden too. The
 /// compositor socket named in `ENV_FILE` stays with the daemon's helpers,
 /// attached controllers and unsandboxed launches. Those run as the same user
 /// with full file access and could open it by path anyway, and desktop
 /// services such as portals need capture, as with the control bus.
 pub(crate) const APP_SOCKET: &str = "wayland-apps";
 /// Globals COSMIC 8cb1802 filters with `client_not_sandboxed` or
-/// `client_has_no_security_context`. None may reach a launched application.
+/// `client_has_no_security_context`. Startup checks that the security
+/// context is in effect by their absence; the filter's allow-list, not this
+/// list, is what bounds what a sandboxed app can see.
 pub(crate) const PRIVILEGED_GLOBALS: &[&str] = &[
     "zcosmic_toplevel_info_v1",
     "zcosmic_toplevel_manager_v1",
@@ -487,6 +492,7 @@ pub(crate) struct CosmicSession {
     xwayland_files: Vec<(PathBuf, u64, u64)>,
     xwayland_lock_pid: Option<u32>,
     application_socket: Option<OwnedFd>,
+    filter: Option<super::wayland_filter::WaylandFilter>,
 }
 impl CosmicSession {
     pub(crate) fn start(options: &mut DaemonOptions) -> Result<Self> {
@@ -564,6 +570,7 @@ impl CosmicSession {
             xwayland_files: vec![],
             xwayland_lock_pid: None,
             application_socket: None,
+            filter: None,
         };
         let parent_socket = runtime.join("cosmic-parent");
         if parent_socket.exists() {
@@ -689,6 +696,12 @@ impl CosmicSession {
         // Probe input before advertising a ready desktop. No synthesized events.
         control(runtime, "input", &json!([]))?;
         session.application_socket = Some(create_application_socket(runtime, &options.session_id)?);
+        // cosmic-comp's security context hides the globals it gates; the
+        // filter's allow-list also hides any it adds later without a gate.
+        session.filter = Some(super::wayland_filter::WaylandFilter::relay(
+            runtime,
+            &runtime.join(APP_SOCKET),
+        )?);
         Ok(session)
     }
     pub(crate) fn pid(&self) -> Option<u32> {
@@ -699,6 +712,7 @@ impl CosmicSession {
             return;
         }
         self.stopped = true;
+        self.filter.take();
         self.application_socket.take();
         let _ = fs::remove_file(self.runtime.join(APP_SOCKET));
         self.lifetime.take();

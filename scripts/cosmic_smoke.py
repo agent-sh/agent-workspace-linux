@@ -487,4 +487,8 @@ isolation = subprocess.run(["python3", "/opt/cosmic-probe/runtime_isolation_smok
 (ARTIFACTS / "runtime-isolation.log").write_text(isolation.stdout + isolation.stderr)
 assert isolation.returncode == 0, isolation.stdout + isolation.stderr
 print("COSMIC shared runtime isolation passed", flush=True)
+# Sandboxed apps must reach only the filtered Wayland socket.
+subprocess.run(["python3", "/opt/cosmic-probe/sandbox_wayland_globals_smoke.py", "cosmic"],
+               env=dict(os.environ, HOME=str(isolation_home), AGENT_WORKSPACE_BIN=BIN,
+                        SANDBOX_GLOBALS_ARTIFACTS=str(ARTIFACTS)), check=True, timeout=300)
 print("COSMIC native acceptance passed", flush=True)

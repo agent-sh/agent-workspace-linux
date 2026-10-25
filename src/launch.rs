@@ -888,15 +888,21 @@ mod tests {
         for backend in [
             crate::session::SessionBackend::Kwin,
             crate::session::SessionBackend::Hyprland,
+            crate::session::SessionBackend::Cosmic,
         ] {
             let runtime = test_runtime(&format!("filtered-wayland-{backend:?}"));
             let mount_host = runtime.join("mount-host");
             fs::create_dir_all(&mount_host).expect("runtime and mount host");
             let _bus = std::os::unix::net::UnixListener::bind(runtime.join("client-bus"))
                 .expect("client bus socket");
-            let main = runtime.join("workspace-wayland");
-            let _main = std::os::unix::net::UnixListener::bind(&main).expect("main socket");
             let status = native_status(&runtime, backend);
+            // The socket sandboxes would otherwise bind: the main socket, or
+            // COSMIC's security-context socket.
+            let (_, main) = status
+                .session
+                .sandbox_wayland_socket(&runtime)
+                .expect("native backends filter Wayland");
+            let _main = std::os::unix::net::UnixListener::bind(&main).expect("main socket");
             let policies = [
                 sandbox_policy(Vec::new(), NetworkMode::Disabled),
                 sandbox_policy(

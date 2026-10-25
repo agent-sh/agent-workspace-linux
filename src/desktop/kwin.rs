@@ -216,13 +216,20 @@ catch(e) {{ callDBus({unique}, {path}, {interface}, 'Result', JSON.stringify({{o
     }
 }
 
+/// KWin reports the connection's pid; relayed sandboxed windows report the
+/// relay's holder, which maps back to the sandboxed client.
+fn relayed(mut window: WorkspaceWindow) -> WorkspaceWindow {
+    window.pid = crate::session::wayland_filter::window_pid(window.pid);
+    window
+}
+
 impl DesktopControl for KwinDesktopControl<'_> {
     fn list_windows(&self, include_hidden: bool) -> Result<Vec<WorkspaceWindow>> {
         let mut windows: Vec<WorkspaceWindow> = serde_json::from_value(self.script("return windows().filter(function(w){return w.normalWindow || w.dialog;}).map(describe);")?)?;
         if !include_hidden {
             windows.retain(|w| w.visible);
         }
-        Ok(windows)
+        Ok(windows.into_iter().map(relayed).collect())
     }
     fn search_window_ids(&self, only_visible: bool) -> Result<Vec<String>> {
         Ok(self
@@ -232,13 +239,14 @@ impl DesktopControl for KwinDesktopControl<'_> {
             .collect())
     }
     fn active_window(&self) -> Result<Option<WorkspaceWindow>> {
-        Ok(serde_json::from_value(self.script("var w=workspace.activeWindow || workspace.activeClient; return w ? describe(w) : null;")?)?)
+        let window: Option<WorkspaceWindow> = serde_json::from_value(self.script("var w=workspace.activeWindow || workspace.activeClient; return w ? describe(w) : null;")?)?;
+        Ok(window.map(relayed))
     }
     fn window_info(&self, id: &str) -> Result<WorkspaceWindow> {
-        Ok(serde_json::from_value(self.script(&format!(
+        Ok(relayed(serde_json::from_value(self.script(&format!(
             "return describe(find({}));",
             serde_json::to_string(&super::sanitize_window_id(id)?)?
-        ))?)?)
+        ))?)?))
     }
     fn pointer(&self) -> Result<WorkspacePointer> {
         Ok(serde_json::from_value(self.script(&format!("var p=workspace.cursorPos; return {{x:Math.round(p.x*{s}), y:Math.round(p.y*{s}),screen:0}};",s=self.status.session.scale))?)?)
