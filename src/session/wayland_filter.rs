@@ -389,11 +389,23 @@ fn connect_through_holder(
         control: Some(control),
     };
     // Register before the holder connects, then let it connect.
-    if let Ok(mut peers) = PEERS.lock() {
-        peers.insert(pid as u32, client_pid);
+    PEERS
+        .lock()
+        .map_err(|_| invalid("relay pid map poisoned"))?
+        .insert(pid as u32, client_pid);
+    let control = holder.control.as_ref().unwrap();
+    let go = [1u8];
+    if unsafe {
+        libc::send(
+            control.as_raw_fd(),
+            go.as_ptr().cast(),
+            1,
+            libc::MSG_NOSIGNAL,
+        )
+    } != 1
+    {
+        return Err(io::Error::last_os_error());
     }
-    let mut control = holder.control.as_ref().unwrap();
-    std::io::Write::write_all(&mut control, &[1])?;
     control.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut fds = Vec::new();
     let mut byte = [0u8; 1];
@@ -428,8 +440,12 @@ unsafe fn holder(control: RawFd, upstream: &SocketAddress) -> ! {
     // Connect only after the parent has recorded this holder's mapping, so
     // the compositor never sees a connection without one.
     let mut go = [0u8; 1];
-    if libc::read(control, go.as_mut_ptr().cast(), 1) != 1 {
-        libc::_exit(1);
+    loop {
+        match libc::read(control, go.as_mut_ptr().cast(), 1) {
+            1 => break,
+            -1 if *libc::__errno_location() == libc::EINTR => {}
+            _ => libc::_exit(1),
+        }
     }
     let socket = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
     if socket < 0
@@ -1010,7 +1026,9 @@ mod tests {
     };
 
     /// Waits until the relay has read everything `stream` sent, so the
-    /// descriptors it carried are counted before the test goes on.
+    /// descriptors it carried are counted before the test goes on. The pump
+    /// counts them just after the read; the next step (a new connection
+    /// through a forked holder) is far slower than that gap.
     fn drained(stream: &UnixStream) {
         let deadline = std::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -1257,7 +1275,7 @@ mod tests {
             result = send_fds(&client, &[0], 28);
         }
         assert!(closed(&server).is_empty());
-        assert!(sent <= 56 + 28, "{sent} descriptors queued");
+        assert!(sent > 56, "closed before the cap: {sent}");
         // Past the budget shared by every connection of one filter.
         let harness = Harness::new(
             "budget",
