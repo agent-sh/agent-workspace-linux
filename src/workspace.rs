@@ -364,6 +364,21 @@ pub struct WorkspaceManifest {
     pub last_event_sequence: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub apps: Vec<WorkspaceApp>,
+    /// Kernel start times of the recorded pids. Stale cleanup signals a pid
+    /// only while its start time still matches, so a recycled pid (a host
+    /// compositor, another workspace's daemon) is never terminated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_ticks: Option<ProcessStartTicks>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProcessStartTicks {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_server: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_manager: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1658,13 +1673,35 @@ fn cleanup_stale_workspace_processes(
             false,
         )?
     });
-    manifest.session.cleanup_stale_processes(
+    let recorded = manifest.process_start_ticks.as_ref();
+    let window_manager_pid = recorded_process(
         manifest.window_manager_pid,
+        recorded,
+        |ticks| ticks.window_manager,
+        "window manager or compositor",
+        &mut actions,
+    );
+    let x_server_pid = recorded_process(
         manifest.x_server_pid,
+        recorded,
+        |ticks| ticks.x_server,
+        "X server",
+        &mut actions,
+    );
+    manifest.session.cleanup_stale_processes(
+        window_manager_pid,
+        x_server_pid,
         dry_run,
         &mut actions,
     );
-    if let Some(pid) = manifest.daemon_pid {
+    let daemon_pid = recorded_process(
+        manifest.daemon_pid,
+        recorded,
+        |ticks| ticks.daemon,
+        "workspace daemon",
+        &mut actions,
+    );
+    if let Some(pid) = daemon_pid {
         cleanup_stale_process_pid(
             pid,
             "workspace daemon",
@@ -3871,7 +3908,54 @@ fn workspace_manifest(status: &WorkspaceStatus, stopped_at_unix: Option<u64>) ->
         daemon_stderr_path: status.runtime_dir.join("daemon.err.log"),
         last_event_sequence: status.last_event_sequence,
         apps: status.apps.clone(),
+        process_start_ticks: Some(ProcessStartTicks {
+            daemon: status.daemon_pid.and_then(process_start_ticks),
+            x_server: Some(status.x_server_pid)
+                .filter(|pid| *pid != 0)
+                .and_then(process_start_ticks),
+            window_manager: status.window_manager_pid.and_then(process_start_ticks),
+        }),
     }
+}
+
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_start_ticks_from_proc_stat(&stat)
+}
+
+/// Field 22 of /proc/PID/stat; fields after the parenthesised comm start at 3.
+fn process_start_ticks_from_proc_stat(stat: &str) -> Option<u64> {
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// Pass a recorded pid on to stale cleanup only while it is still the process
+/// the manifest recorded. Manifests from older releases carry no start times
+/// and keep the name-based identity check alone.
+fn recorded_process(
+    pid: Option<u32>,
+    recorded: Option<&ProcessStartTicks>,
+    ticks: impl Fn(&ProcessStartTicks) -> Option<u64>,
+    label: &str,
+    actions: &mut Vec<String>,
+) -> Option<u32> {
+    let pid = pid.filter(|pid| *pid != 0)?;
+    let Some(recorded) = recorded else {
+        return Some(pid);
+    };
+    if ticks(recorded).is_some_and(|expected| process_start_ticks(pid) == Some(expected)) {
+        return Some(pid);
+    }
+    if process_is_alive(pid) {
+        actions.push(format!(
+            "skipped {label} pid {pid}: it is no longer the process this workspace started"
+        ));
+    }
+    None
 }
 
 fn write_workspace_manifest(
@@ -9591,6 +9675,55 @@ mod tests {
             .expect_err("too-long socket path should fail before daemon spawn");
 
         assert!(error.to_string().contains("Unix socket paths"));
+    }
+
+    #[test]
+    fn stale_cleanup_skips_pids_whose_start_time_changed() {
+        let stat = "123 (a) b) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 20";
+        assert_eq!(process_start_ticks_from_proc_stat(stat), Some(424242));
+
+        let pid = std::process::id();
+        let ours = process_start_ticks(pid).expect("own start time");
+        let mut actions = Vec::new();
+        let recorded = |window_manager| ProcessStartTicks {
+            window_manager,
+            ..ProcessStartTicks::default()
+        };
+        let pick = |ticks: &ProcessStartTicks| ticks.window_manager;
+
+        assert_eq!(
+            recorded_process(
+                Some(pid),
+                Some(&recorded(Some(ours))),
+                pick,
+                "wm",
+                &mut actions
+            ),
+            Some(pid)
+        );
+        assert_eq!(
+            recorded_process(
+                Some(pid),
+                Some(&recorded(Some(ours + 1))),
+                pick,
+                "wm",
+                &mut actions
+            ),
+            None
+        );
+        assert_eq!(
+            recorded_process(Some(pid), Some(&recorded(None)), pick, "wm", &mut actions),
+            None
+        );
+        assert_eq!(actions.len(), 2);
+        assert_eq!(
+            recorded_process(Some(pid), None, pick, "wm", &mut actions),
+            Some(pid)
+        );
+        assert_eq!(
+            recorded_process(Some(0), None, pick, "wm", &mut actions),
+            None
+        );
     }
 
     #[test]
