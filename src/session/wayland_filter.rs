@@ -162,6 +162,8 @@ pub(crate) fn window_pid(pid: Option<u32>) -> Option<u32> {
 struct Limits {
     connections: usize,
     queued_fds: usize,
+    /// Descriptors one connection may queue without their messages.
+    per_connection_fds: usize,
 }
 
 impl Limits {
@@ -177,6 +179,7 @@ impl Limits {
         Self {
             connections: MAX_CONNECTIONS.min(soft / 48).max(1),
             queued_fds: MAX_QUEUED_FDS.min(soft / 4),
+            per_connection_fds: MAX_QUEUED_FDS,
         }
     }
 }
@@ -235,7 +238,8 @@ impl WaylandFilter {
             std::thread::Builder::new()
                 .name("sandbox-wayland".into())
                 .spawn(move || {
-                    accept_loop(&listener, &address, &stop, &links, Limits::from_rlimit())
+                    let budget = Arc::new(Budget::new(Limits::from_rlimit()));
+                    accept_loop(&listener, &address, &stop, &links, &budget)
                 })?
         };
         Ok(Self {
@@ -385,11 +389,24 @@ fn connect_through_holder(
         pid,
         control: Some(control),
     };
-    // Register before the compositor can see a window from this connection.
-    if let Ok(mut peers) = PEERS.lock() {
-        peers.insert(pid as u32, client_pid);
-    }
+    // Register before the holder connects, then let it connect.
+    PEERS
+        .lock()
+        .map_err(|_| invalid("relay pid map poisoned"))?
+        .insert(pid as u32, client_pid);
     let control = holder.control.as_ref().unwrap();
+    let go = [1u8];
+    if unsafe {
+        libc::send(
+            control.as_raw_fd(),
+            go.as_ptr().cast(),
+            1,
+            libc::MSG_NOSIGNAL,
+        )
+    } != 1
+    {
+        return Err(io::Error::last_os_error());
+    }
     control.set_read_timeout(Some(Duration::from_secs(5)))?;
     let mut fds = Vec::new();
     let mut byte = [0u8; 1];
@@ -419,6 +436,16 @@ unsafe fn holder(control: RawFd, upstream: &SocketAddress) -> ! {
     for signal in 1..32 {
         if signal != libc::SIGKILL && signal != libc::SIGSTOP {
             libc::sigaction(signal, &default, std::ptr::null_mut());
+        }
+    }
+    // Connect only after the parent has recorded this holder's mapping, so
+    // the compositor never sees a connection without one.
+    let mut go = [0u8; 1];
+    loop {
+        match libc::read(control, go.as_mut_ptr().cast(), 1) {
+            1 => break,
+            -1 if *libc::__errno_location() == libc::EINTR => {}
+            _ => libc::_exit(1),
         }
     }
     let socket = libc::socket(libc::AF_UNIX, libc::SOCK_STREAM | libc::SOCK_CLOEXEC, 0);
@@ -488,12 +515,8 @@ fn accept_loop(
     upstream: &SocketAddress,
     stop: &AtomicBool,
     links: &Arc<Mutex<HashMap<u64, Arc<Link>>>>,
-    limits: Limits,
+    budget: &Arc<Budget>,
 ) {
-    let budget = Arc::new(Budget {
-        queued: AtomicUsize::new(0),
-        limit: limits.queued_fds,
-    });
     for (id, client) in (0u64..).zip(listener.incoming()) {
         if stop.load(Ordering::SeqCst) {
             return;
@@ -505,11 +528,11 @@ fn accept_loop(
         };
         if links
             .lock()
-            .map_or(true, |list| list.len() >= limits.connections)
+            .map_or(true, |list| list.len() >= budget.connections)
         {
             eprintln!(
                 "sandbox Wayland relay refused a client: {} connections already open",
-                limits.connections
+                budget.connections
             );
             continue;
         }
@@ -540,6 +563,19 @@ fn accept_loop(
 struct Budget {
     queued: AtomicUsize,
     limit: usize,
+    per_connection: usize,
+    connections: usize,
+}
+
+impl Budget {
+    fn new(limits: Limits) -> Self {
+        Self {
+            queued: AtomicUsize::new(0),
+            limit: limits.queued_fds,
+            per_connection: limits.per_connection_fds,
+            connections: limits.connections,
+        }
+    }
 }
 
 struct Link {
@@ -627,7 +663,7 @@ fn pump(
                     return Err(invalid("sandboxed clients queued too many descriptors"));
                 }
             }
-            if fds.len() > MAX_QUEUED_FDS {
+            if fds.len() > budget.map_or(MAX_QUEUED_FDS, |budget| budget.per_connection) {
                 return Err(invalid(
                     "too many descriptors queued without their messages",
                 ));
@@ -943,6 +979,7 @@ mod tests {
         listener: Arc<UnixListener>,
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
+        budget: Arc<Budget>,
     }
 
     impl Harness {
@@ -954,10 +991,11 @@ mod tests {
             let listener = Arc::new(UnixListener::bind(dir.join("in")).unwrap());
             let address = SocketAddress::new(&dir.join("up")).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
+            let budget = Arc::new(Budget::new(limits));
             let thread = {
-                let (listener, stop) = (listener.clone(), stop.clone());
+                let (listener, stop, budget) = (listener.clone(), stop.clone(), budget.clone());
                 let links = Arc::new(Mutex::new(HashMap::new()));
-                std::thread::spawn(move || accept_loop(&listener, &address, &stop, &links, limits))
+                std::thread::spawn(move || accept_loop(&listener, &address, &stop, &links, &budget))
             };
             Self {
                 dir,
@@ -965,6 +1003,7 @@ mod tests {
                 listener,
                 stop,
                 thread: Some(thread),
+                budget,
             }
         }
 
@@ -994,12 +1033,31 @@ mod tests {
     const OPEN: Limits = Limits {
         connections: MAX_CONNECTIONS,
         queued_fds: MAX_QUEUED_FDS,
+        per_connection_fds: MAX_QUEUED_FDS,
     };
 
+    impl Harness {
+        /// Waits until the relay has counted `count` queued descriptors, so a
+        /// test can order connections by what the shared budget has seen.
+        fn wait_queued(&self, count: usize) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while self.budget.queued.load(Ordering::SeqCst) < count {
+                assert!(std::time::Instant::now() < deadline, "relay did not count");
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        }
+    }
+
+    #[track_caller]
     fn closed(stream: &UnixStream) -> Vec<u8> {
         use std::io::Read;
         let mut rest = Vec::new();
-        (&*stream).read_to_end(&mut rest).unwrap();
+        // Closing a socket with unread data resets it; that is closed too.
+        match (&*stream).read_to_end(&mut rest) {
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::ConnectionReset => {}
+            Err(error) => panic!("reading a closed relay connection: {error}"),
+        }
         rest
     }
 
@@ -1200,28 +1258,41 @@ mod tests {
 
     #[test]
     fn closes_clients_that_queue_descriptors_without_messages() {
+        // Descriptors in flight over Unix sockets count against a per-user
+        // limit on the host (ETOOMANYREFS past it), which a desktop session
+        // shares: a flood of them here crashed a running terminal. Keep every
+        // case to a few dozen descriptors with small caps.
         let partial = &message(5, 0, &[0; 4088])[..8];
         // Past the per-connection cap.
-        let harness = Harness::new("flood", OPEN);
+        let harness = Harness::new(
+            "flood",
+            Limits {
+                connections: 4,
+                queued_fds: MAX_QUEUED_FDS,
+                per_connection_fds: 56,
+            },
+        );
         let (client, server) = harness.connect();
         let mut sent = 0;
         let mut result = send_fds(&client, partial, 28);
-        while result.is_ok() && sent <= MAX_QUEUED_FDS {
+        while result.is_ok() && sent <= 56 {
             sent += 28;
             result = send_fds(&client, &[0], 28);
         }
         assert!(closed(&server).is_empty());
-        assert!(sent <= MAX_QUEUED_FDS + 28, "{sent} descriptors queued");
+        assert!(sent > 56, "closed before the cap: {sent}");
         // Past the budget shared by every connection of one filter.
         let harness = Harness::new(
             "budget",
             Limits {
                 connections: 4,
                 queued_fds: 56,
+                per_connection_fds: 56,
             },
         );
         let (first, first_server) = harness.connect();
         send_fds(&first, partial, 28).unwrap();
+        harness.wait_queued(28);
         let (second, second_server) = harness.connect();
         send_fds(&second, partial, 28).unwrap();
         let _ = send_fds(&second, &[0], 28);
@@ -1246,6 +1317,7 @@ mod tests {
             Limits {
                 connections: 1,
                 queued_fds: MAX_QUEUED_FDS,
+                per_connection_fds: MAX_QUEUED_FDS,
             },
         );
         let (client, server) = harness.connect();
