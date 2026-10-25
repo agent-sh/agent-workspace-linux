@@ -3874,8 +3874,10 @@ fn create_private_runtime_dir(path: &Path) -> Result<()> {
             .with_context(|| format!("failed to create {}", root.display()))?;
     }
     let metadata = verify_owned_dir(root, "workspace runtime root")?;
-    // XDG requires the runtime root to be private to its user.
-    if metadata.mode() & 0o022 != 0 {
+    // Group write is only safe when the group is this user's own (the
+    // usual 002 umask on user-private-group systems).
+    let mode = metadata.mode();
+    if mode & 0o002 != 0 || (mode & 0o020 != 0 && metadata.gid() != unsafe { libc::getegid() }) {
         bail!(
             "workspace runtime root {} is writable by other users; use a private XDG_RUNTIME_DIR",
             root.display()
@@ -7315,10 +7317,14 @@ fn trusted_tmux_socket(socket_path: &Path) -> Result<PathBuf> {
     };
     let name = terminal_dir
         .file_name()
-        .context("managed terminal directory has no name")?;
-    let links = runtime.join("terminal-links");
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("terminal-"))
+        .context("managed terminal directory has no terminal id")?;
+    // No longer than the socket it stands in for, so any path the terminal
+    // could bind also fits here.
+    let links = runtime.join("tlinks");
     create_owned_private_dir(&links, "managed terminal link directory")?;
-    let link = links.join(name).with_extension("sock");
+    let link = links.join(name);
     validate_unix_socket_path(&link)?;
     let source = owned_socket_identity(socket_path)
         .with_context(|| format!("managed terminal socket {}", socket_path.display()))?;
@@ -9876,8 +9882,9 @@ mod tests {
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("chmod");
         assert!(create_private_runtime_dir(&runtime(&shared)).is_err());
         assert!(!shared.join("agent-workspace-linux").exists());
-        fs::set_permissions(&shared, fs::Permissions::from_mode(0o770)).expect("chmod");
-        assert!(create_private_runtime_dir(&runtime(&shared)).is_err());
+        // Group write by this user's own group is the common 002 umask.
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).expect("chmod");
+        create_private_runtime_dir(&runtime(&shared)).expect("own-group writable root");
 
         let linked = scratch.join("linked");
         std::os::unix::fs::symlink(&owned, &linked).expect("symlink root");
@@ -9909,7 +9916,7 @@ mod tests {
         let server = UnixListener::bind(&socket).expect("terminal server");
 
         let link = trusted_tmux_socket(&socket).expect("link real socket");
-        assert_eq!(link, runtime.join("terminal-links").join("terminal-t.sock"));
+        assert_eq!(link, runtime.join("tlinks").join("t"));
         UnixStream::connect(&link).expect("link reaches the terminal server");
         server.accept().expect("accepted through link");
 
