@@ -58,8 +58,14 @@ def wait_for(probe, label, timeout=10):
 # Toplevel capture renders offscreen between frames, so only the next frame's
 # buffer-age query fails. Any other ERROR line, or more of these than captures
 # can explain, fails acceptance. See docs/native-cosmic.md.
-CAPTURE_SWAP = (
+# Smithay swaps with eglSwapBuffersWithDamageKHR when the frame has damage and
+# with eglSwapBuffers otherwise. Mesa applies the same current-surface check to
+# both, so each failed swap logs exactly one of the two.
+SWAP_FAILURES = (
     "smithay::backend::egl::ffi: [EGL] 0x300d (BAD_SURFACE) eglSwapBuffers: eglSwapBuffers",
+    "smithay::backend::egl::ffi: [EGL] 0x300d (BAD_SURFACE) eglSwapBuffersWithDamageKHR: _eglSwapBuffersWithDamageCommon",
+)
+CAPTURE_SWAP = (
     "smithay::backend::egl::ffi: [EGL] 0x3003 (BAD_ALLOC) eglCreatePlatformWindowSurfaceEXT: _eglCreateWindowSurfaceCommon",
     "smithay::backend::egl::surface: error=EGL failed to allocate resources for the requested operation.",
     "cosmic_comp::backend::winit: Failed to render frame. err=Failed to submit buffer for display",
@@ -77,9 +83,9 @@ def check_compositor_log(path, output_captures, window_captures):
         if match:
             message = match.group(1).strip()
             counts[message] = counts.get(message, 0) + 1
-    unexpected = {m: n for m, n in counts.items() if m not in (*CAPTURE_SWAP, BUFFER_AGE, LOCALE)}
+    unexpected = {m: n for m, n in counts.items() if m not in (*SWAP_FAILURES, *CAPTURE_SWAP, BUFFER_AGE, LOCALE)}
     assert not unexpected, f"unexpected COSMIC errors: {unexpected}"
-    swaps = {counts.get(m, 0) for m in CAPTURE_SWAP}
+    swaps = {counts.get(m, 0) for m in CAPTURE_SWAP} | {sum(counts.get(m, 0) for m in SWAP_FAILURES)}
     assert len(swaps) == 1, f"incomplete COSMIC capture swap signature: {counts}"
     swaps = swaps.pop()
     assert swaps <= output_captures, f"{swaps} failed swaps for {output_captures} output captures"
