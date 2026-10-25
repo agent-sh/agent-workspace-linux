@@ -227,6 +227,12 @@ impl HyprlandSession {
                 "--no-kactivities",
             ]);
         prepare_child(&mut parent);
+        // Runtimes are reused by id; a crashed renderer leaves its socket
+        // behind, which must not pass for the new renderer's readiness.
+        let parent_socket = runtime.join("hyprland-parent");
+        if parent_socket.symlink_metadata().is_ok() {
+            fs::remove_file(&parent_socket)?;
+        }
         let log = fs::File::create(runtime.join("hyprland-parent.log"))?;
         parent.stdout(log.try_clone()?).stderr(log);
         session.parent = Some(
@@ -240,7 +246,7 @@ impl HyprlandSession {
                 if let Some(exit) = session.parent.as_mut().unwrap().try_wait()? {
                     bail!("private Hyprland renderer exited {exit}");
                 }
-                Ok(runtime.join("hyprland-parent").exists())
+                Ok(connect_socket(&parent_socket).is_ok())
             },
             "Hyprland private renderer",
         )?;
