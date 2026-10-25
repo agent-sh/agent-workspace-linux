@@ -1,3 +1,6 @@
+pub(crate) mod cosmic;
+pub(crate) mod cosmic_input;
+pub(crate) mod cosmic_protocol;
 pub(crate) mod gnome;
 pub(crate) mod hyprland;
 pub(crate) mod i3;

@@ -263,6 +263,8 @@ struct ViewerSnapshot {
     doctor_blockers: Vec<String>,
     i3_doctor_ready: bool,
     i3_doctor_blockers: Vec<String>,
+    cosmic_doctor_ready: bool,
+    cosmic_doctor_blockers: Vec<String>,
     kwin_doctor_ready: bool,
     hyprland_doctor_ready: bool,
     hyprland_doctor_blockers: Vec<String>,
@@ -284,6 +286,9 @@ impl ViewerSnapshot {
             }
             crate::session::SessionBackend::Kwin => {
                 (self.kwin_doctor_ready, &self.kwin_doctor_blockers)
+            }
+            crate::session::SessionBackend::Cosmic => {
+                (self.cosmic_doctor_ready, &self.cosmic_doctor_blockers)
             }
         }
     }
@@ -2506,6 +2511,8 @@ fn compute_viewer_refresh(
                 doctor_blockers: doctor.blockers,
                 i3_doctor_ready: doctor.ready_for_i3_workspace,
                 i3_doctor_blockers: doctor.i3_blockers,
+                cosmic_doctor_ready: doctor.ready_for_cosmic_workspace,
+                cosmic_doctor_blockers: doctor.cosmic_blockers,
                 kwin_doctor_ready: doctor.ready_for_kwin_workspace,
                 hyprland_doctor_ready: doctor.ready_for_hyprland_workspace,
                 hyprland_doctor_blockers: doctor.hyprland_blockers,

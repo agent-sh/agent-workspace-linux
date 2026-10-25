@@ -28,6 +28,32 @@ use session::SessionSpec;
 use std::{fs, path::PathBuf};
 use workspace::{DaemonOptions, EnvVar, LaunchSpec, WorkspaceStartOptions};
 
+#[derive(Debug, PartialEq, Eq)]
+enum XwaylandLauncher {
+    Hyprland,
+    Cosmic,
+}
+
+/// Select the compositor-owned XWayland launcher for an `Xwayland` argv[0].
+///
+/// Hyprland passes its environment to XWayland, so its launcher is selected
+/// only by `AGENT_WORKSPACE_XWAYLAND_BACKEND=hyprland`, and it then requires
+/// its runtime and real-executable variables. COSMIC starts XWayland through
+/// Smithay, which clears every variable except `PATH` and `XDG_RUNTIME_DIR`.
+/// The variable is therefore absent for COSMIC (or `cosmic` if that ever
+/// changes), and its launcher then requires the read-only configuration
+/// descriptor naming the COSMIC backend. A COSMIC launch can never carry the
+/// Hyprland value, and a Hyprland launch has no COSMIC descriptor. Any other
+/// value, or a failed check in the selected launcher, exits without starting
+/// an X server.
+fn xwayland_launcher(backend: Option<&std::ffi::OsStr>) -> Result<XwaylandLauncher> {
+    match backend.map(|value| value.to_str()) {
+        Some(Some("hyprland")) => Ok(XwaylandLauncher::Hyprland),
+        None | Some(Some("cosmic")) => Ok(XwaylandLauncher::Cosmic),
+        Some(other) => bail!("unknown XWayland launcher backend {other:?}"),
+    }
+}
+
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<()> {
     let mut args = std::env::args().skip(1).collect::<Vec<_>>();
@@ -36,9 +62,12 @@ async fn main() -> Result<()> {
         .as_deref()
         .and_then(|arg| std::path::Path::new(arg).file_name())
         == Some(std::ffi::OsStr::new("Xwayland"))
-        && std::env::var("AGENT_WORKSPACE_XWAYLAND_BACKEND").as_deref() == Ok("hyprland")
     {
-        return session::hyprland::xwayland(&args);
+        let backend = std::env::var_os("AGENT_WORKSPACE_XWAYLAND_BACKEND");
+        return match xwayland_launcher(backend.as_deref())? {
+            XwaylandLauncher::Hyprland => session::hyprland::xwayland(&args),
+            XwaylandLauncher::Cosmic => session::cosmic::xwayland(),
+        };
     }
     // Internal helper: synthetic XTEST pointer input (motion+button) used by the
     // workspace daemon so synthetic clicks reach XInput2 apps (winit/egui, …).
@@ -58,6 +87,14 @@ async fn main() -> Result<()> {
         std::fs::write(&staging, serde_json::to_vec(&value)?)?;
         std::fs::rename(staging, path)?;
         return Ok(());
+    }
+    if args.first().map(String::as_str) == Some("__cosmic-control") {
+        return session::cosmic::helper(&args[1..]);
+    }
+    if args.first().map(String::as_str) == Some("__cosmic-session-guard") {
+        return session::cosmic::session_guard(std::path::Path::new(
+            args.get(1).context("missing COSMIC guard path")?,
+        ));
     }
     let permissions = parse_global_options(&mut args)?;
     match args.first().map(String::as_str) {
@@ -4436,8 +4473,8 @@ Usage:
   agent-workspace-linux profile template project-dev [--id ID] [--host-path PATH]
   agent-workspace-linux profile template restricted-chrome [--id ID] [--browser-path PATH]
   agent-workspace-linux profile template browser-session [--id ID] [--browser-path PATH] --user-data-dir PATH
-  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--ack-unenforced-policy] [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland] [--scale N] [--width PX] [--height PX]
-  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] [--ack-unenforced-policy] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland] [--scale N] [--width PX] [--height PX]
+  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--ack-unenforced-policy] [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland|cosmic] [--scale N] [--width PX] [--height PX]
+  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] [--ack-unenforced-policy] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland|cosmic] [--scale N] [--width PX] [--height PX]
   agent-workspace-linux workspace list
   agent-workspace-linux workspace cleanup [--id ID] [--dry-run]
   agent-workspace-linux workspace status [--id ID]
@@ -4547,6 +4584,31 @@ inspect and close GPUI viewers even when the desktop compositor does not expose
 them as ordinary controllable windows.
 "#
     );
+}
+
+#[cfg(test)]
+mod xwayland_launcher_tests {
+    use super::{xwayland_launcher, XwaylandLauncher};
+    use std::ffi::OsStr;
+
+    #[test]
+    fn xwayland_launcher_selection_is_exclusive_and_fails_closed() {
+        assert_eq!(
+            xwayland_launcher(Some(OsStr::new("hyprland"))).unwrap(),
+            XwaylandLauncher::Hyprland
+        );
+        assert_eq!(xwayland_launcher(None).unwrap(), XwaylandLauncher::Cosmic);
+        assert_eq!(
+            xwayland_launcher(Some(OsStr::new("cosmic"))).unwrap(),
+            XwaylandLauncher::Cosmic
+        );
+        for other in ["", "kwin", "Hyprland", "hyprland "] {
+            assert!(
+                xwayland_launcher(Some(OsStr::new(other))).is_err(),
+                "{other:?}"
+            );
+        }
+    }
 }
 
 #[cfg(test)]
