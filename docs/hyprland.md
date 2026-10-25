@@ -12,6 +12,12 @@ The backend targets Hyprland 0.53 and KWin 6.6. It requires `Hyprland`,
 Aquamarine requires a renderer-backed allocator even with headless outputs.
 The workspace starts a private KWin virtual compositor to supply that allocator,
 then creates a Hyprland headless output and removes the nested Wayland output.
+
+KWin's virtual compositor uses the first DRM device that opens, and Hyprland
+allocates its buffers on that device. NVIDIA's GBM cannot allocate them. On a
+host with an NVIDIA GPU and another GPU, the private KWin compositor runs in a
+bubblewrap namespace whose `/dev/dri` holds only the other GPU's render node.
+Hosts with one GPU vendor use every render node as before.
 KWin supplies no desktop shell. Neither compositor connects to a host display,
 input device, system bus, or DRM card. Weston 14 cannot serve as the parent:
 Aquamarine requests `wl_compositor` version 6 while Weston advertises version 5.

@@ -335,12 +335,15 @@ fn xwayland_exec() -> Result<()> {
         .create(true)
         .append(true)
         .open(runtime.join("xwayland.log"))?;
-    let error = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .args(args)
         .arg("-auth")
         .arg(authority)
-        .stderr(Stdio::from(stderr))
-        .exec();
+        .stderr(Stdio::from(stderr));
+    // The compositor does not pass its environment on to XWayland.
+    super::private::use_mesa_egl(&mut command);
+    let error = command.exec();
     Err(error).context("exec authenticated COSMIC XWayland")
 }
 fn set_cookie(authority: &Path, display: &str, cookie: &str) -> Result<()> {
@@ -448,6 +451,12 @@ fn compositor_namespace(runtime: &Path, wrapper: Option<&Path>) -> Result<Comman
     } else {
         "parent-bin"
     });
+    if wrapper.is_none() {
+        // --die-with-parent stops Weston only from inside a PID namespace;
+        // without one Weston outlives a crashed daemon. cosmic-comp keeps the
+        // host PID view for client credentials and exits with its guard socket.
+        command.arg("--unshare-pid");
+    }
     command.arg("--tmpfs").arg(&destination);
     if let Some(wrapper) = wrapper {
         let file = fs::File::open(wrapper)?;
@@ -594,6 +603,7 @@ impl CosmicSession {
             ])
             .arg(format!("--width={}", options.width))
             .arg(format!("--height={}", options.height));
+        super::private::use_mesa_egl(&mut parent);
         prepare_child(&mut parent);
         let (stdout, stderr) = log_file(&runtime.join("cosmic-parent.log"))?;
         parent.stdout(stdout).stderr(stderr);
@@ -637,6 +647,7 @@ impl CosmicSession {
             });
         }
         session.lifetime = Some(lifetime);
+        super::private::use_mesa_egl(&mut compositor);
         prepare_child(&mut compositor);
         let (stdout, stderr) = log_file(&runtime.join("cosmic.log"))?;
         compositor.stdout(stdout).stderr(stderr);
@@ -741,18 +752,27 @@ impl CosmicSession {
         }
         self.private.shutdown();
         if let Some(mut parent) = self.parent.take() {
+            // Signal the group: Weston survives the death of its bwrap
+            // supervisor despite --die-with-parent. The unreaped leader keeps
+            // the group number from being recycled before the SIGKILL.
+            let group = -(parent.id() as i32);
             unsafe {
-                libc::kill(parent.id() as i32, libc::SIGTERM);
+                libc::kill(group, libc::SIGTERM);
             }
-            if wait_for(
+            let _ = wait_for(
                 Duration::from_secs(3),
-                || Ok(parent.try_wait()?.is_some()),
+                || {
+                    Ok(!matches!(
+                        super::private::unreaped_exit(parent.id()),
+                        super::private::UnreapedExit::Running
+                    ))
+                },
                 "COSMIC parent stop",
-            )
-            .is_err()
-            {
-                let _ = parent.kill();
+            );
+            unsafe {
+                libc::kill(group, libc::SIGKILL);
             }
+            let _ = parent.kill();
             let _ = parent.wait();
         }
         // Smithay owns these paths rather than XWayland itself. A compositor

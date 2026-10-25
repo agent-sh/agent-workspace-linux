@@ -54,6 +54,37 @@ pub(crate) fn blockers() -> Vec<String> {
     blockers
 }
 
+/// KWin's virtual renderer takes the first DRM device that opens, and
+/// Hyprland allocates its buffers on that renderer's device. NVIDIA's GBM
+/// cannot allocate them, so on a host that also has another GPU the renderer
+/// sees only that GPU's render node. Other hosts keep every node.
+fn parent_render_node() -> Option<PathBuf> {
+    let mut nodes: Vec<(PathBuf, bool)> = fs::read_dir("/sys/class/drm")
+        .ok()?
+        .flatten()
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            name.strip_prefix("renderD")
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit()))
+                .then_some(())?;
+            let driver = fs::read_link(entry.path().join("device/driver")).ok()?;
+            let nvidia = driver.file_name().is_some_and(|name| name == "nvidia");
+            let node = Path::new("/dev/dri").join(&name);
+            let path = std::ffi::CString::new(node.as_os_str().as_encoded_bytes()).ok()?;
+            (unsafe { libc::access(path.as_ptr(), libc::R_OK | libc::W_OK) } == 0)
+                .then_some((node, nvidia))
+        })
+        .collect();
+    nodes.sort();
+    if !nodes.iter().any(|(_, nvidia)| *nvidia) {
+        return None;
+    }
+    nodes
+        .into_iter()
+        .find(|(_, nvidia)| !nvidia)
+        .map(|(node, _)| node)
+}
+
 pub(crate) fn configure_process_environment(
     command: &mut Command,
     runtime: &Path,
@@ -206,7 +237,33 @@ impl HyprlandSession {
             private,
             filter: None,
         };
-        let mut parent = Command::new("kwin_wayland");
+        let mut parent = match parent_render_node() {
+            Some(node) => {
+                let bwrap = command_path_check("bwrap");
+                if !bwrap.ok {
+                    bail!(
+                        "bwrap is required to keep Hyprland's renderer off the NVIDIA render node"
+                    );
+                }
+                let mut command = Command::new(bwrap.detail);
+                command
+                    .args([
+                        "--dev-bind",
+                        "/",
+                        "/",
+                        "--proc",
+                        "/proc",
+                        "--tmpfs",
+                        "/dev/dri",
+                    ])
+                    .arg("--dev-bind")
+                    .arg(&node)
+                    .arg(&node)
+                    .args(["--unshare-pid", "--die-with-parent", "--", "kwin_wayland"]);
+                command
+            }
+            None => Command::new("kwin_wayland"),
+        };
         configure_process_environment(&mut parent, runtime, "", &options.xauthority_path);
         parent
             .env_remove("WAYLAND_DISPLAY")
