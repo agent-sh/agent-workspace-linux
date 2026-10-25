@@ -17,15 +17,38 @@ use std::{
     time::{Duration, Instant},
 };
 
-pub(crate) fn call(runtime: &Path, request: Value) -> Result<Value> {
+/// Connect to the private control bus and resolve `name` to the unique
+/// connection of the workspace compositor. Any same-user process that can
+/// reach the bus socket could queue for or claim a well-known name, so the
+/// owner's PID is checked and calls go to the unique name, which no other
+/// connection can take over.
+fn compositor_service(
+    runtime: &Path,
+    compositor: u32,
+    name: &str,
+) -> Result<(zbus::blocking::Connection, String)> {
     let connection = zbus::blocking::connection::Builder::address(
         crate::session::kwin::bus_address(runtime).as_str(),
     )?
     .method_timeout(Duration::from_secs(5))
     .build()?;
+    let dbus = zbus::blocking::fdo::DBusProxy::new(&connection)?;
+    let owner = dbus
+        .get_name_owner(name.try_into()?)
+        .with_context(|| format!("{name} has no owner on the private control bus"))?;
+    let pid = dbus.get_connection_unix_process_id(owner.as_ref().into())?;
+    if pid != compositor {
+        bail!("{name} is owned by pid {pid}, not the workspace compositor pid {compositor}");
+    }
+    Ok((connection, owner.to_string()))
+}
+
+pub(crate) fn call(runtime: &Path, compositor: u32, request: Value) -> Result<Value> {
+    let (connection, owner) =
+        compositor_service(runtime, compositor, "org.agent_sh.Workspace.Gnome")?;
     let proxy = zbus::blocking::Proxy::new(
         &connection,
-        "org.agent_sh.Workspace.Gnome",
+        owner.as_str(),
         "/org/agent_sh/Workspace/Gnome",
         "org.agent_sh.Workspace.Gnome",
     )?;
@@ -42,15 +65,12 @@ type MonitorSpec = (String, String, String, String);
 type Mode = (String, i32, i32, f64, f64, Vec<f64>, Properties);
 type Monitor = (MonitorSpec, Vec<Mode>, Properties);
 type LogicalMonitor = (i32, i32, f64, u32, bool, Vec<MonitorSpec>, Properties);
-pub(crate) fn apply_scale(runtime: &Path, scale: f64) -> Result<()> {
-    let connection = zbus::blocking::connection::Builder::address(
-        crate::session::kwin::bus_address(runtime).as_str(),
-    )?
-    .method_timeout(Duration::from_secs(5))
-    .build()?;
+pub(crate) fn apply_scale(runtime: &Path, compositor: u32, scale: f64) -> Result<()> {
+    let (connection, owner) =
+        compositor_service(runtime, compositor, "org.gnome.Mutter.DisplayConfig")?;
     let proxy = zbus::blocking::Proxy::new(
         &connection,
-        "org.gnome.Mutter.DisplayConfig",
+        owner.as_str(),
         "/org/gnome/Mutter/DisplayConfig",
         "org.gnome.Mutter.DisplayConfig",
     )?;
@@ -93,7 +113,7 @@ pub(crate) fn apply_scale(runtime: &Path, scale: f64) -> Result<()> {
     let _: () = proxy.call("ApplyMonitorsConfig", &(serial, 1u32, logical, &properties))?;
     let deadline = Instant::now() + Duration::from_secs(5);
     loop {
-        if call(runtime, json!({"op":"probe"}))?["scale"]
+        if call(runtime, compositor, json!({"op":"probe"}))?["scale"]
             .as_f64()
             .is_some_and(|v| (v - scale).abs() < 0.001)
         {
@@ -105,8 +125,8 @@ pub(crate) fn apply_scale(runtime: &Path, scale: f64) -> Result<()> {
         std::thread::sleep(Duration::from_millis(30));
     }
 }
-fn frame(runtime: &Path, id: Option<&str>) -> Result<image::RgbaImage> {
-    let value = call(runtime, json!({"op":"screenshot","id":id}))?;
+fn frame(runtime: &Path, compositor: u32, id: Option<&str>) -> Result<image::RgbaImage> {
+    let value = call(runtime, compositor, json!({"op":"screenshot","id":id}))?;
     let bytes: Vec<u8> = serde_json::from_value(value["png"].clone())?;
     Ok(
         image::load_from_memory_with_format(&bytes, image::ImageFormat::Png)
@@ -114,8 +134,8 @@ fn frame(runtime: &Path, id: Option<&str>) -> Result<image::RgbaImage> {
             .to_rgba8(),
     )
 }
-pub(crate) fn probe_capture(runtime: &Path) -> Result<(u32, u32)> {
-    Ok(frame(runtime, None)?.dimensions())
+pub(crate) fn probe_capture(runtime: &Path, compositor: u32) -> Result<(u32, u32)> {
+    Ok(frame(runtime, compositor, None)?.dimensions())
 }
 
 pub(crate) struct GnomeDesktopControl<'a> {
@@ -125,8 +145,70 @@ impl<'a> GnomeDesktopControl<'a> {
     pub fn new(status: &'a WorkspaceStatus) -> Self {
         Self { status }
     }
+    fn compositor(&self) -> Result<u32> {
+        self.status
+            .window_manager_pid
+            .context("GNOME compositor PID missing from workspace status")
+    }
     fn call(&self, request: Value) -> Result<Value> {
-        call(&self.status.runtime_dir, request)
+        call(&self.status.runtime_dir, self.compositor()?, request)
+    }
+    /// Xterm has no accessible text field; its Shift+Insert binding reads
+    /// PRIMARY. A short-lived X client owns PRIMARY, serves the text only to
+    /// the xterm process and exits, which clears PRIMARY. CLIPBOARD is never
+    /// touched, and the key is sent only while the xterm window has focus.
+    fn paste_xterm(&self, window_id: &str, pid: u32, text: &str) -> Result<()> {
+        use std::io::{BufRead, Write};
+        let exe = crate::workspace::daemon_executable_path()
+            .context("resolve current executable for the PRIMARY helper")?;
+        let mut child = super::x11::workspace_command(self.status, exe)
+            .args(["__xtest", "primary-once", &pid.to_string()])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .context("start the PRIMARY selection helper")?;
+        let stdout = child.stdout.take().context("PRIMARY helper stdout")?;
+        let (sender, lines) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout).lines() {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
+        let expect = |want: &str| -> Result<()> {
+            match lines.recv_timeout(Duration::from_secs(5)) {
+                Ok(Ok(line)) if line == want => Ok(()),
+                Ok(Ok(line)) => bail!("PRIMARY helper reported {line:?}, expected {want:?}"),
+                Ok(Err(error)) => Err(error.into()),
+                Err(_) => bail!("PRIMARY helper did not report {want:?} in time"),
+            }
+        };
+        let result = (|| {
+            let mut stdin = child.stdin.take().context("PRIMARY helper stdin")?;
+            stdin.write_all(text.as_bytes())?;
+            drop(stdin);
+            expect("owned")?;
+            let keys = super::kwin::keysyms("shift+Insert")?;
+            self.call(json!({"op":"keys","keys":keys,"focus":window_id}))?;
+            expect("served")
+        })();
+        if result.is_err() {
+            let _ = child.kill();
+        }
+        let output = child.wait_with_output()?;
+        if let Err(error) = result {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(error.context(format!("xterm PRIMARY paste failed: {}", stderr.trim())));
+        }
+        if !output.status.success() {
+            bail!(
+                "PRIMARY helper failed: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
+            );
+        }
+        Ok(())
     }
     fn mutate(&self, op: &str, id: &str) -> Result<()> {
         self.call(json!({"op":op,"id":super::sanitize_window_id(id)?}))?;
@@ -165,7 +247,11 @@ impl<'a> GnomeDesktopControl<'a> {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        let mut image = frame(&self.status.runtime_dir, window.map(|w| w.id.as_str()))?;
+        let mut image = frame(
+            &self.status.runtime_dir,
+            self.compositor()?,
+            window.map(|w| w.id.as_str()),
+        )?;
         if let Some(window) = window {
             let g = &window.geometry;
             if image.dimensions() != (g.width, g.height) {
@@ -300,17 +386,13 @@ impl DesktopControl for GnomeDesktopControl<'_> {
         let result = self.call(json!({"op":"text","text":text}))?;
         if result["x11"] == true {
             let window: WorkspaceWindow = serde_json::from_value(result["window"].clone())?;
+            let pid = window.pid.context("legacy client PID missing")?;
             if window.wm_class.as_deref().is_some_and(|name| {
                 name.eq_ignore_ascii_case("xterm") || name.eq_ignore_ascii_case("uxterm")
             }) {
-                // Xterm's defined Shift+Insert binding reads PRIMARY. Keep the
-                // ordinary CLIPBOARD untouched; PRIMARY retains the typed text
-                // so asynchronous selection reads cannot race restoration.
-                self.call(json!({"op":"primary-set","text":text}))?;
-                self.key("shift+Insert")?;
+                self.paste_xterm(&window.id, pid, text)?;
             } else {
-                let pid = window.pid.context("legacy client PID missing")?;
-                text_input::insert(self.status, &window.id, pid, text)?;
+                text_input::insert(self.status, self.compositor()?, &window.id, pid, text)?;
             }
         }
         Ok(())

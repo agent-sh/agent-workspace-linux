@@ -166,12 +166,16 @@ Mutter validates scale against the chosen physical output mode. For example,
 1200x900 supports 150%; 960x720 does not. Unsupported combinations fail at
 startup. Geometry, input and screenshots use physical pixels throughout.
 GTK clients may use a larger integer buffer scale on fractional outputs.
-Native Unicode text requires a focused Wayland text-input field. Legacy GTK
-and Qt editable fields use the private accessibility bus, with client PID,
-focus, caret, selection and text readback checks. Xterm uses its PRIMARY
-selection and Shift+Insert binding. That replaces the workspace PRIMARY
-selection but preserves the ordinary CLIPBOARD. Unsupported legacy fields
-return an error instead of reporting dropped Unicode characters as typed.
+Native Unicode text requires a focused Wayland text-input field. A request
+that cannot be typed in full is rejected before any key is sent. Legacy
+editable fields (GTK, Qt, Chromium, Firefox, Electron) use the private
+accessibility bus, with client PID, focus, caret, selection and text readback
+checks. Xterm gets text through PRIMARY and its Shift+Insert binding: a
+short-lived X client owns PRIMARY, serves the text once to the xterm process
+only, then exits, which leaves PRIMARY empty. CLIPBOARD is not touched.
+Unsupported legacy fields return an error instead of reporting dropped
+Unicode characters as typed. Window screenshots paint the window offscreen
+and do not change focus or stacking.
 
 The session has a private session bus, accessibility bus and empty system bus.
 A bundled Shell extension exposes fixed native controls only to the workspace

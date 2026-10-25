@@ -15,8 +15,14 @@ use zbus::{
 
 type Object = (String, OwnedObjectPath);
 
+// AtspiRole values from at-spi2-core atspi-constants.h.
+const ROLE_PASSWORD_TEXT: u32 = 40;
+const ROLE_TEXT: u32 = 61;
+const ROLE_ENTRY: u32 = 79;
+
 pub(super) fn insert(
     status: &WorkspaceStatus,
+    compositor: u32,
     window_id: &str,
     pid: u32,
     text: &str,
@@ -60,16 +66,20 @@ pub(super) fn insert(
             )?;
             let state: Vec<u32> = accessible.call("GetState", &())?;
             let interfaces: Vec<String> = accessible.call("GetInterfaces", &())?;
-            let role: String = accessible.call("GetRoleName", &())?;
+            let role: u32 = accessible.call("GetRole", &())?;
             // AT-SPI StateType::Focused is bit12; interface membership is
             // checked separately so read-only text never becomes editable.
-            if role.contains("text")
+            // Role names differ per toolkit (GTK4 says "text box"), so match
+            // the AT-SPI role enum: TEXT for GTK and Qt fields, ENTRY for
+            // Chromium, Firefox, Electron and search fields. Readback below
+            // applies to every role.
+            if matches!(role, ROLE_TEXT | ROLE_ENTRY | ROLE_PASSWORD_TEXT)
                 && state.first().is_some_and(|s| s & (1 << 12) != 0)
                 && ["org.a11y.atspi.EditableText", "org.a11y.atspi.Text"]
                     .iter()
                     .all(|interface| interfaces.iter().any(|s| s == interface))
             {
-                if role.contains("password") {
+                if role == ROLE_PASSWORD_TEXT {
                     bail!("legacy password text cannot be verified through accessibility");
                 }
                 let target = zbus::blocking::proxy::Builder::<Proxy>::new(&connection)
@@ -120,7 +130,11 @@ pub(super) fn insert(
                 let suffix: String = target
                     .call("GetText", &(end, i32::MAX))
                     .context("legacy suffix readback")?;
-                let active = super::call(&status.runtime_dir, serde_json::json!({"op":"active"}))?;
+                let active = super::call(
+                    &status.runtime_dir,
+                    compositor,
+                    serde_json::json!({"op":"active"}),
+                )?;
                 let state: Vec<u32> = accessible.call("GetState", &())?;
                 if active["id"].as_str() != Some(window_id)
                     || !state.first().is_some_and(|s| s & (1 << 12) != 0)

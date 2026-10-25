@@ -54,6 +54,43 @@ export default class Workspace extends Extension {
         return w;
     }
     _scale() { return global.display.get_monitor_scale(0); }
+    _focusId() {
+        const w = global.display.focus_window;
+        return w ? `gnome:${w.get_stable_sequence()}` : null;
+    }
+    // Paint the window actor offscreen, as the Shell screenshot UI does, so
+    // capture never activates, raises or refocuses anything. Only a
+    // minimized window is shown for the capture and minimized again.
+    async _captureWindow(window, stream) {
+        const focus = global.display.focus_window;
+        const minimized = window.minimized;
+        try {
+            if (minimized) { window.unminimize(); await delay(); }
+            const actor = window.get_compositor_private();
+            if (!actor) throw new Error('Window has no compositor actor');
+            const content = actor.paint_to_content(null);
+            const texture = content?.get_texture();
+            if (!texture) throw new Error('Window actor produced no texture');
+            const scale = actor.get_resource_scale();
+            const frame = window.get_frame_rect(), buffer = window.get_buffer_rect();
+            const tw = texture.get_width(), th = texture.get_height();
+            const x = Math.min(tw, Math.max(0, Math.round((frame.x - buffer.x) * scale)));
+            const y = Math.min(th, Math.max(0, Math.round((frame.y - buffer.y) * scale)));
+            const w = Math.min(tw - x, Math.round(frame.width * scale));
+            const h = Math.min(th - y, Math.round(frame.height * scale));
+            if (w <= 0 || h <= 0) throw new Error('Window frame is outside its painted buffer');
+            await new Promise((resolve, reject) => Shell.Screenshot.composite_to_stream(
+                texture, x, y, w, h, scale, null, 0, 0, 1, stream, (_source, result) => {
+                    try { Shell.Screenshot.composite_to_stream_finish(result); resolve(); } catch (e) { reject(e); }
+                }));
+        } finally {
+            if (minimized) window.minimize();
+            if (global.display.focus_window !== focus) {
+                if (focus) focus.focus(global.get_current_time());
+                else global.display.unset_input_focus(global.get_current_time());
+            }
+        }
+    }
     _describe(w) {
         const r = w.get_frame_rect(), s = this._scale();
         return {id: `gnome:${w.get_stable_sequence()}`, title: w.get_title() ?? '',
@@ -83,49 +120,52 @@ export default class Workspace extends Extension {
         case 'click': pointer(q.x,q.y); await delay(); for(let i=0;i<q.count;i++) { button(q.button,true); button(q.button,false); } break;
         case 'drag': pointer(q.fx,q.fy); await delay(); button(q.button,true); for(let i=1;i<=12;i++) { pointer(q.fx+(q.tx-q.fx)*i/12,q.fy+(q.ty-q.fy)*i/12); await delay(); } button(q.button,false); break;
         case 'scroll': pointer(q.x,q.y); await delay(); for(let i=0;i<q.amount;i++) this._pointer.notify_discrete_scroll(time(), q.direction, Clutter.ScrollSource.WHEEL); break;
-        case 'keys': for(const k of q.keys) key(k,true); for(const k of [...q.keys].reverse()) key(k,false); break;
+        case 'keys': {
+            // Optional focus guard: check and send in one compositor turn.
+            if (q.focus !== undefined && this._focusId() !== q.focus)
+                throw new Error(`Window ${q.focus} lost focus before key input`);
+            for(const k of q.keys) key(k,true); for(const k of [...q.keys].reverse()) key(k,false); break;
+        }
         case 'text': {
             const window = global.display.focus_window;
             if (!window) throw new Error('No focused window for text input');
             if (window.get_client_type() === Meta.WindowClientType.X11)
                 return {x11: true, window: this._describe(window)};
-            for (const part of q.text.split(/([\n\r\t])/)) {
-                if (!part) continue;
-                if (/^[\n\r\t]$/.test(part)) {
+            // CRLF is one Return. Validate the whole request before sending
+            // anything so a rejected segment never leaves text half typed.
+            const parts = q.text.split(/(\r\n|[\n\r\t])/).filter(part => part);
+            const control = part => /^(\r\n|[\n\r\t])$/.test(part);
+            const im = Main.inputMethod.currentFocus;
+            if (!im && parts.some(part => !control(part) && !/^[\x20-\x7e]+$/.test(part)))
+                throw new Error('Native Unicode input requires a focused Wayland text-input field; nothing was typed');
+            let typed = 0;
+            for (const part of parts) {
+                if (global.display.focus_window !== window || Main.inputMethod.currentFocus !== im)
+                    throw new Error(`Text input focus changed after ${typed} of ${[...q.text].length} characters were typed`);
+                if (control(part)) {
                     const k = part === '\t' ? Clutter.KEY_Tab : Clutter.KEY_Return;
                     key(k, true); key(k, false); await delay();
-                } else if (Main.inputMethod.currentFocus) {
+                } else if (im) {
                     Main.inputMethod.commit(part);
-                } else if (/^[\x20-\x7e]*$/.test(part)) {
-                    for (const c of part) { key(c.codePointAt(0), true); key(c.codePointAt(0), false); }
                 } else {
-                    throw new Error('Native Unicode input requires a focused Wayland text-input field');
+                    for (const c of part) { key(c.codePointAt(0), true); key(c.codePointAt(0), false); }
                 }
+                typed += [...part].length;
             }
             await delay();
             return {x11: false};
         }
-        case 'primary-set': St.Clipboard.get_default().set_text(St.ClipboardType.PRIMARY,q.text); break;
         case 'clipboard-set': St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD,q.text); break;
         case 'clipboard-get': return await new Promise(resolve => St.Clipboard.get_default().get_text(St.ClipboardType.CLIPBOARD, (_c,text) => resolve(text ?? '')));
         case 'screenshot': {
             const stream = Gio.MemoryOutputStream.new_resizable();
-            const screenshot = new Shell.Screenshot();
-            const old = global.display.focus_window;
-            let window = null, minimized = false;
-            try {
-                if(q.id) { window=this._window(q.id); minimized=window.minimized; window.unminimize(); window.activate(global.get_current_time()); await delay(); }
-                if(window) await screenshot.screenshot_window(true,true,stream);
-                else await screenshot.screenshot(true,stream);
-                stream.close(null);
-                const png = Array.from(stream.steal_as_bytes().get_data());
-                if (png.length === 0)
-                    throw new Error('GNOME PNG encoding returned no data; check the private bwrap helper');
-                return {png};
-            } finally {
-                if(window && minimized) window.minimize();
-                if(window && old && old !== window) old.activate(global.get_current_time());
-            }
+            if (q.id) await this._captureWindow(this._window(q.id), stream);
+            else await new Shell.Screenshot().screenshot(true, stream);
+            stream.close(null);
+            const png = Array.from(stream.steal_as_bytes().get_data());
+            if (png.length === 0)
+                throw new Error('GNOME PNG encoding returned no data; check the private bwrap helper');
+            return {png};
         }
         default: throw new Error(`Unknown fixed workspace operation: ${q.op}`);
         }

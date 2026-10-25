@@ -32,6 +32,7 @@ const BUTTON_RELEASE: u8 = 5;
 ///   drag  X1 Y1 X2 Y2 BUTTON
 ///   focus WINDOW_ID
 ///   focus-check WINDOW_ID
+///   primary-once PID   (text on stdin; serves PRIMARY once to PID)
 ///   content-check WINDOW_ID [VISIBLE_WORKSPACE_WINDOW_ID ...]
 pub fn run(args: &[String]) -> Result<()> {
     let (conn, screen_num) = x11rb::connect(None).context("XTEST: connect to workspace display")?;
@@ -112,6 +113,10 @@ pub fn run(args: &[String]) -> Result<()> {
             }
             println!("{content}");
         }
+        Some("primary-once") if args.len() == 2 => {
+            let pid: u32 = args[1].parse().context("invalid PRIMARY target PID")?;
+            serve_primary_once(&conn, root, pid)?;
+        }
         Some("focus-check") if args.len() == 2 => {
             let window: u32 = args[1].parse().context("invalid X11 focus window id")?;
             println!("{}", focus_request_kind(&conn, window)?);
@@ -173,6 +178,172 @@ pub fn run(args: &[String]) -> Result<()> {
     // Round-trip so every faked event is processed before we exit.
     conn.get_input_focus()?.reply()?;
     Ok(())
+}
+
+/// Own PRIMARY with text read from stdin and serve it to exactly one
+/// UTF-8 request from a client whose XRes PID is `pid`, then exit. Exiting
+/// drops ownership, so no other client can read the text afterwards.
+/// Requests from other clients are refused. Prints `owned` once PRIMARY is
+/// held and `served` after the target client received the text.
+fn serve_primary_once(
+    conn: &x11rb::rust_connection::RustConnection,
+    root: u32,
+    pid: u32,
+) -> Result<()> {
+    use std::io::{Read, Write};
+    use x11rb::connection::RequestConnection as _;
+    use x11rb::protocol::{
+        res::{ClientIdMask, ClientIdSpec, ConnectionExt as _},
+        xproto::{
+            AtomEnum, CreateWindowAux, EventMask, PropMode, SelectionNotifyEvent, WindowClass,
+            SELECTION_NOTIFY_EVENT,
+        },
+        Event,
+    };
+    use x11rb::wrapper::ConnectionExt as _;
+    let mut text = Vec::new();
+    std::io::stdin().read_to_end(&mut text)?;
+    if std::str::from_utf8(&text).is_err() {
+        bail!("PRIMARY text is not UTF-8");
+    }
+    // One property write must carry the whole text; INCR is not implemented.
+    if text.len() + 64 > conn.maximum_request_bytes() {
+        bail!(
+            "text is {} bytes; one X selection transfer holds at most {}",
+            text.len(),
+            conn.maximum_request_bytes() - 64
+        );
+    }
+    let atom = |name: &[u8]| -> Result<u32> { Ok(conn.intern_atom(false, name)?.reply()?.atom) };
+    let (utf8, text_atom, targets, stamp) = (
+        atom(b"UTF8_STRING")?,
+        atom(b"TEXT")?,
+        atom(b"TARGETS")?,
+        atom(b"AGENT_WORKSPACE_PRIMARY_TIME")?,
+    );
+    let window = conn.generate_id()?;
+    conn.create_window(
+        0,
+        window,
+        root,
+        0,
+        0,
+        1,
+        1,
+        0,
+        WindowClass::INPUT_ONLY,
+        0,
+        &CreateWindowAux::new().event_mask(EventMask::PROPERTY_CHANGE),
+    )?
+    .check()?;
+    // ICCCM forbids CurrentTime for ownership; a property change yields a
+    // real server timestamp.
+    conn.change_property8(PropMode::REPLACE, window, stamp, AtomEnum::STRING, b"")?;
+    conn.flush()?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    let time = loop {
+        match conn.poll_for_event()? {
+            Some(Event::PropertyNotify(event)) if event.window == window => break event.time,
+            Some(_) => {}
+            None if std::time::Instant::now() >= deadline => {
+                bail!("X server did not report a timestamp")
+            }
+            None => std::thread::sleep(std::time::Duration::from_millis(5)),
+        }
+    };
+    conn.set_selection_owner(window, u32::from(AtomEnum::PRIMARY), time)?
+        .check()?;
+    if conn
+        .get_selection_owner(u32::from(AtomEnum::PRIMARY))?
+        .reply()?
+        .owner
+        != window
+    {
+        bail!("could not take PRIMARY ownership");
+    }
+    println!("owned");
+    std::io::stdout().flush()?;
+    let requester_pid = |requestor: u32| -> Option<u32> {
+        conn.res_query_client_ids(&[ClientIdSpec {
+            client: requestor,
+            mask: ClientIdMask::LOCAL_CLIENT_PID,
+        }])
+        .ok()?
+        .reply()
+        .ok()?
+        .ids
+        .iter()
+        .find_map(|id| id.value.first().copied())
+    };
+    let mut refused = Vec::new();
+    loop {
+        let Some(event) = conn.poll_for_event()? else {
+            if std::time::Instant::now() >= deadline {
+                bail!("target client did not request PRIMARY; refused requests: {refused:?}");
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            continue;
+        };
+        match event {
+            Event::SelectionClear(event) if event.owner == window => {
+                bail!("PRIMARY was replaced before the target client read it");
+            }
+            Event::SelectionRequest(request) if request.owner == window => {
+                let property = if request.property == 0 {
+                    request.target
+                } else {
+                    request.property
+                };
+                let from_target = requester_pid(request.requestor) == Some(pid);
+                let served = if request.selection != u32::from(AtomEnum::PRIMARY) {
+                    None
+                } else if request.target == targets {
+                    conn.change_property32(
+                        PropMode::REPLACE,
+                        request.requestor,
+                        property,
+                        AtomEnum::ATOM,
+                        &[targets, utf8, text_atom],
+                    )?;
+                    Some(false)
+                } else if (request.target == utf8 || request.target == text_atom) && from_target {
+                    conn.change_property8(
+                        PropMode::REPLACE,
+                        request.requestor,
+                        property,
+                        utf8,
+                        &text,
+                    )?;
+                    Some(true)
+                } else {
+                    refused.push((requester_pid(request.requestor), request.target));
+                    None
+                };
+                conn.send_event(
+                    false,
+                    request.requestor,
+                    EventMask::NO_EVENT,
+                    SelectionNotifyEvent {
+                        response_type: SELECTION_NOTIFY_EVENT,
+                        sequence: 0,
+                        time: request.time,
+                        requestor: request.requestor,
+                        selection: request.selection,
+                        target: request.target,
+                        property: if served.is_some() { property } else { 0 },
+                    },
+                )?;
+                conn.flush()?;
+                if served == Some(true) {
+                    conn.get_input_focus()?.reply()?;
+                    println!("served");
+                    std::io::stdout().flush()?;
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 // Only WM-managed top-level windows need an activation request. Popups and
