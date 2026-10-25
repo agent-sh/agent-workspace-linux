@@ -61,6 +61,19 @@ private `/dev` with no input or DRM devices. There is no host PATH fallback. The
 application activation services; the accessibility bus has only its registry.
 The system bus is private and contains no activation services.
 
+Sandboxed apps connect to a separate `wayland-apps` socket. At startup the
+daemon registers it with COSMIC through `wp_security_context_v1`, with the
+sandbox engine `agent-workspace-linux`, and keeps its close descriptor open for
+the session. COSMIC withholds its privileged globals from every client of that
+socket: toplevel info and management, workspaces, image capture, output
+configuration and power, virtual keyboard, input method, layer shell, session
+lock, keyboard layout, data control, accessibility and nested security
+contexts. Startup fails if the socket advertises any of them. Only this socket
+is bound into sandboxes. The compositor socket stays with the daemon's
+helpers, attached controllers and unsandboxed launches, matching the control
+bus: those run as the same user with full file access, and desktop services
+such as portals need capture.
+
 The current upstream spawn inventory is:
 
 | Source | Spawn | Restriction |
@@ -80,8 +93,10 @@ their exact signature and count, and fails on any other compositor error.
 For an output capture, COSMIC binds the window surface, renders, then copies
 the frame into the capture buffer from inside `render_output`. That copy binds
 an offscreen texture, which makes the EGL context current without a surface.
-The following `eglSwapBuffers` then fails with `EGL_BAD_SURFACE`, because Mesa
-requires the surface to be the current draw surface (`eglapi.c`). Smithay
+The following swap then fails with `EGL_BAD_SURFACE`, because Mesa requires
+the surface to be the current draw surface (`eglapi.c`). Smithay swaps with
+`eglSwapBuffersWithDamageKHR` when the frame has damage and with
+`eglSwapBuffers` otherwise, so the log names either call. Smithay
 answers `EGL_BAD_SURFACE` by creating a new window surface before destroying
 the old one. Mesa refuses a second surface on the same `wl_egl_window` with
 `EGL_BAD_ALLOC` (`platform_wayland.c`), so the old surface stays in place.

@@ -31,7 +31,8 @@ const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "awl-tui-"));
 const configDir = path.join(tempDir, "config");
 const runtimeDir = path.join(tempDir, "runtime");
 fs.mkdirSync(configDir, { recursive: true });
-fs.mkdirSync(runtimeDir, { recursive: true });
+fs.mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
+fs.chmodSync(runtimeDir, 0o700);
 fs.chmodSync(runtimeDir, 0o700);
 
 const env = {

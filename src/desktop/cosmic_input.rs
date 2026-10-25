@@ -99,8 +99,64 @@ impl Input {
             .with_context(|| format!("COSMIC input capability {} unavailable", T::NAME))
     }
 }
+/// COSMIC commits EI text through text-input only when a text-input client is
+/// focused and no input method is bound. Otherwise it maps each character to a
+/// keysym and silently drops characters libxkbcommon maps to none (older
+/// releases do so for Unicode noncharacters), and control characters become
+/// editing keys or keysyms clients ignore. Reject such text before sending.
+pub(crate) fn check_text_deliverable(text: &str) -> Result<()> {
+    for character in text.chars() {
+        let control = character.is_control() && character != '\t';
+        if control || xkbcommon::xkb::utf32_to_keysym(character as u32).raw() == 0 {
+            bail!(
+                "COSMIC cannot type character U+{:04X}; send control keys with key actions",
+                character as u32
+            );
+        }
+    }
+    Ok(())
+}
+
+fn seat_keymap(device: &Device) -> Result<xkbcommon::xkb::Keymap> {
+    let keymap = device
+        .keymap()
+        .context("COSMIC EI keyboard has no keymap")?;
+    let mut file = std::fs::File::from(keymap.fd.try_clone()?);
+    file.seek(SeekFrom::Start(0))?;
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    text.truncate(text.trim_end_matches('\0').len());
+    let context = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
+    xkbcommon::xkb::Keymap::new_from_string(
+        &context,
+        text,
+        xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )
+    .context("invalid EI keymap")
+}
+/// Keycode and shift level of a keysym in the seat layout's first group.
+fn key_for_keysym(map: &xkbcommon::xkb::Keymap, sym: xkbcommon::xkb::Keysym) -> Option<(u32, u32)> {
+    (0..=1).find_map(|level| {
+        (map.min_keycode().raw()..=map.max_keycode().raw())
+            .find(|c| {
+                map.key_get_syms_by_level(xkbcommon::xkb::Keycode::new(*c), 0, level)
+                    .contains(&sym)
+            })
+            .map(|code| (code, level))
+    })
+}
+
 /// Caller applies an additional process deadline, including D-Bus and handshake.
 pub(crate) fn run(bus_address: &str, actions: &Value) -> Result<Value> {
+    for action in actions
+        .as_array()
+        .context("COSMIC input actions must be an array")?
+    {
+        if action["kind"] == "text" {
+            check_text_deliverable(action["text"].as_str().context("text missing")?)?;
+        }
+    }
     let bus = zbus::blocking::connection::Builder::address(bus_address)?
         .method_timeout(Duration::from_secs(3))
         .name("com.system76.CosmicOSK")?
@@ -133,6 +189,20 @@ pub(crate) fn run(bus_address: &str, actions: &Value) -> Result<Value> {
         input.wait()?;
     }
     let regions=input.device::<ei::PointerAbsolute>()?.0.regions().iter().map(|r|json!({"x":r.x,"y":r.y,"width":r.width,"height":r.height,"scale":r.scale,"mapping_id":r.mapping_id})).collect::<Vec<_>>();
+    // Resolve every key before sending any, so a missing key types nothing.
+    let mut keymap = None;
+    for action in actions.as_array().into_iter().flatten() {
+        if action["kind"] == "key" {
+            if keymap.is_none() {
+                keymap = Some(seat_keymap(&input.device::<ei::Keyboard>()?.0)?);
+            }
+            let raw = action["keysym"].as_u64().context("keysym missing")? as u32;
+            if key_for_keysym(keymap.as_ref().unwrap(), xkbcommon::xkb::Keysym::new(raw)).is_none()
+            {
+                bail!("keysym 0x{raw:x} is not in the COSMIC keyboard layout; nothing was typed");
+            }
+        }
+    }
     let serial = input.events.connection().serial();
     for d in &input.devices {
         d.device().start_emulating(serial, 1);
@@ -181,37 +251,12 @@ pub(crate) fn run(bus_address: &str, actions: &Value) -> Result<Value> {
             }
             "key" => {
                 let (d, i) = input.device::<ei::Keyboard>()?;
-                let keymap = d.keymap().context("COSMIC EI keyboard has no keymap")?;
-                let mut file = std::fs::File::from(keymap.fd.try_clone()?);
-                file.seek(SeekFrom::Start(0))?;
-                let mut text = String::new();
-                file.read_to_string(&mut text)?;
-                text.truncate(text.trim_end_matches('\0').len());
-                let context = xkbcommon::xkb::Context::new(xkbcommon::xkb::CONTEXT_NO_FLAGS);
-                let map = xkbcommon::xkb::Keymap::new_from_string(
-                    &context,
-                    text,
-                    xkbcommon::xkb::KEYMAP_FORMAT_TEXT_V1,
-                    xkbcommon::xkb::KEYMAP_COMPILE_NO_FLAGS,
-                )
-                .context("invalid EI keymap")?;
+                let map = keymap.as_ref().context("COSMIC keymap unavailable")?;
                 let sym = xkbcommon::xkb::Keysym::new(
                     action["keysym"].as_u64().context("keysym missing")? as u32,
                 );
-                let (code, level) = (0..=1)
-                    .find_map(|level| {
-                        (map.min_keycode().raw()..=map.max_keycode().raw())
-                            .find(|c| {
-                                map.key_get_syms_by_level(
-                                    xkbcommon::xkb::Keycode::new(*c),
-                                    0,
-                                    level,
-                                )
-                                .contains(&sym)
-                            })
-                            .map(|code| (code, level))
-                    })
-                    .context("keysym not in COSMIC keyboard layout")?;
+                let (code, level) =
+                    key_for_keysym(map, sym).context("keysym not in COSMIC keyboard layout")?;
                 let pressed = action["pressed"] == true;
                 let shift = if level == 1 {
                     let symbol = xkbcommon::xkb::Keysym::new(0xffe1);
@@ -271,4 +316,23 @@ pub(crate) fn run(bus_address: &str, actions: &Value) -> Result<Value> {
     input.events.connection().connection().disconnect();
     input.context.flush()?;
     Ok(json!({"delivered":true,"regions":regions}))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::check_text_deliverable;
+
+    #[test]
+    fn text_with_keysyms_is_deliverable() {
+        check_text_deliverable("Native COSMIC: שלום café 日本語\tA!").unwrap();
+    }
+
+    #[test]
+    fn characters_cosmic_would_drop_or_reinterpret_are_rejected() {
+        for text in [
+            "a\u{1}b", "x\r", "\u{8}", "\u{1b}", "\u{7f}", "\u{85}", "\n",
+        ] {
+            assert!(check_text_deliverable(text).is_err(), "{text:?}");
+        }
+    }
 }

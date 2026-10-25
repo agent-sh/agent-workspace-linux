@@ -30,7 +30,7 @@ VIEWER_RUNTIME_DIR="$SMOKE_DIR/runtime"
 WORKSPACE_ID="gpui-viewer-smoke-$$"
 COMPANION_WORKSPACE_ID="${WORKSPACE_ID}-stopped"
 VIEWER_PID=""
-mkdir -p "$VIEWER_RUNTIME_DIR"
+mkdir -m 700 -p "$VIEWER_RUNTIME_DIR"
 export XDG_RUNTIME_DIR="$VIEWER_RUNTIME_DIR"
 
 cleanup() {
@@ -137,7 +137,7 @@ fi
 
 echo "== open GPUI viewer through X11/Xwayland =="
 mkdir -p "$VIEWER_CONFIG_HOME/agent-workspace-linux"
-mkdir -p "$VIEWER_RUNTIME_DIR"
+mkdir -m 700 -p "$VIEWER_RUNTIME_DIR"
 cat > "$VIEWER_CONFIG_HOME/agent-workspace-linux/viewer.json" <<'JSON'
 {
   "width": 380.0,

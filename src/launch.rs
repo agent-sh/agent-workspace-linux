@@ -61,6 +61,9 @@ pub(crate) fn scrub_host_session_environment(command: &mut Command) {
     }
 }
 
+/// The attach environment for trusted external controllers (the agent host,
+/// computer-use-linux). It keeps the compositor-facing session bus; only apps
+/// launched into the workspace are switched to the client bus.
 pub(crate) fn workspace_environment_variables(status: &WorkspaceStatus) -> Vec<EnvVar> {
     let mut variables = vec![
         EnvVar {
@@ -95,7 +98,6 @@ pub(crate) fn workspace_environment_variables(status: &WorkspaceStatus) -> Vec<E
         &status.xauthority_path,
         &status.runtime_dir,
     );
-    configure_application_bus(&mut command, status);
     for (name, value) in command.get_envs() {
         let name = name.to_string_lossy().to_string();
         variables.retain(|entry| entry.name != name);
@@ -109,10 +111,15 @@ pub(crate) fn workspace_environment_variables(status: &WorkspaceStatus) -> Vec<E
     variables
 }
 
+/// Sandboxed launches get the client bus, which carries no compositor
+/// control services. Unsandboxed launches run as the same user with full file
+/// access and could open the control bus anyway; they keep it, as desktop
+/// services such as xdg-desktop-portal-kde need the compositor.
 pub(crate) fn configure_launch_environment(
     command: &mut Command,
     status: &WorkspaceStatus,
     launch_env: &[EnvVar],
+    sandboxed: bool,
 ) {
     scrub_host_session_environment(command);
     for env_var in launch_env {
@@ -128,10 +135,13 @@ pub(crate) fn configure_launch_environment(
         &status.xauthority_path,
         &status.runtime_dir,
     );
-    configure_application_bus(command, status);
+    if sandboxed {
+        configure_application_bus(command, status);
+    }
 }
 
 fn configure_application_bus(command: &mut Command, status: &WorkspaceStatus) {
+    status.session.configure_sandboxed_environment(command);
     if status.session.backend.requires_client_application_bus() {
         let bus = status.runtime_dir.join("client-bus");
         command.env(
@@ -239,7 +249,7 @@ pub(crate) fn bubblewrap_sandbox_for_launch(
             args.extend(["--tmpfs".to_string(), base.display().to_string()]);
         }
         args.extend(["--tmpfs".to_string(), runtime_target.display().to_string()]);
-        let resources = app_session_resources(status, terminal_dir)?;
+        let (resources, wayland) = app_session_resources(status, terminal_dir)?;
         let mut dirs = BTreeSet::new();
         for path in resources
             .read_only_binds
@@ -264,6 +274,13 @@ pub(crate) fn bubblewrap_sandbox_for_launch(
                     target_path(&path).display().to_string(),
                 ]);
             }
+        }
+        if let Some((filtered, visible)) = wayland {
+            args.extend([
+                "--bind".to_string(),
+                filtered.display().to_string(),
+                target_path(&visible).display().to_string(),
+            ]);
         }
         if network.unshare_net() {
             args.push("--unshare-net".to_string());
@@ -361,10 +378,12 @@ fn host_desktop_ipc_dirs() -> Vec<PathBuf> {
         .collect()
 }
 
+/// Also returns the backend's filtered Wayland socket and the main socket
+/// path apps see it at, when the backend's main socket is privileged.
 fn app_session_resources(
     status: &WorkspaceStatus,
     terminal_dir: Option<&Path>,
-) -> Result<SessionSandboxResources> {
+) -> Result<(SessionSandboxResources, Option<(PathBuf, PathBuf)>)> {
     let mut resources = status.session.sandbox_resources(
         &status.xauthority_path,
         &status.runtime_dir,
@@ -397,7 +416,14 @@ fn app_session_resources(
         }
         resources.read_write_binds.push(dir.to_path_buf());
     }
-    Ok(resources)
+    let wayland = status.session.sandbox_wayland_socket(&status.runtime_dir);
+    if let Some((filtered, visible)) = &wayland {
+        crate::session::wayland_filter::require_socket(filtered)?;
+        resources
+            .read_write_binds
+            .retain(|path| path != visible && path != filtered);
+    }
+    Ok((resources, wayland))
 }
 
 pub(crate) fn restricted_mount_namespace_args(
@@ -407,8 +433,8 @@ pub(crate) fn restricted_mount_namespace_args(
     network: LaunchNetworkPlan,
     terminal_dir: Option<&Path>,
 ) -> Result<Vec<String>> {
-    let resources = app_session_resources(status, terminal_dir)?;
-    restricted_mount_namespace_args_with_resources(policy, cwd, network, resources)
+    let (resources, wayland) = app_session_resources(status, terminal_dir)?;
+    restricted_mount_namespace_args_with_resources(policy, cwd, network, resources, wayland)
 }
 
 fn restricted_mount_namespace_args_with_resources(
@@ -416,6 +442,7 @@ fn restricted_mount_namespace_args_with_resources(
     cwd: Option<&Path>,
     network: LaunchNetworkPlan,
     resources: SessionSandboxResources,
+    wayland: Option<(PathBuf, PathBuf)>,
 ) -> Result<Vec<String>> {
     let policy = policy.context("mount namespace requested without an applied policy")?;
     let mut args = Vec::new();
@@ -433,6 +460,9 @@ fn restricted_mount_namespace_args_with_resources(
         .chain(&resources.read_write_binds)
     {
         add_parent_dirs(&mut dirs, path);
+    }
+    if let Some((_, visible)) = &wayland {
+        add_parent_dirs(&mut dirs, visible);
     }
     for mount in &policy.mounts {
         if !mount.workspace_path.is_absolute() {
@@ -487,6 +517,11 @@ fn restricted_mount_namespace_args_with_resources(
         args.push("--bind".to_string());
         args.push(path.display().to_string());
         args.push(path.display().to_string());
+    }
+    if let Some((filtered, visible)) = wayland {
+        args.push("--bind".to_string());
+        args.push(filtered.display().to_string());
+        args.push(visible.display().to_string());
     }
 
     for mount in &policy.mounts {
@@ -644,7 +679,7 @@ mod tests {
         let mut command = Command::new("true");
         command.env("DBUS_SESSION_BUS_ADDRESS", "host-dbus");
 
-        configure_launch_environment(&mut command, &status, &[]);
+        configure_launch_environment(&mut command, &status, &[], true);
 
         let address = command
             .get_envs()
@@ -682,6 +717,39 @@ mod tests {
             assert!(error.to_string().contains("client bus is unavailable"));
         }
 
+        fs::remove_dir_all(runtime).expect("remove test runtime");
+    }
+
+    #[test]
+    fn only_sandboxed_apps_get_the_client_bus() {
+        let runtime = test_runtime("controller-bus");
+        fs::create_dir_all(&runtime).expect("runtime");
+        let status = native_status(&runtime, crate::session::SessionBackend::Kwin);
+        let control = crate::session::private::socket_address(&runtime.join("session-bus"));
+        let client = crate::session::private::socket_address(&runtime.join("client-bus"));
+        let attach = workspace_environment_variables(&status)
+            .into_iter()
+            .find(|var| var.name == "DBUS_SESSION_BUS_ADDRESS")
+            .expect("attach bus");
+        assert_eq!(attach.value, control);
+
+        let mut command = Command::new("true");
+        configure_launch_environment(&mut command, &status, &[], true);
+        let launched = command
+            .get_envs()
+            .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
+            .and_then(|(_, value)| value)
+            .expect("app bus");
+        assert_eq!(launched.to_string_lossy(), client);
+
+        let mut command = Command::new("true");
+        configure_launch_environment(&mut command, &status, &[], false);
+        let unsandboxed = command
+            .get_envs()
+            .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
+            .and_then(|(_, value)| value)
+            .expect("unsandboxed app bus");
+        assert_eq!(unsandboxed.to_string_lossy(), control);
         fs::remove_dir_all(runtime).expect("remove test runtime");
     }
 
@@ -766,6 +834,12 @@ mod tests {
         let listener =
             std::os::unix::net::UnixListener::bind(&client_bus).expect("working client bus socket");
         let status = native_status(&runtime, backend);
+        let _filter = status
+            .session
+            .sandbox_wayland_socket(&runtime)
+            .map(|(filtered, _)| {
+                std::os::unix::net::UnixListener::bind(filtered).expect("filtered Wayland socket")
+            });
         let policies = [
             sandbox_policy(Vec::new(), NetworkMode::Disabled),
             sandbox_policy(
@@ -810,6 +884,67 @@ mod tests {
     }
 
     #[test]
+    fn native_sandboxes_see_only_the_filtered_wayland_socket() {
+        for backend in [
+            crate::session::SessionBackend::Kwin,
+            crate::session::SessionBackend::Hyprland,
+            crate::session::SessionBackend::Cosmic,
+        ] {
+            let runtime = test_runtime(&format!("filtered-wayland-{backend:?}"));
+            let mount_host = runtime.join("mount-host");
+            fs::create_dir_all(&mount_host).expect("runtime and mount host");
+            let _bus = std::os::unix::net::UnixListener::bind(runtime.join("client-bus"))
+                .expect("client bus socket");
+            let status = native_status(&runtime, backend);
+            // The socket sandboxes would otherwise bind: the main socket, or
+            // COSMIC's security-context socket.
+            let (_, main) = status
+                .session
+                .sandbox_wayland_socket(&runtime)
+                .expect("native backends filter Wayland");
+            let _main = std::os::unix::net::UnixListener::bind(&main).expect("main socket");
+            let policies = [
+                sandbox_policy(Vec::new(), NetworkMode::Disabled),
+                sandbox_policy(
+                    vec![crate::policy::ProfileMount {
+                        host_path: mount_host,
+                        workspace_path: PathBuf::from("/workspace/data"),
+                        mode: crate::policy::MountMode::ReadOnly,
+                    }],
+                    NetworkMode::Disabled,
+                ),
+            ];
+            for policy in &policies {
+                let error = match bubblewrap_sandbox_for_launch(&status, Some(policy), None, None) {
+                    Err(error) => error,
+                    Ok(_) => panic!("a missing Wayland filter must fail closed"),
+                };
+                assert!(error.to_string().contains("sandbox Wayland filter"));
+            }
+            let filtered = runtime.join(crate::session::wayland_filter::SOCKET);
+            let _filter =
+                std::os::unix::net::UnixListener::bind(&filtered).expect("filtered socket");
+            let canonical = fs::canonicalize(&runtime).expect("canonical runtime");
+            let same = |arg: &str, path: &Path| {
+                Path::new(arg) == path
+                    || Path::new(arg) == canonical.join(path.file_name().unwrap())
+            };
+            for policy in &policies {
+                let sandbox = bubblewrap_sandbox_for_launch(&status, Some(policy), None, None)
+                    .expect("filtered sandbox")
+                    .expect("sandbox");
+                assert!(sandbox.args.windows(3).any(|window| {
+                    window[0] == "--bind" && same(&window[1], &filtered) && same(&window[2], &main)
+                }));
+                assert!(!sandbox.args.windows(3).any(|window| {
+                    matches!(window[0].as_str(), "--bind" | "--ro-bind") && same(&window[1], &main)
+                }));
+            }
+            fs::remove_dir_all(runtime).expect("remove test runtime");
+        }
+    }
+
+    #[test]
     fn hyprland_crash_then_x11_same_runtime_ignores_stale_client_bus() {
         let runtime = test_runtime("native-crash-x11-same-runtime");
         fs::create_dir_all(&runtime).expect("create reused runtime");
@@ -818,7 +953,7 @@ mod tests {
             std::os::unix::net::UnixListener::bind(&client_bus).expect("native client bus socket");
         let native = native_status(&runtime, crate::session::SessionBackend::Hyprland);
         let mut native_command = Command::new("true");
-        configure_launch_environment(&mut native_command, &native, &[]);
+        configure_launch_environment(&mut native_command, &native, &[], true);
         assert!(native_command
             .get_envs()
             .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
@@ -829,7 +964,7 @@ mod tests {
         let x11 = native_status(&runtime, crate::session::SessionBackend::X11);
         let mut command = Command::new("true");
         command.env("DBUS_SESSION_BUS_ADDRESS", "host-dbus");
-        configure_launch_environment(&mut command, &x11, &[]);
+        configure_launch_environment(&mut command, &x11, &[], true);
 
         let address = command
             .get_envs()
@@ -978,6 +1113,7 @@ mod tests {
                 read_only_binds: vec![xauthority.clone()],
                 read_write_binds: vec![socket.clone()],
             },
+            None,
         )
         .expect("mount namespace args");
 

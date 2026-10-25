@@ -24,6 +24,12 @@ exceed Linux Unix socket path limits. App environments use the actual workspace
 paths, with no descriptor aliases. Restricted apps receive only the private
 display, authenticated XWayland socket, private session bus and accessibility
 bus. They cannot access the compositor control socket or its parent's display.
+Their Wayland socket is the daemon's filter, not Hyprland's main socket. Hyprland
+offers screencopy, toplevel export, virtual keyboard and pointer, input method,
+layer shell, session lock, output, gamma and data-control globals to every client
+of its main socket, and keeps virtual keyboard, pointer and input method even for
+`wp_security_context_v1` clients. The filter relays each sandboxed client over a
+security-context connection and forwards only globals an ordinary window needs.
 The private configuration has no application launch bindings, config includes,
 portal activation, or arbitrary D-Bus service activation.
 

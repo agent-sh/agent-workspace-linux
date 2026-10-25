@@ -77,7 +77,10 @@ impl<'a> HyprlandDesktopControl<'a> {
             wm_class: value["class"].as_str().map(str::to_owned),
             wm_instance: value["initialClass"].as_str().map(str::to_owned),
             app_id: None,
-            pid: value["pid"].as_u64().and_then(|v| u32::try_from(v).ok()),
+            // Relayed sandboxed windows report the relay's holder process.
+            pid: crate::session::wayland_filter::window_pid(
+                value["pid"].as_u64().and_then(|v| u32::try_from(v).ok()),
+            ),
             visible: value["mapped"] == true
                 && value["hidden"] != true
                 && value["workspace"]["name"].as_str() != Some("special:workspace-hidden"),

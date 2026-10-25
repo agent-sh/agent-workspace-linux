@@ -4,6 +4,7 @@ pub(crate) mod hyprland;
 pub(crate) mod i3;
 pub(crate) mod kwin;
 pub(crate) mod private;
+pub(crate) mod wayland_filter;
 pub(crate) mod x11;
 
 use crate::desktop::DesktopControl;
@@ -150,6 +151,15 @@ impl SessionSpec {
         }
     }
 
+    /// Environment for sandboxed launches only, applied after
+    /// `configure_process_environment`. Attached controllers and unsandboxed
+    /// launches keep the latter, as they do the control bus.
+    pub(crate) fn configure_sandboxed_environment(self, command: &mut Command) {
+        if self.backend == SessionBackend::Cosmic {
+            cosmic::configure_sandboxed_environment(command);
+        }
+    }
+
     pub(crate) fn sandbox_resources(
         self,
         xauthority_path: &Path,
@@ -170,6 +180,30 @@ impl SessionSpec {
             SessionBackend::Cosmic => {
                 cosmic::sandbox_resources(runtime_dir, xauthority_path, display)
             }
+        }
+    }
+
+    /// The filtered Wayland socket a backend binds into sandboxes in place
+    /// of its main socket, and that main socket's app-visible path.
+    pub(crate) fn sandbox_wayland_socket(
+        self,
+        runtime_dir: &Path,
+    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        match self.backend {
+            SessionBackend::Kwin => Some(wayland_filter::sandbox_socket(
+                runtime_dir,
+                kwin::WAYLAND_SOCKET,
+            )),
+            SessionBackend::Hyprland => Some(wayland_filter::sandbox_socket(
+                runtime_dir,
+                hyprland::WAYLAND_SOCKET,
+            )),
+            // COSMIC's own security-context socket is the filter's upstream.
+            SessionBackend::Cosmic => Some(wayland_filter::sandbox_socket(
+                runtime_dir,
+                cosmic::APP_SOCKET,
+            )),
+            SessionBackend::X11 | SessionBackend::I3 | SessionBackend::Gnome => None,
         }
     }
 

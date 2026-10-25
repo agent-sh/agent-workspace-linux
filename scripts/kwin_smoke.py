@@ -113,7 +113,9 @@ for scale in (1, 1.5):
         env = workspace(id, "env")["environment"]["variables"]
         env = {entry["name"]: entry["value"] for entry in env}
         assert env["XDG_SESSION_TYPE"] == "wayland"
-        assert env["DBUS_SESSION_BUS_ADDRESS"].endswith(f"/{id}/client-bus")
+        # Attached controllers (computer-use-linux) need the compositor bus;
+        # launched apps get client-bus instead (runtime_isolation_smoke.py).
+        assert env["DBUS_SESSION_BUS_ADDRESS"].endswith(f"/{id}/session-bus")
         assert env["WAYLAND_DISPLAY"] == "workspace-wayland"
         assert env["QT_QPA_PLATFORM"] == "wayland"
         bus_env = dict(os.environ, **env)
@@ -257,4 +259,8 @@ try:
     print("KWin restricted XWayland terminal passed",flush=True)
 finally:
     workspace(id,"stop")
+# Sandboxed apps must reach only the filtered Wayland socket.
+(Path.home()/".cache").mkdir(exist_ok=True)
+subprocess.run(["python3","/opt/kwin-probe/sandbox_wayland_globals_smoke.py","kwin"],
+               env=dict(os.environ,AGENT_WORKSPACE_BIN=BIN,SANDBOX_GLOBALS_ARTIFACTS=str(ARTIFACTS)),check=True,timeout=300)
 print("KWin native acceptance passed", flush=True)

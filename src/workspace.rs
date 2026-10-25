@@ -381,6 +381,9 @@ pub struct ProcessStartTicks {
     pub x_server: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_manager: Option<u64>,
+    /// Running app leaders by pid.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub apps: BTreeMap<u32, u64>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -658,6 +661,22 @@ pub struct WorkspaceTerminal {
     pub width: u32,
     #[serde(default)]
     pub height: u32,
+    /// Where host-side tmux clients for this terminal must run.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub(crate) client_sandbox: TmuxClientSandbox,
+}
+
+/// The tmux server of a sandboxed terminal is code the sandbox controls, and a
+/// tmux client obeys server messages that run commands and open files. Host
+/// clients for such a terminal therefore run inside the same sandbox.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub(crate) enum TmuxClientSandbox {
+    /// Not resolved from the workspace; refuse to run a client.
+    #[default]
+    Unknown,
+    Host,
+    Bubblewrap(Vec<String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -1615,7 +1634,7 @@ pub fn cleanup_stale_workspaces(id: Option<String>, dry_run: bool) -> Result<Wor
             continue;
         }
 
-        match fs::remove_dir_all(&workspace.runtime_dir) {
+        match remove_stale_runtime(&workspace.runtime_dir) {
             Ok(()) => removed.push(WorkspaceCleanupEntry {
                 id: workspace.id,
                 runtime_dir: workspace.runtime_dir,
@@ -1665,7 +1684,12 @@ fn cleanup_stale_workspace_processes(
     let mut actions = Vec::new();
 
     for app in &manifest.apps {
-        cleanup_stale_app_process_group(app, dry_run, &mut actions);
+        cleanup_stale_app_process_group(
+            app,
+            manifest.process_start_ticks.as_ref(),
+            dry_run,
+            &mut actions,
+        );
     }
     actions.extend(if dry_run {
         terminal_preview
@@ -1719,7 +1743,34 @@ fn cleanup_stale_workspace_processes(
     Ok(actions)
 }
 
-fn cleanup_stale_app_process_group(app: &WorkspaceApp, dry_run: bool, actions: &mut Vec<String>) {
+/// Processes cleanup just signalled may still add entries while they exit
+/// (a log line, a socket being unlinked), so a non-empty error is retried
+/// within the same grace period they get to exit.
+fn remove_stale_runtime(runtime_dir: &Path) -> io::Result<()> {
+    let deadline = Instant::now() + Duration::from_millis(APP_TERMINATE_GRACE_MS);
+    let mut retried = false;
+    loop {
+        match fs::remove_dir_all(runtime_dir) {
+            Err(error)
+                if error.kind() == io::ErrorKind::DirectoryNotEmpty
+                    && Instant::now() < deadline =>
+            {
+                retried = true;
+                thread::sleep(Duration::from_millis(50));
+            }
+            // Gone between retries: removed is what was asked for.
+            Err(error) if retried && error.kind() == io::ErrorKind::NotFound => return Ok(()),
+            result => return result,
+        }
+    }
+}
+
+fn cleanup_stale_app_process_group(
+    app: &WorkspaceApp,
+    recorded: Option<&ProcessStartTicks>,
+    dry_run: bool,
+    actions: &mut Vec<String>,
+) {
     if !app.running {
         return;
     }
@@ -1740,6 +1791,15 @@ fn cleanup_stale_app_process_group(app: &WorkspaceApp, dry_run: bool, actions: &
             app_label, app.pid
         ));
         return;
+    }
+    if let Some(recorded) = recorded {
+        if recorded.apps.get(&app.pid).copied() != process_start_ticks(app.pid) {
+            actions.push(format!(
+                "skipped app {} process group {pgid}: leader pid {} is no longer the app this workspace started",
+                app_label, app.pid
+            ));
+            return;
+        }
     }
     match linux_process_group_id(app.pid) {
         Some(actual_pgid) if actual_pgid == pgid => {}
@@ -3852,9 +3912,12 @@ fn create_private_runtime_dir(path: &Path) -> Result<()> {
             .with_context(|| format!("failed to create {}", root.display()))?;
     }
     let metadata = verify_owned_dir(root, "workspace runtime root")?;
-    if metadata.mode() & 0o002 != 0 {
+    // XDG requires the runtime root to be private to its user. Group
+    // membership cannot be proven private (members by primary gid are not
+    // listed), so any group or world write is refused.
+    if metadata.mode() & 0o022 != 0 {
         bail!(
-            "workspace runtime root {} is world-writable; use a private XDG_RUNTIME_DIR",
+            "workspace runtime root {} is writable by other users; use a private XDG_RUNTIME_DIR",
             root.display()
         );
     }
@@ -3919,6 +3982,12 @@ fn workspace_manifest(status: &WorkspaceStatus, stopped_at_unix: Option<u64>) ->
                 .filter(|pid| *pid != 0)
                 .and_then(process_start_ticks),
             window_manager: status.window_manager_pid.and_then(process_start_ticks),
+            apps: status
+                .apps
+                .iter()
+                .filter(|app| app.running)
+                .filter_map(|app| process_start_ticks(app.pid).map(|ticks| (app.pid, ticks)))
+                .collect(),
         }),
     }
 }
@@ -7067,7 +7136,12 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
             child_command.current_dir(cwd);
         }
     }
-    crate::launch::configure_launch_environment(&mut child_command, &state.status, &spec.env);
+    crate::launch::configure_launch_environment(
+        &mut child_command,
+        &state.status,
+        &spec.env,
+        sandbox.is_some(),
+    );
     child_command.process_group(0);
     let child = child_command
         .spawn()
@@ -7143,10 +7217,12 @@ fn terminal_info(id: &str, terminal_id: &str, app_id: Option<String>) -> Result<
     let status = status_workspace(&id)?;
     let terminal_id = sanitize_terminal_id(terminal_id)?;
     let tmux_socket_path = terminal_socket_path(&status.runtime_dir, &terminal_id);
+    let client_sandbox = terminal_client_sandbox(&status, &tmux_socket_path)?;
     let session_name = terminal_id.clone();
     let target = session_name.clone();
     let output = tmux_output(
         &tmux_socket_path,
+        &client_sandbox,
         &[
             "display-message",
             "-p",
@@ -7177,7 +7253,85 @@ fn terminal_info(id: &str, terminal_id: &str, app_id: Option<String>) -> Result<
         current_path: non_empty_field(fields.get(5).copied()),
         width,
         height,
+        client_sandbox,
     })
+}
+
+/// Every per-terminal socket gets the same minimal client sandbox, whatever
+/// policy launched the terminal: read-only system directories, the terminal's
+/// own directory, no network and no home. A tmux client needs nothing else,
+/// and this is never weaker than the terminal's own sandbox. Legacy sockets
+/// at the runtime root only exist for terminals launched by older daemons.
+fn terminal_client_sandbox(status: &WorkspaceStatus, socket: &Path) -> Result<TmuxClientSandbox> {
+    let terminal_dir = socket
+        .parent()
+        .filter(|dir| dir.parent() == Some(status.runtime_dir.join("client").as_path()));
+    match terminal_dir {
+        Some(dir) => Ok(TmuxClientSandbox::Bubblewrap(tmux_client_sandbox_args(
+            dir,
+        )?)),
+        None if bubblewrap_sandbox_for_launch(
+            status,
+            status.applied_policy.as_ref(),
+            None,
+            None,
+        )?
+        .is_none() =>
+        {
+            Ok(TmuxClientSandbox::Host)
+        }
+        None => bail!(
+            "terminal socket {} predates per-terminal sandboxes; restart the workspace to use it",
+            socket.display()
+        ),
+    }
+}
+
+fn tmux_client_sandbox_args(terminal_dir: &Path) -> Result<Vec<String>> {
+    let source = fs::canonicalize(terminal_dir)
+        .with_context(|| format!("managed terminal directory {}", terminal_dir.display()))?;
+    let mut args = [
+        "--unshare-net",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind",
+        "/etc",
+        "/etc",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    // Merged-/usr systems link these into /usr; older layouts have real dirs.
+    for path in ["/bin", "/sbin", "/lib", "/lib64"] {
+        match fs::read_link(path) {
+            Ok(target) => args.extend([
+                "--symlink".to_string(),
+                target.display().to_string(),
+                path.to_string(),
+            ]),
+            Err(_) if Path::new(path).is_dir() => {
+                args.extend(["--ro-bind".to_string(), path.to_string(), path.to_string()])
+            }
+            Err(_) => {}
+        }
+    }
+    args.extend([
+        "--bind".to_string(),
+        source.display().to_string(),
+        terminal_dir.display().to_string(),
+        "--chdir".to_string(),
+        "/".to_string(),
+    ]);
+    Ok(args)
 }
 
 fn tmux_capture_pane(
@@ -7188,11 +7342,12 @@ fn tmux_capture_pane(
     if preserve_trailing_spaces {
         args.insert(2, "-N");
     }
-    match tmux_output(&terminal.tmux_socket_path, &args) {
+    match tmux_output(&terminal.tmux_socket_path, &terminal.client_sandbox, &args) {
         Ok(output) => Ok(output),
         Err(error) if preserve_trailing_spaces => {
             let fallback = tmux_output(
                 &terminal.tmux_socket_path,
+                &terminal.client_sandbox,
                 &["capture-pane", "-p", "-t", terminal.target.as_str()],
             )?;
             Ok(format!(
@@ -7206,6 +7361,7 @@ fn tmux_capture_pane(
 fn tmux_send_literal_text(terminal: &WorkspaceTerminal, text: &str) -> Result<()> {
     tmux_status(
         &terminal.tmux_socket_path,
+        &terminal.client_sandbox,
         &[
             "send-keys",
             "-t",
@@ -7220,11 +7376,11 @@ fn tmux_send_literal_text(terminal: &WorkspaceTerminal, text: &str) -> Result<()
 fn tmux_send_keys(terminal: &WorkspaceTerminal, keys: &[String]) -> Result<()> {
     let mut args = vec!["send-keys", "-t", terminal.target.as_str()];
     args.extend(keys.iter().map(String::as_str));
-    tmux_status(&terminal.tmux_socket_path, &args)
+    tmux_status(&terminal.tmux_socket_path, &terminal.client_sandbox, &args)
 }
 
-fn tmux_output(socket_path: &Path, args: &[&str]) -> Result<String> {
-    let output = tmux_command(socket_path, args)
+fn tmux_output(socket_path: &Path, sandbox: &TmuxClientSandbox, args: &[&str]) -> Result<String> {
+    let output = tmux_command(socket_path, sandbox, args)?
         .output()
         .with_context(|| format!("failed to run tmux {}", args.join(" ")))?;
     if !output.status.success() {
@@ -7237,8 +7393,8 @@ fn tmux_output(socket_path: &Path, args: &[&str]) -> Result<String> {
     String::from_utf8(output.stdout).context("tmux output was not UTF-8")
 }
 
-fn tmux_status(socket_path: &Path, args: &[&str]) -> Result<()> {
-    let output = tmux_command(socket_path, args)
+fn tmux_status(socket_path: &Path, sandbox: &TmuxClientSandbox, args: &[&str]) -> Result<()> {
+    let output = tmux_command(socket_path, sandbox, args)?
         .output()
         .with_context(|| format!("failed to run tmux {}", args.join(" ")))?;
     if !output.status.success() {
@@ -7251,12 +7407,31 @@ fn tmux_status(socket_path: &Path, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-fn tmux_command(socket_path: &Path, args: &[&str]) -> Command {
+fn tmux_command(socket_path: &Path, sandbox: &TmuxClientSandbox, args: &[&str]) -> Result<Command> {
     let tmux = resolve_executable_path(DEFAULT_TMUX_PROGRAM)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_TMUX_PROGRAM));
-    let mut command = Command::new(tmux);
+    let mut command = match sandbox {
+        TmuxClientSandbox::Unknown => bail!("terminal client sandbox was not resolved"),
+        TmuxClientSandbox::Host => Command::new(tmux),
+        TmuxClientSandbox::Bubblewrap(sandbox_args) => {
+            let mut command = Command::new("bwrap");
+            command
+                .args(sandbox_args)
+                .arg("--die-with-parent")
+                .arg("--")
+                .arg(tmux);
+            command
+        }
+    };
+    // The client sends its environment to the server; send nothing private.
+    command.env_clear();
+    for name in ["PATH", "LANG", "LC_ALL", "LC_CTYPE"] {
+        if let Some(value) = env::var_os(name) {
+            command.env(name, value);
+        }
+    }
     command.arg("-S").arg(socket_path).args(args);
-    command
+    Ok(command)
 }
 
 fn non_empty_field(value: Option<&str>) -> Option<String> {
@@ -8739,8 +8914,15 @@ fn wait_for_daemon_startup(options: &DaemonOptions) -> Result<()> {
         thread::sleep(Duration::from_millis(100));
     }
     if let Some(pid) = pid.filter(|pid| owned_daemon_running(*pid, &options.session_id)) {
+        // setsid makes the daemon its own group leader; signal the group so
+        // helpers it started without a parent-death signal go with it.
+        let target = if linux_process_group_id(pid as u32) == Some(pid as u32) {
+            -pid
+        } else {
+            pid
+        };
         unsafe {
-            libc::kill(pid, libc::SIGTERM);
+            libc::kill(target, libc::SIGTERM);
         }
         let grace = Instant::now() + Duration::from_secs(5);
         while Instant::now() < grace && owned_daemon_running(pid, &options.session_id) {
@@ -8748,7 +8930,7 @@ fn wait_for_daemon_startup(options: &DaemonOptions) -> Result<()> {
         }
         if owned_daemon_running(pid, &options.session_id) {
             unsafe {
-                libc::kill(pid, libc::SIGKILL);
+                libc::kill(target, libc::SIGKILL);
             }
         }
     }
@@ -8787,7 +8969,9 @@ fn daemon_socket_ready(socket_path: &Path) -> Result<bool> {
     }
     if let Some(parent) = socket_path.parent() {
         if let Ok(error) = fs::read_to_string(parent.join("daemon.err.log")) {
-            if error.starts_with("Error:") {
+            // `Error:` is a reported failure; a panic can happen before the
+            // daemon records its pid, so catch it here instead of at the guard.
+            if error.starts_with("Error:") || error.contains("panicked at") {
                 bail!("workspace startup failed: {}", error.trim());
             }
         }
@@ -8848,13 +9032,28 @@ fn remove_dead_x11_display_artifacts(number: u32, socket: &Path, lock: &Path) ->
     if process_exists(pid) {
         return Ok(false);
     }
-    if socket.exists() {
-        fs::remove_file(socket)
-            .with_context(|| format!("failed to remove stale X11 socket {}", socket.display()))?;
-    }
-    if lock.exists() {
-        fs::remove_file(lock)
-            .with_context(|| format!("failed to remove stale X11 lock {}", lock.display()))?;
+    // A concurrent start (or Xvfb itself) may replace the stale lock with a
+    // live one; only remove artifacts while the same stale lock is in place.
+    let stale = fs::symlink_metadata(lock).map(|meta| meta.ino()).ok();
+    let still_stale = || {
+        fs::symlink_metadata(lock).map(|meta| meta.ino()).ok() == stale
+            && read_x11_lock_pid(lock) == Some(pid)
+    };
+    // Concurrent starts may find the same stale artifacts; already gone is
+    // the result we want.
+    for (path, what) in [(socket, "socket"), (lock, "lock")] {
+        if !still_stale() {
+            return Ok(false);
+        }
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to remove stale X11 {what} {}", path.display())
+                })
+            }
+        }
     }
     eprintln!("removed stale X11 display artifacts for :{number} with dead pid {pid}");
     Ok(true)
@@ -9644,7 +9843,7 @@ mod tests {
         }])
         .collect::<Vec<_>>();
 
-        crate::launch::configure_launch_environment(&mut command, &status, &launch_env);
+        crate::launch::configure_launch_environment(&mut command, &status, &launch_env, true);
         let envs = command
             .get_envs()
             .map(|(name, value)| {
@@ -9783,6 +9982,8 @@ mod tests {
         fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("chmod");
         assert!(create_private_runtime_dir(&runtime(&shared)).is_err());
         assert!(!shared.join("agent-workspace-linux").exists());
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o775)).expect("chmod");
+        assert!(create_private_runtime_dir(&runtime(&shared)).is_err());
 
         let linked = scratch.join("linked");
         std::os::unix::fs::symlink(&owned, &linked).expect("symlink root");
@@ -9799,6 +10000,67 @@ mod tests {
         assert!(create_private_runtime_dir(&runtime(&base_link)).is_err());
 
         fs::remove_dir_all(scratch).expect("remove scratch");
+    }
+
+    #[test]
+    fn sandboxed_terminals_get_sandboxed_tmux_clients() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let mut status = status_with_profile_defaults(policy(
+            NetworkPolicy {
+                mode: NetworkMode::Disabled,
+                allow_hosts: Vec::new(),
+            },
+            true,
+            false,
+        ));
+        status.runtime_dir =
+            std::env::temp_dir().join(format!("awl-tclient-{}-{unique}", std::process::id()));
+        let socket = client_terminal_socket_path(&status.runtime_dir, "t");
+        let terminal_dir = socket.parent().expect("terminal dir").to_path_buf();
+        fs::create_dir_all(&terminal_dir).expect("terminal dir");
+
+        let TmuxClientSandbox::Bubblewrap(args) =
+            terminal_client_sandbox(&status, &socket).expect("sandboxed client")
+        else {
+            panic!("sandboxed terminal must get a sandboxed tmux client");
+        };
+        let canonical_dir = fs::canonicalize(&terminal_dir).expect("canonical dir");
+        assert!(args.windows(3).any(|window| window[0] == "--bind"
+            && Path::new(&window[1]) == canonical_dir
+            && Path::new(&window[2]) == terminal_dir));
+        // Nothing of the host beyond system directories and this terminal.
+        assert!(args.iter().any(|arg| arg == "--unshare-net"));
+        assert!(!args.windows(2).any(|pair| {
+            matches!(pair[0].as_str(), "--bind" | "--ro-bind")
+                && matches!(pair[1].as_str(), "/" | "/home")
+        }));
+        let command = tmux_command(&socket, &TmuxClientSandbox::Bubblewrap(args), &["ls"])
+            .expect("client command");
+        assert_eq!(command.get_program(), "bwrap");
+        assert!(command.get_args().any(|arg| arg == "--die-with-parent"));
+        assert!(command
+            .get_envs()
+            .all(|(name, _)| ["PATH", "LANG", "LC_ALL", "LC_CTYPE"]
+                .contains(&name.to_str().unwrap_or_default())));
+
+        let legacy = status.runtime_dir.join("terminal-t.tmux.sock");
+        assert!(terminal_client_sandbox(&status, &legacy).is_err());
+
+        status.applied_policy = None;
+        // Even a terminal launched without a policy gets the minimal sandbox.
+        assert!(matches!(
+            terminal_client_sandbox(&status, &socket).expect("client"),
+            TmuxClientSandbox::Bubblewrap(_)
+        ));
+        assert_eq!(
+            terminal_client_sandbox(&status, &legacy).expect("legacy host client"),
+            TmuxClientSandbox::Host
+        );
+        assert!(tmux_command(&socket, &TmuxClientSandbox::Unknown, &["ls"]).is_err());
+        fs::remove_dir_all(&status.runtime_dir).expect("remove test runtime");
     }
 
     #[test]
@@ -10229,6 +10491,32 @@ mod tests {
             ),
             Some(LiveControlBlockReason::Mode(McpControlMode::Paused))
         );
+    }
+
+    #[test]
+    fn stale_app_cleanup_skips_a_leader_whose_start_time_changed() {
+        let pid = std::process::id();
+        let mut app = workspace_app_for_test("app-self");
+        app.pid = pid;
+        app.process_group_id = linux_process_group_id(pid);
+        app.running = true;
+        let ours = process_start_ticks(pid).expect("own start time");
+        let recorded = |ticks: u64| ProcessStartTicks {
+            apps: BTreeMap::from([(pid, ticks)]),
+            ..ProcessStartTicks::default()
+        };
+
+        let mut actions = Vec::new();
+        cleanup_stale_app_process_group(&app, Some(&recorded(ours)), true, &mut actions);
+        assert!(actions[0].starts_with("would terminate"), "{actions:?}");
+
+        let mut actions = Vec::new();
+        cleanup_stale_app_process_group(&app, Some(&recorded(ours + 1)), true, &mut actions);
+        assert!(actions[0].contains("no longer the app"), "{actions:?}");
+
+        let mut actions = Vec::new();
+        cleanup_stale_app_process_group(&app, None, true, &mut actions);
+        assert!(actions[0].starts_with("would terminate"), "{actions:?}");
     }
 
     fn workspace_app_for_test(id: &str) -> WorkspaceApp {

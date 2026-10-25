@@ -145,9 +145,23 @@ Install `i3-wm` and the X11 dependencies, including ImageMagick `import`.
 binary with `AGENT_WORKSPACE_BIN` to check the real private session and restricted apps.
 
 Sandboxed apps use private process namespaces and receive only the workspace
-display, application bus, accessibility bus, and shared client data. Network-only
-profiles retain normal host file access while hiding this workspace's control
-sockets and compositor settings. Compositor methods stay on a separate control bus.
+display, an application bus without compositor methods, the accessibility bus,
+and, for a managed terminal, that terminal's own socket directory. Network-only
+profiles keep normal host file access but hide every workspace runtime and the
+host desktop IPC (session and system bus, X11 sockets, IBus). Unsandboxed apps
+and attached controllers such as computer-use-linux use the compositor control
+bus, as in a regular desktop session.
+Sandboxed apps also get a restricted Wayland socket. On Hyprland, KWin and
+COSMIC it is a filter that forwards only an allow-list of ordinary app globals,
+so capture, input injection, input method, toplevel and workspace management,
+layer shell, session lock, output control and clipboard-manager globals stay
+hidden, and binds of hidden names are refused. The daemon's own helpers keep
+the unfiltered socket.
+`scripts/sandbox_wayland_globals_smoke.py` checks this on each native backend.
+This covers Wayland only. Sandboxed apps still share the workspace's X11
+display (Xvfb or XWayland) and accessibility bus with its other apps, so do not
+run untrusted sandboxed apps next to unsandboxed apps or terminals in the same
+workspace.
 
 Managed terminal sessions end when their workspace stops, even after the terminal
 window has closed. Stale cleanup uses the saved launch and session identity.
