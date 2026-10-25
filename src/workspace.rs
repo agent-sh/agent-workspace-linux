@@ -67,6 +67,7 @@ const SIGKILL: i32 = 9;
 const ESRCH: i32 = 3;
 const PRIVATE_RUNTIME_DIR_MODE: u32 = 0o700;
 const PRIVATE_SOCKET_MODE: u32 = 0o600;
+const DAEMON_PID_FILE: &str = "daemon.pid";
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 pub(crate) const MAX_CLIPBOARD_TEXT_BYTES: usize = 64 * 1024;
 const APPLIED_POLICY_FILE: &str = "applied_policy.json";
@@ -1234,14 +1235,7 @@ pub fn start_workspace(options: WorkspaceStartOptions) -> Result<IpcResponse> {
         }),
         WorkspaceStartPlan::Start(daemon_options) => {
             spawn_detached_daemon(&daemon_options)?;
-            wait_for_socket(
-                &daemon_options.socket_path,
-                if daemon_options.session.backend != crate::session::SessionBackend::X11 {
-                    Duration::from_secs(30)
-                } else {
-                    Duration::from_secs(5)
-                },
-            )?;
+            wait_for_daemon_startup(&daemon_options)?;
             request(&daemon_options.socket_path, IpcRequest::Status)
         }
     }
@@ -3325,6 +3319,11 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
     validate_unix_socket_path(&options.socket_path)?;
     create_private_runtime_dir(&options.runtime_dir)?;
     remove_stale_socket(&options.socket_path)?;
+    fs::write(
+        options.runtime_dir.join(DAEMON_PID_FILE),
+        format!("{}\n", std::process::id()),
+    )
+    .context("record workspace daemon pid")?;
 
     // Load the spawn-time MCP permission ceiling (if any) before serving any
     // IPC. Fail closed: if a ceiling path was provided but cannot be read or
@@ -3615,6 +3614,7 @@ fn prepare_workspace_start(mut options: WorkspaceStartOptions) -> Result<Workspa
     create_private_runtime_dir(&runtime_dir)?;
     create_client_runtime(&runtime_dir)?;
     remove_stale_socket(&socket_path)?;
+    remove_stale_socket(&runtime_dir.join(DAEMON_PID_FILE))?;
     let xauthority_path = runtime_dir.join("Xauthority");
     let display = if matches!(
         options.session.backend,
@@ -8615,22 +8615,95 @@ fn request(socket_path: &Path, request: IpcRequest) -> Result<IpcResponse> {
     Ok(response)
 }
 
-fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<()> {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if socket_path.exists() {
+/// Every startup step in the daemon is bounded and reports failure through
+/// `daemon.err.log` or by exiting, so wait for one of those rather than a fixed
+/// budget that slow native compositors can outlast. The cap only guards a hung
+/// daemon (summed worst-case native startup is about 70 s), and a daemon that
+/// hits it is stopped instead of left running behind a failed start.
+const DAEMON_STARTUP_HANG_GUARD: Duration = Duration::from_secs(120);
+
+fn wait_for_daemon_startup(options: &DaemonOptions) -> Result<()> {
+    let pid_path = options.runtime_dir.join(DAEMON_PID_FILE);
+    let deadline = Instant::now() + DAEMON_STARTUP_HANG_GUARD;
+    let mut pid = None;
+    while Instant::now() < deadline {
+        if daemon_socket_ready(&options.socket_path)? {
             return Ok(());
         }
-        if let Some(parent) = socket_path.parent() {
-            if let Ok(error) = fs::read_to_string(parent.join("daemon.err.log")) {
-                if error.starts_with("Error:") {
-                    bail!("workspace startup failed: {}", error.trim());
+        if pid.is_none() {
+            pid = fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok());
+        }
+        if let Some(pid) = pid {
+            if !owned_daemon_running(pid, &options.session_id) {
+                // The daemon may have written its error just before exiting.
+                if daemon_socket_ready(&options.socket_path)? {
+                    return Ok(());
                 }
+                bail!(
+                    "workspace daemon exited before it was ready; see {}",
+                    options.runtime_dir.join("daemon.err.log").display()
+                );
             }
         }
         thread::sleep(Duration::from_millis(100));
     }
-    bail!("timed out waiting for workspace IPC socket");
+    if let Some(pid) = pid.filter(|pid| owned_daemon_running(*pid, &options.session_id)) {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        let grace = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < grace && owned_daemon_running(pid, &options.session_id) {
+            thread::sleep(Duration::from_millis(100));
+        }
+        if owned_daemon_running(pid, &options.session_id) {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+    bail!(
+        "workspace daemon did not become ready within {} s and was stopped",
+        DAEMON_STARTUP_HANG_GUARD.as_secs()
+    )
+}
+
+/// True while `pid` is a live daemon for exactly this start, matched by its
+/// unique session id so a recycled PID is never signalled.
+fn owned_daemon_running(pid: i32, session_id: &str) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    if stat
+        .rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X"))
+    {
+        return false;
+    }
+    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
+    args.windows(2)
+        .any(|pair| pair[0] == b"--session-id" && pair[1] == session_id.as_bytes())
+}
+
+/// Ok(true) once the daemon serves IPC, an error once it reported a startup
+/// failure, Ok(false) while it is still starting.
+fn daemon_socket_ready(socket_path: &Path) -> Result<bool> {
+    if socket_path.exists() {
+        return Ok(true);
+    }
+    if let Some(parent) = socket_path.parent() {
+        if let Ok(error) = fs::read_to_string(parent.join("daemon.err.log")) {
+            if error.starts_with("Error:") {
+                bail!("workspace startup failed: {}", error.trim());
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn wait_for_socket_removed(socket_path: &Path, timeout: Duration) -> Result<()> {
@@ -9518,6 +9591,32 @@ mod tests {
             .expect_err("too-long socket path should fail before daemon spawn");
 
         assert!(error.to_string().contains("Unix socket paths"));
+    }
+
+    #[test]
+    fn owned_daemon_matches_only_its_live_session() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30", "daemon", "--session-id", "session-test-1"])
+            .spawn()
+            .expect("spawn stand-in daemon");
+        let pid = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !owned_daemon_running(pid, "session-test-1") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(owned_daemon_running(pid, "session-test-1"));
+        assert!(!owned_daemon_running(pid, "session-test-2"));
+        assert!(!owned_daemon_running(pid, "session-test"));
+        child.kill().expect("kill stand-in");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while owned_daemon_running(pid, "session-test-1") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !owned_daemon_running(pid, "session-test-1"),
+            "zombie counts as gone"
+        );
+        child.wait().expect("reap stand-in");
     }
 
     #[test]
