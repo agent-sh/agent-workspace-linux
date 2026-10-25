@@ -12,7 +12,7 @@ You need:
 
 ```bash
 sudo apt install xvfb openbox xdotool xauth x11-utils imagemagick xclip \
-    bubblewrap pkg-config libxkbcommon-x11-dev
+    bubblewrap uidmap pkg-config libxkbcommon-x11-dev
 ```
 
 ## Build

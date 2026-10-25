@@ -28,6 +28,9 @@ def cmd(*args):
     assert v.get("ok",True),v
     return v
 
+# Hosts that cannot drop supplementary groups keep them, as before.
+doctor=json.loads(subprocess.run([BIN,"doctor"],env=ENV,capture_output=True,text=True,timeout=60).stdout)
+drops_groups="1" if "drop supplementary groups via" in doctor["runtime"]["sandbox_group_drop"]["detail"] else "0"
 mcp=Mcp(BIN,ROOT/"mcp.log",env=ENV,headless=True)
 try:
     for mounted in (False,True):
@@ -45,7 +48,7 @@ try:
             probe="""import os,sys,json,socket
 from pathlib import Path
 runtime=Path(sys.argv[1]); hostpid=sys.argv[2]; own_x_socket='X'+sys.argv[3].split(':',1)[1].split('.')[0]
-paths=[runtime/'control.sock',runtime/'session-bus',runtime/'i3.sock',Path('/proc')/hostpid/'root'/str(runtime).lstrip('/')/'control.sock',*map(Path,sys.argv[4:])]
+paths=[runtime/'control.sock',runtime/'session-bus',runtime/'i3.sock',Path('/proc')/hostpid/'root'/str(runtime).lstrip('/')/'control.sock',*map(Path,sys.argv[5:])]
 ibus=Path.home()/'.cache'/'ibus'
 paths+=[p for p in ibus.glob('dbus-*')] if ibus.is_dir() else []
 reachable=[]
@@ -56,14 +59,15 @@ for path in paths:
  finally: s.close()
 foreign_x=[p.name for p in Path('/tmp/.X11-unix').iterdir() if p.name!=own_x_socket]
 host_bus=any(p.exists() for p in [Path('/run/dbus/system_bus_socket'),Path('/run/user')/str(os.getuid())/'bus'])
-print(json.dumps({'reachable':reachable,'pid':os.getpid(),'host_proc':Path('/proc',hostpid).exists(),'foreign_x':foreign_x,'host_bus':host_bus}))
-raise SystemExit(42 if reachable or Path('/proc',hostpid).exists() or foreign_x or host_bus else 0)
+groups=[g for g in os.getgroups() if g!=os.getgid()] if sys.argv[4]=='1' else []
+print(json.dumps({'reachable':reachable,'pid':os.getpid(),'host_proc':Path('/proc',hostpid).exists(),'foreign_x':foreign_x,'host_bus':host_bus,'groups':groups}))
+raise SystemExit(42 if reachable or Path('/proc',hostpid).exists() or foreign_x or host_bus or groups else 0)
 """
             terminal=mcp.tool("workspace_run_in_terminal",{"id":id,"terminal_id":"private","command":["sh","-c","printf PRIVATE_TERMINAL_OK; exec tail -f /dev/null"],"wait_window":True,"timeout_ms":10000})
             assert terminal["ok"],terminal
             # Another sandboxed app must not reach the terminal's tmux server, a
             # sibling workspace's control socket, or the host input-method bus.
-            run=cmd("workspace","run","--id",id,"--timeout-ms",10000,"--","python3","-c",probe,status["runtime_dir"],status["daemon_pid"],status["display"],
+            run=cmd("workspace","run","--id",id,"--timeout-ms",10000,"--","python3","-c",probe,status["runtime_dir"],status["daemon_pid"],status["display"],drops_groups,
                     terminal["terminal"]["tmux_socket_path"],Path(sibling["runtime_dir"])/"control.sock")
             assert run["exit_code"]==0,run
             screen=mcp.tool("workspace_terminal_read",{"id":id,"terminal_id":"private"})

@@ -586,6 +586,277 @@ pub(crate) fn resolve_command_path(program: &str) -> Option<PathBuf> {
         .find(|candidate| is_executable_file(candidate))
 }
 
+/// Unprivileged bubblewrap keeps the caller's supplementary groups, and groups
+/// such as docker or lxd are root-equivalent. When the owner has any, a
+/// sandboxed launch starts through `unshare` with a user namespace whose maps
+/// come from the setuid newuidmap/newgidmap (so setgroups stays allowed),
+/// drops every supplementary group and execs bubblewrap as the same uid with
+/// no capabilities. Inner root maps to one subordinate id nothing runs as.
+/// Best effort: when the groups cannot be dropped on this host, launches
+/// behave as before and keep them; `doctor` reports why.
+pub(crate) fn sandbox_launcher_prefix() -> Vec<String> {
+    cached_group_drop().clone().unwrap_or_default()
+}
+
+/// Whether sandboxed launches drop the owner's supplementary groups here, and
+/// why not when they cannot. Computed once per process: a daemon started
+/// before the host was fixed keeps its result until it restarts.
+pub(crate) fn group_drop_status() -> std::result::Result<bool, String> {
+    cached_group_drop()
+        .as_ref()
+        .map(|prefix| !prefix.is_empty())
+        .map_err(Clone::clone)
+}
+
+fn cached_group_drop() -> &'static std::result::Result<Vec<String>, String> {
+    static PREFIX: std::sync::OnceLock<std::result::Result<Vec<String>, String>> =
+        std::sync::OnceLock::new();
+    PREFIX.get_or_init(|| group_drop_prefix().map_err(|error| format!("{error:#}")))
+}
+
+fn group_drop_prefix() -> Result<Vec<String>> {
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    if supplementary_groups()?.iter().all(|group| *group == gid) {
+        return Ok(Vec::new());
+    }
+    let missing = |what: &str| {
+        anyhow::anyhow!(
+            "supplementary groups are kept in sandboxed launches ({what}); \
+             install uidmap and give your user a subordinate range, e.g. \
+             `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER`"
+        )
+    };
+    for tool in ["newuidmap", "newgidmap"] {
+        resolve_executable_path(tool).ok_or_else(|| missing(&format!("{tool} not found")))?;
+    }
+    let unshare = resolve_executable_path("unshare").ok_or_else(|| missing("unshare not found"))?;
+    // Repeated --map-users/--map-groups ranges arrived in util-linux 2.40.
+    let version = Command::new(&unshare)
+        .arg("--version")
+        .env_clear()
+        .output()
+        .ok()
+        .and_then(|output| String::from_utf8(output.stdout).ok())
+        .and_then(|text| util_linux_version(&text));
+    if version.is_none_or(|version| version < (2, 40)) {
+        return Err(missing("util-linux 2.40 or newer is required for unshare"));
+    }
+    let name = user_name(uid);
+    let sub_uid = subordinate_start(Path::new("/etc/subuid"), uid, name.as_deref())
+        .ok_or_else(|| missing("no /etc/subuid range"))?;
+    let sub_gid = subordinate_start(Path::new("/etc/subgid"), uid, name.as_deref())
+        .ok_or_else(|| missing("no /etc/subgid range"))?;
+    let prefix = vec![
+        unshare.display().to_string(),
+        "--user".to_string(),
+        format!("--map-users={uid}:{uid}:1"),
+        format!("--map-users=0:{sub_uid}:1"),
+        format!("--map-groups={gid}:{gid}:1"),
+        format!("--map-groups=0:{sub_gid}:1"),
+        "--setuid".to_string(),
+        uid.to_string(),
+        "--setgid".to_string(),
+        gid.to_string(),
+        "--".to_string(),
+    ];
+    group_drop_preflight(&prefix)?;
+    Ok(prefix)
+}
+
+fn util_linux_version(text: &str) -> Option<(u32, u32)> {
+    let version = text.split_whitespace().last()?;
+    let mut parts = version.split('.');
+    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
+}
+
+/// Runs the real chain once (the wrapper, then bubblewrap inside it), so a
+/// host that refuses either (user namespaces restricted by AppArmor,
+/// newuidmap denied, no_new_privs) keeps the previous behavior instead of
+/// every app exiting right after spawn.
+fn group_drop_preflight(prefix: &[String]) -> Result<()> {
+    let bwrap = resolve_executable_path("bwrap").context("bwrap not found")?;
+    let truth = resolve_executable_path("true").context("true not found")?;
+    let output = Command::new(&prefix[0])
+        .args(&prefix[1..])
+        .arg(bwrap)
+        .args([
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--unshare-pid",
+            "--proc",
+            "/proc",
+            "--unshare-net",
+            "--",
+        ])
+        .arg(truth)
+        .env_clear()
+        .output()
+        .context("could not run unshare")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let restricted = fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        .is_ok_and(|value| value.trim() == "1");
+    bail!(
+        "supplementary groups are kept in sandboxed launches: dropping them failed ({}){}",
+        String::from_utf8_lossy(&output.stderr).trim(),
+        if restricted {
+            ". AppArmor restricts unprivileged user namespaces here \
+             (kernel.apparmor_restrict_unprivileged_userns=1); see the README section \
+             on supplementary groups"
+        } else {
+            ""
+        }
+    )
+}
+
+/// A sandboxed launch command and the private descriptor carrying its
+/// arguments. Keep `args_fd` alive until the command is spawned.
+pub(crate) struct SandboxedCommand {
+    pub(crate) command: Command,
+    pub(crate) args_fd: std::os::fd::OwnedFd,
+}
+
+/// Builds a sandboxed launch. The launcher and bubblewrap run from absolute
+/// paths with an empty environment; the app's environment and argv reach
+/// bubblewrap through `--args` on a close-on-exec memfd that only this child
+/// inherits. Launch variables such as LD_PRELOAD or PATH therefore never
+/// apply to the launcher, and stay out of the world-readable command line.
+pub(crate) fn sandboxed_command(
+    sandbox_args: &[String],
+    program: &str,
+    program_args: &[String],
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<SandboxedCommand> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::process::CommandExt;
+    let bwrap = resolve_executable_path("bwrap").context("bwrap not found")?;
+    let args_fd = bwrap_args_memfd(sandbox_args, env)?;
+    let prefix = sandbox_launcher_prefix();
+    let mut command = match prefix.split_first() {
+        Some((launcher, args)) => {
+            let mut command = Command::new(launcher);
+            command.args(args).arg(&bwrap);
+            command
+        }
+        None => Command::new(&bwrap),
+    };
+    let fd = args_fd.as_raw_fd();
+    // bubblewrap reads only options from --args; the program stays on the
+    // command line after `--`.
+    command
+        .arg("--args")
+        .arg(fd.to_string())
+        .arg("--")
+        .arg(program)
+        .args(program_args)
+        .env_clear();
+    unsafe {
+        command.pre_exec(move || {
+            if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    Ok(SandboxedCommand { command, args_fd })
+}
+
+/// The environment (`--setenv`) and the sandbox options, as NUL-separated
+/// bubblewrap arguments in a close-on-exec memfd. bubblewrap itself starts
+/// with an empty environment, so it passes only these variables on.
+fn bwrap_args_memfd(
+    sandbox_args: &[String],
+    env: &[(std::ffi::OsString, std::ffi::OsString)],
+) -> Result<std::os::fd::OwnedFd> {
+    use std::os::fd::FromRawFd;
+    use std::os::unix::ffi::OsStrExt;
+    // Arguments are NUL-separated: a NUL inside any value would split it
+    // into extra bubblewrap options.
+    let mut bytes = Vec::new();
+    let mut push = |value: &[u8]| -> Result<()> {
+        if value.contains(&0) {
+            bail!("sandbox argument or environment value contains a NUL byte");
+        }
+        bytes.extend_from_slice(value);
+        bytes.push(0);
+        Ok(())
+    };
+    for (name, value) in env {
+        push(b"--setenv")?;
+        push(name.as_bytes())?;
+        push(value.as_bytes())?;
+    }
+    for arg in sandbox_args {
+        push(arg.as_bytes())?;
+    }
+    let raw = unsafe { libc::memfd_create(c"bwrap-args".as_ptr(), libc::MFD_CLOEXEC) };
+    if raw < 0 {
+        return Err(std::io::Error::last_os_error()).context("create bwrap argument memfd");
+    }
+    let args_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
+    // A memfd on a standard stream would be replaced by the child's stdio.
+    if raw <= 2 {
+        bail!("bwrap argument memfd landed on standard stream {raw}");
+    }
+    let mut file = std::fs::File::from(args_fd.try_clone()?);
+    std::io::Write::write_all(&mut file, &bytes).context("write bwrap arguments")?;
+    std::io::Seek::rewind(&mut file).context("rewind bwrap arguments")?;
+    Ok(args_fd)
+}
+
+fn supplementary_groups() -> Result<Vec<libc::gid_t>> {
+    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error()).context("read supplementary groups");
+    }
+    let mut groups = vec![0 as libc::gid_t; count as usize];
+    let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
+    if count < 0 {
+        return Err(std::io::Error::last_os_error()).context("read supplementary groups");
+    }
+    groups.truncate(count as usize);
+    Ok(groups)
+}
+
+fn user_name(uid: libc::uid_t) -> Option<String> {
+    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
+    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
+    let mut result = std::ptr::null_mut();
+    let status = unsafe {
+        libc::getpwuid_r(
+            uid,
+            &mut entry,
+            buffer.as_mut_ptr(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    if status != 0 || result.is_null() {
+        return None;
+    }
+    unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }
+        .to_str()
+        .ok()
+        .map(str::to_string)
+}
+
+/// The first id of the user's range in an /etc/subuid-style file, matched by
+/// name or numeric uid.
+fn subordinate_start(path: &Path, uid: libc::uid_t, name: Option<&str>) -> Option<u64> {
+    let uid = uid.to_string();
+    fs::read_to_string(path).ok()?.lines().find_map(|line| {
+        let mut fields = line.trim().split(':');
+        let owner = fields.next()?;
+        let start = fields.next()?.parse::<u64>().ok()?;
+        let count = fields.next()?.parse::<u64>().ok()?;
+        (count >= 1 && (owner == uid || Some(owner) == name)).then_some(start)
+    })
+}
+
 pub(crate) fn resolve_executable_path(program: &str) -> Option<PathBuf> {
     if program.contains('/') {
         let path = PathBuf::from(program);
@@ -603,6 +874,55 @@ fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn launch_environment_reaches_bubblewrap_only_through_private_arguments() {
+        let env = [
+            ("LD_PRELOAD".into(), "/tmp/inject.so".into()),
+            ("PATH".into(), "/nonexistent".into()),
+        ];
+        let fd = bwrap_args_memfd(
+            &["--ro-bind".to_string(), "/".to_string(), "/".to_string()],
+            &env,
+        )
+        .expect("memfd");
+        let mut bytes = Vec::new();
+        std::io::Read::read_to_end(&mut std::fs::File::from(fd), &mut bytes).expect("read");
+        let args = bytes
+            .split(|byte| *byte == 0)
+            .map(|arg| String::from_utf8_lossy(arg).into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &args[..9],
+            [
+                "--setenv",
+                "LD_PRELOAD",
+                "/tmp/inject.so",
+                "--setenv",
+                "PATH",
+                "/nonexistent",
+                "--ro-bind",
+                "/",
+                "/",
+            ]
+        );
+        assert!(bwrap_args_memfd(&["--chdir".into(), "/w\0--bind\0/\0/x".into()], &[]).is_err());
+        assert!(bwrap_args_memfd(&[], &[("A".into(), "b\0c".into())]).is_err());
+    }
+
+    #[test]
+    fn subordinate_ranges_match_by_name_or_uid() {
+        let path = test_runtime("subuid");
+        fs::write(
+            &path,
+            "other:200000:65536\nalice:100000:0\nalice:300000:65536\n1000:400000:10\n",
+        )
+        .expect("write subuid");
+        assert_eq!(subordinate_start(&path, 1001, Some("alice")), Some(300000));
+        assert_eq!(subordinate_start(&path, 1000, None), Some(400000));
+        assert_eq!(subordinate_start(&path, 1002, Some("bob")), None);
+        fs::remove_file(path).expect("remove subuid");
+    }
+
     use super::*;
 
     fn native_status(

@@ -156,6 +156,9 @@ pub struct RuntimeReport {
     pub screenshot: Check,
     pub clipboard: Check,
     pub policy: PolicyRuntimeCapabilities,
+    /// Whether sandboxed launches drop the owner's supplementary groups; when
+    /// they cannot, sandboxed apps keep them as before.
+    pub sandbox_group_drop: Check,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1151,6 +1154,21 @@ pub fn doctor_report() -> DoctorReport {
         screenshot: first_available_command(&["ffmpeg", "import", "scrot"]),
         clipboard: first_available_command(&["xclip", "xsel"]),
         policy: policy_runtime_capabilities(),
+        sandbox_group_drop: match crate::launch::group_drop_status() {
+            Ok(false) => Check {
+                ok: true,
+                detail: "no supplementary groups to drop".to_string(),
+            },
+            Ok(true) => Check {
+                ok: true,
+                detail: "sandboxed launches drop supplementary groups via newuidmap/newgidmap"
+                    .to_string(),
+            },
+            Err(reason) => Check {
+                ok: false,
+                detail: reason,
+            },
+        },
     };
     let viewer = ViewerRuntimeReport {
         host_display: host_display_check(),
@@ -3853,6 +3871,30 @@ fn write_applied_policy_file(
     fs::write(&policy_path, format!("{content}\n"))
         .with_context(|| format!("failed to write {}", policy_path.display()))?;
     Ok(policy_path)
+}
+
+/// The environment a sandboxed app gets: the daemon's own environment with
+/// the launch rules applied (scrubbed host session variables, workspace
+/// variables, the caller's launch variables, the client bus). Bubblewrap
+/// receives it through `--setenv` instead of inheriting it.
+fn sandboxed_app_environment(
+    status: &WorkspaceStatus,
+    launch_env: &[EnvVar],
+) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
+    let mut rules = Command::new("true");
+    crate::launch::configure_launch_environment(&mut rules, status, launch_env, true);
+    let mut env = env::vars_os().collect::<BTreeMap<_, _>>();
+    for (name, value) in rules.get_envs() {
+        match value {
+            Some(value) => {
+                env.insert(name.to_os_string(), value.to_os_string());
+            }
+            None => {
+                env.remove(name);
+            }
+        }
+    }
+    env.into_iter().collect()
 }
 
 fn create_client_runtime(runtime: &Path) -> Result<()> {
@@ -7108,14 +7150,19 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
     )?;
     let (mount_isolation, network_isolation) =
         launch_isolation_labels_from_sandbox(sandbox.as_ref());
+    // Held until spawn: the descriptor that carries a sandboxed launch's
+    // arguments and environment to bubblewrap.
+    let mut sandbox_args_fd = None;
     let mut child_command = if let Some(sandbox) = &sandbox {
-        let mut command = Command::new("bwrap");
-        command
-            .args(&sandbox.args)
-            .arg("--")
-            .arg(&spec.command[0])
-            .args(&spec.command[1..]);
-        command
+        let env = sandboxed_app_environment(&state.status, &spec.env);
+        let built = crate::launch::sandboxed_command(
+            &sandbox.args,
+            &spec.command[0],
+            &spec.command[1..],
+            &env,
+        )?;
+        sandbox_args_fd = Some(built.args_fd);
+        built.command
     } else {
         let mut command = Command::new(&spec.command[0]);
         command.args(&spec.command[1..]);
@@ -7136,16 +7183,19 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
             child_command.current_dir(cwd);
         }
     }
-    crate::launch::configure_launch_environment(
-        &mut child_command,
-        &state.status,
-        &spec.env,
-        sandbox.is_some(),
-    );
+    if sandbox.is_none() {
+        crate::launch::configure_launch_environment(
+            &mut child_command,
+            &state.status,
+            &spec.env,
+            false,
+        );
+    }
     child_command.process_group(0);
     let child = child_command
         .spawn()
         .with_context(|| format!("failed to launch {}", launch_description(&spec.command)))?;
+    drop(sandbox_args_fd);
     let pid = child.id();
     let stdout_path = rename_app_log(&log_paths.stdout, pid, "stdout")?;
     let stderr_path = rename_app_log(&log_paths.stderr, pid, "stderr")?;
@@ -7414,7 +7464,16 @@ fn tmux_command(socket_path: &Path, sandbox: &TmuxClientSandbox, args: &[&str]) 
         TmuxClientSandbox::Unknown => bail!("terminal client sandbox was not resolved"),
         TmuxClientSandbox::Host => Command::new(tmux),
         TmuxClientSandbox::Bubblewrap(sandbox_args) => {
-            let mut command = Command::new("bwrap");
+            let bwrap = resolve_executable_path("bwrap").context("bwrap not found")?;
+            let prefix = crate::launch::sandbox_launcher_prefix();
+            let mut command = match prefix.split_first() {
+                Some((launcher, launcher_args)) => {
+                    let mut command = Command::new(launcher);
+                    command.args(launcher_args).arg(bwrap);
+                    command
+                }
+                None => Command::new(bwrap),
+            };
             command
                 .args(sandbox_args)
                 .arg("--die-with-parent")
@@ -10039,7 +10098,12 @@ mod tests {
         }));
         let command = tmux_command(&socket, &TmuxClientSandbox::Bubblewrap(args), &["ls"])
             .expect("client command");
-        assert_eq!(command.get_program(), "bwrap");
+        // bwrap, or unshare in front of it where supplementary groups are dropped.
+        let program = Path::new(command.get_program());
+        assert!(
+            program.ends_with("bwrap") || program.ends_with("unshare"),
+            "{program:?}"
+        );
         assert!(command.get_args().any(|arg| arg == "--die-with-parent"));
         assert!(command
             .get_envs()
