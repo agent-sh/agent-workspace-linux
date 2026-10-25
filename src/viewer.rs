@@ -264,6 +264,8 @@ struct ViewerSnapshot {
     i3_doctor_ready: bool,
     i3_doctor_blockers: Vec<String>,
     kwin_doctor_ready: bool,
+    hyprland_doctor_ready: bool,
+    hyprland_doctor_blockers: Vec<String>,
     kwin_doctor_blockers: Vec<String>,
     gnome_doctor_ready: bool,
     gnome_doctor_blockers: Vec<String>,
@@ -276,6 +278,9 @@ impl ViewerSnapshot {
             crate::session::SessionBackend::I3 => (self.i3_doctor_ready, &self.i3_doctor_blockers),
             crate::session::SessionBackend::Gnome => {
                 (self.gnome_doctor_ready, &self.gnome_doctor_blockers)
+            }
+            crate::session::SessionBackend::Hyprland => {
+                (self.hyprland_doctor_ready, &self.hyprland_doctor_blockers)
             }
             crate::session::SessionBackend::Kwin => {
                 (self.kwin_doctor_ready, &self.kwin_doctor_blockers)
@@ -2502,6 +2507,8 @@ fn compute_viewer_refresh(
                 i3_doctor_ready: doctor.ready_for_i3_workspace,
                 i3_doctor_blockers: doctor.i3_blockers,
                 kwin_doctor_ready: doctor.ready_for_kwin_workspace,
+                hyprland_doctor_ready: doctor.ready_for_hyprland_workspace,
+                hyprland_doctor_blockers: doctor.hyprland_blockers,
                 kwin_doctor_blockers: doctor.kwin_blockers,
                 gnome_doctor_ready: doctor.ready_for_gnome_workspace,
                 gnome_doctor_blockers: doctor.gnome_blockers,

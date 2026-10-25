@@ -1,4 +1,5 @@
 pub(crate) mod gnome;
+pub(crate) mod hyprland;
 pub(crate) mod i3;
 pub(crate) mod kwin;
 pub(crate) mod private;
@@ -34,6 +35,10 @@ impl SessionSpec {
                 "kwin_wayland_runtime",
                 "workspace apps use a private KWin Wayland display and session bus",
             ),
+            SessionBackend::Hyprland => (
+                "hyprland_wayland_runtime",
+                "workspace apps use private Hyprland Wayland and XWayland displays and a private session bus",
+            ),
             SessionBackend::I3 => (
                 "i3_xauth_display",
                 "workspace apps run on a private X11 display managed by i3 with scoped authority",
@@ -50,7 +55,7 @@ impl SessionSpec {
         self.backend == other.backend
             && (self.scale - other.scale).abs()
                 <= match self.backend {
-                    SessionBackend::Kwin => 0.5 / 256.0,
+                    SessionBackend::Kwin | SessionBackend::Hyprland => 0.5 / 256.0,
                     // Mutter exposes monitor scale as a single-precision float.
                     SessionBackend::Gnome => 1e-6,
                     SessionBackend::X11 | SessionBackend::I3 => 0.0,
@@ -71,6 +76,7 @@ impl SessionSpec {
             SessionBackend::X11 => crate::workspace::doctor_report().blockers,
             SessionBackend::Kwin => kwin::blockers(),
             SessionBackend::Gnome => gnome::blockers(),
+            SessionBackend::Hyprland => hyprland::blockers(),
             SessionBackend::I3 => i3::blockers(),
         }
     }
@@ -81,6 +87,9 @@ impl SessionSpec {
             SessionBackend::X11 => x11::X11Session::start(options).map(Session::X11),
             SessionBackend::Kwin => kwin::KwinSession::start(options).map(Session::Kwin),
             SessionBackend::Gnome => gnome::GnomeSession::start(options).map(Session::Gnome),
+            SessionBackend::Hyprland => {
+                hyprland::HyprlandSession::start(options).map(Session::Hyprland)
+            }
             SessionBackend::I3 => x11::X11Session::start(options).map(Session::X11),
         }
     }
@@ -97,6 +106,9 @@ impl SessionSpec {
                 Box::new(crate::desktop::gnome::GnomeDesktopControl::new(status))
             }
             SessionBackend::Kwin => Box::new(crate::desktop::kwin::KwinDesktopControl::new(status)),
+            SessionBackend::Hyprland => Box::new(
+                crate::desktop::hyprland::HyprlandDesktopControl::new(status),
+            ),
         }
     }
 
@@ -113,6 +125,9 @@ impl SessionSpec {
             }
             SessionBackend::Gnome => {
                 gnome::configure_process_environment(command, runtime_dir, display, xauthority)
+            }
+            SessionBackend::Hyprland => {
+                hyprland::configure_process_environment(command, runtime_dir, display, xauthority)
             }
             SessionBackend::Kwin => {
                 kwin::configure_process_environment(command, runtime_dir, display, xauthority)
@@ -134,13 +149,16 @@ impl SessionSpec {
                 gnome::sandbox_resources(runtime_dir, xauthority_path, display)
             }
             SessionBackend::Kwin => kwin::sandbox_resources(runtime_dir, xauthority_path, display),
+            SessionBackend::Hyprland => {
+                hyprland::sandbox_resources(runtime_dir, xauthority_path, display)
+            }
         }
     }
 
     pub(crate) fn chrome_ozone_platform(self) -> &'static str {
         match self.backend {
             SessionBackend::X11 | SessionBackend::I3 => x11::CHROME_OZONE_PLATFORM,
-            SessionBackend::Kwin | SessionBackend::Gnome => "wayland",
+            SessionBackend::Kwin | SessionBackend::Gnome | SessionBackend::Hyprland => "wayland",
         }
     }
 
@@ -157,6 +175,9 @@ impl SessionSpec {
             }
             SessionBackend::Gnome => {
                 gnome::cleanup_stale_processes(window_manager_pid, dry_run, actions)
+            }
+            SessionBackend::Hyprland => {
+                hyprland::cleanup_stale_processes(window_manager_pid, dry_run, actions)
             }
             SessionBackend::I3 => {
                 i3::cleanup_stale_processes(window_manager_pid, x_server_pid, dry_run, actions)
@@ -201,12 +222,13 @@ pub enum SessionBackend {
     X11,
     Kwin,
     Gnome,
+    Hyprland,
     I3,
 }
 
 impl SessionBackend {
     pub(crate) fn requires_client_application_bus(self) -> bool {
-        matches!(self, Self::Kwin | Self::Gnome)
+        matches!(self, Self::Kwin | Self::Gnome | Self::Hyprland)
     }
 
     fn as_str(self) -> &'static str {
@@ -214,6 +236,7 @@ impl SessionBackend {
             Self::X11 => "x11",
             Self::Kwin => "kwin",
             Self::Gnome => "gnome",
+            Self::Hyprland => "hyprland",
             Self::I3 => "i3",
         }
     }
@@ -227,9 +250,10 @@ impl FromStr for SessionBackend {
             "x11" => Ok(Self::X11),
             "kwin" => Ok(Self::Kwin),
             "gnome" => Ok(Self::Gnome),
+            "hyprland" => Ok(Self::Hyprland),
             "i3" => Ok(Self::I3),
             _ => bail!(
-                "session backend must be x11 (Xvfb with Openbox), i3 (Xvfb with i3), kwin or gnome (native Wayland)"
+                "session backend must be x11 (Xvfb with Openbox), i3 (Xvfb with i3), kwin, gnome or hyprland (native Wayland)"
             ),
         }
     }
@@ -243,12 +267,13 @@ pub(crate) enum Session {
     X11(x11::X11Session),
     Kwin(kwin::KwinSession),
     Gnome(gnome::GnomeSession),
+    Hyprland(hyprland::HyprlandSession),
 }
 impl Session {
     pub fn x_server_pid(&self) -> u32 {
         match self {
             Self::X11(s) => s.x_server_pid(),
-            Self::Kwin(_) | Self::Gnome(_) => 0,
+            Self::Kwin(_) | Self::Gnome(_) | Self::Hyprland(_) => 0,
         }
     }
     pub fn window_manager_pid(&self) -> Option<u32> {
@@ -256,6 +281,7 @@ impl Session {
             Self::X11(s) => s.window_manager_pid(),
             Self::Kwin(s) => s.pid(),
             Self::Gnome(s) => s.pid(),
+            Self::Hyprland(s) => s.pid(),
         }
     }
     pub fn shutdown(&mut self) {
@@ -263,6 +289,7 @@ impl Session {
             Self::X11(s) => s.shutdown(),
             Self::Kwin(s) => s.shutdown(),
             Self::Gnome(s) => s.shutdown(),
+            Self::Hyprland(s) => s.shutdown(),
         }
     }
 }

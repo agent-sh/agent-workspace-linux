@@ -132,8 +132,8 @@ pub(crate) fn configure_launch_environment(
 }
 
 fn configure_application_bus(command: &mut Command, status: &WorkspaceStatus) {
-    let bus = status.runtime_dir.join("client-bus");
-    if status.session.backend.requires_client_application_bus() || bus.exists() {
+    if status.session.backend.requires_client_application_bus() {
+        let bus = status.runtime_dir.join("client-bus");
         command.env(
             "DBUS_SESSION_BUS_ADDRESS",
             crate::session::private::socket_address(&bus),
@@ -684,6 +684,46 @@ mod tests {
     }
 
     #[test]
+    fn hyprland_crash_then_x11_same_runtime_ignores_stale_client_bus() {
+        let runtime = test_runtime("native-crash-x11-same-runtime");
+        fs::create_dir_all(&runtime).expect("create reused runtime");
+        let client_bus = runtime.join("client-bus");
+        let listener =
+            std::os::unix::net::UnixListener::bind(&client_bus).expect("native client bus socket");
+        let native = native_status(&runtime, crate::session::SessionBackend::Hyprland);
+        let mut native_command = Command::new("true");
+        configure_launch_environment(&mut native_command, &native, &[]);
+        assert!(native_command
+            .get_envs()
+            .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
+            .and_then(|(_, value)| value)
+            .is_some());
+
+        drop(listener);
+        let x11 = native_status(&runtime, crate::session::SessionBackend::X11);
+        let mut command = Command::new("true");
+        command.env("DBUS_SESSION_BUS_ADDRESS", "host-dbus");
+        configure_launch_environment(&mut command, &x11, &[]);
+
+        let address = command
+            .get_envs()
+            .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
+            .expect("host bus scrubbed");
+        assert_eq!(address.1, None);
+        let policy = sandbox_policy(Vec::new(), NetworkMode::Disabled);
+        let sandbox = bubblewrap_sandbox_for_launch(&x11, Some(&policy), None)
+            .expect("X11 sandbox after native crash")
+            .expect("network sandbox");
+        let client_bus = client_bus.display().to_string();
+        assert!(!sandbox.args.windows(3).any(|window| {
+            matches!(window[0].as_str(), "--bind" | "--ro-bind")
+                && (window[1] == client_bus || window[2] == client_bus)
+        }));
+
+        fs::remove_dir_all(runtime).expect("remove reused runtime");
+    }
+
+    #[test]
     fn kwin_environment_uses_client_bus_even_when_socket_is_missing() {
         assert_environment_uses_client_bus(crate::session::SessionBackend::Kwin);
     }
@@ -691,6 +731,11 @@ mod tests {
     #[test]
     fn gnome_environment_uses_client_bus_even_when_socket_is_missing() {
         assert_environment_uses_client_bus(crate::session::SessionBackend::Gnome);
+    }
+
+    #[test]
+    fn hyprland_environment_uses_client_bus_even_when_socket_is_missing() {
+        assert_environment_uses_client_bus(crate::session::SessionBackend::Hyprland);
     }
 
     #[test]
@@ -704,6 +749,11 @@ mod tests {
     }
 
     #[test]
+    fn hyprland_sandboxes_reject_missing_client_bus() {
+        assert_sandboxes_reject_missing_client_bus(crate::session::SessionBackend::Hyprland);
+    }
+
+    #[test]
     fn kwin_sandboxes_bind_client_bus_not_control_bus() {
         assert_sandboxes_bind_client_bus(crate::session::SessionBackend::Kwin);
     }
@@ -711,6 +761,11 @@ mod tests {
     #[test]
     fn gnome_sandboxes_bind_client_bus_not_control_bus() {
         assert_sandboxes_bind_client_bus(crate::session::SessionBackend::Gnome);
+    }
+
+    #[test]
+    fn hyprland_sandboxes_bind_client_bus_not_control_bus() {
+        assert_sandboxes_bind_client_bus(crate::session::SessionBackend::Hyprland);
     }
 
     #[test]
