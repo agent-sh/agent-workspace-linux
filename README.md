@@ -14,7 +14,7 @@
 
 > Running open models for your company? [**Tiyuvta**](https://tiyuvta.ai/services/) helps with model choice, deployment and optimization, and fine-tuning on your hardware or cloud account.
 
-Agents that "use a computer" normally take over *your* screen — they move your mouse, steal focus, and drive your logged-in browser. `agent-workspace-linux` gives the agent its **own** desktop instead: a headless X11 display with its own window manager, apps, clipboard, and browser. The agent launches apps, types, clicks, screenshots, and browses there; you can watch (and pause) through a small floating viewer. It speaks [MCP](https://modelcontextprotocol.io) over stdio, so it drops into Claude Code, Codex, and other MCP hosts.
+Agents that "use a computer" normally take over *your* screen — they move your mouse, steal focus, and drive your logged-in browser. `agent-workspace-linux` gives the agent its **own** desktop instead: a private X11 or native Wayland display with its own window manager or compositor, apps, clipboard, and browser. The agent launches apps, types, clicks, screenshots, and browses there; you can watch (and pause) through a small floating viewer. It speaks [MCP](https://modelcontextprotocol.io) over stdio, so it drops into Claude Code, Codex, and other MCP hosts.
 
 ## Why this project
 
@@ -100,9 +100,11 @@ agent-workspace-linux workspace stop
 ```
 
 `workspace start` and `workspace open-profile` accept `--session x11`,
-`--session kwin`, `--session gnome`, or `--session i3`. MCP and saved profiles accept `"session": {"backend":"kwin"}`.
-Explicit CLI/MCP input overrides the profile. Omitting both keeps the pinned
-Xvfb + Openbox default (`{"backend":"x11"}`).
+`--session kwin`, `--session gnome`, `--session i3`, or `--session hyprland`.
+MCP and saved profiles use the same backend names, for example
+`"session": {"backend":"hyprland"}`. Explicit CLI/MCP input overrides the
+profile. Omitting both keeps the pinned Xvfb + Openbox default
+(`{"backend":"x11"}`).
 
 KWin sessions run a native Wayland virtual compositor directly. There is no
 Xvfb underneath KWin. Each workspace owns its Wayland socket, session D-Bus,
@@ -111,19 +113,21 @@ settings, input and clipboard. KWin 6.6 or newer (including `kwin-common`),
 `doctor` reports their readiness separately from X11. This is KWin, not a full
 Plasma desktop shell.
 
-Hyprland is also available with `--session hyprland`. It uses a private KWin
-renderer and a separate Hyprland headless output, with native toplevel capture
-and authenticated XWayland. See [the Hyprland backend guide](docs/hyprland.md)
-for dependencies and its isolated acceptance probe.
+Hyprland uses a private KWin renderer and a separate Hyprland headless output,
+with native toplevel capture and authenticated XWayland. See
+[the Hyprland backend guide](docs/hyprland.md) for dependencies and its isolated
+acceptance probe.
 
-Use `--session kwin --scale 1.5` for a 150% output, or
-`"session": {"backend":"kwin", "scale":1.5}` in a profile or MCP call. Width,
-height, window geometry and pointer coordinates stay in screenshot pixels.
-The adapter converts between these pixels and KWin's logical coordinates.
-KWin aligns output sizes to logical pixels; status reports the effective size.
-Apps use native Wayland by default; rootless XWayland remains available for
-legacy clients. The existing viewer, IPC, permission ceiling and explicit
-Chrome profile import rules apply to every backend.
+Use `--session kwin --scale 1.5` or `--session hyprland --scale 1.5` for a 150%
+output, or set `"scale":1.5` in the corresponding profile or MCP `session`
+object. On KWin and Hyprland, width, height, window geometry and pointer
+coordinates stay in screenshot pixels. The KWin adapter converts between these
+pixels and KWin's logical coordinates. KWin aligns output sizes to logical
+pixels; status reports the effective size. Hyprland uses physical pixels,
+including at fractional output scales. Apps use native Wayland by default;
+rootless XWayland remains available for legacy clients. The existing viewer,
+IPC, permission ceiling and explicit Chrome profile import rules apply to every
+backend.
 
 i3 sessions use a private Xvfb display and i3 window manager at scale 1.
 The private i3 configuration has no launcher bindings, bar, or startup commands.
@@ -246,7 +250,7 @@ In short: **by default the agent host owns permission**, a developer can **lock 
 
 ## Core concepts
 
-- **Hidden workspace** — a private `Xvfb` display + window manager + control socket. Apps launched into it attach to that display, not your session. Creating one requires `--ack-hidden-workspace` so it is never silent.
+- **Hidden workspace** — a private X11 or native Wayland display, window manager or compositor, and control socket. Apps launched into it attach to that display, not your session. Creating one requires `--ack-hidden-workspace` so it is never silent.
 - **Permission ceiling** — optional, declared in JSON (`network`, `mounts`, `apps`). When set, it is enforced for the life of the MCP process. Mount and network isolation are applied with [bubblewrap](https://github.com/containers/bubblewrap) when available.
 - **Profiles** — reusable workspace definitions (mounts, network mode, setup commands, startup apps), e.g. `profile template project-dev` or `browser-session`.
 - **Viewer** — a small GPUI window that shows workspace state and a live screen view, with pause / read-only / stop controls. It is not always-on-top by default.
@@ -276,7 +280,7 @@ The MCP exposes ~86 tools. To avoid dumping them all into the agent's context, i
 
 ## Features
 
-- Hidden X11 workspace with window listing, screenshots, keyboard/mouse input, clipboard, and per-app logs — all scoped to the workspace display.
+- Hidden X11 or native Wayland workspace with window listing, screenshots, keyboard/mouse input, clipboard, and per-app logs — all scoped to the workspace display.
 - Optional, daemon-enforced permission ceiling (network / mounts / app allowlist) via flag or `AGENT_WORKSPACE_PERMISSIONS`.
 - bubblewrap-backed mount and network isolation (`disabled`, `local_only`, `inherit_host`) when available.
 - Workspace-owned browser control over loopback CDP — discover targets, read pages, navigate, extract results.
@@ -286,7 +290,7 @@ The MCP exposes ~86 tools. To avoid dumping them all into the agent's context, i
 
 ## Limitations
 
-- **Linux only.** Targets an X11 (`Xvfb`) workspace; the viewer is validated on X11/Xwayland, with native Wayland still maturing.
+- **Linux only.** The viewer is validated on X11/Xwayland, with native Wayland still maturing.
 - **Pre-1.0.** Interfaces and tool schemas can change between versions.
 - **Single-user trust model.** The control socket is a same-uid Unix socket (mode 0600); there is no cross-user protection by design. Run as a dedicated user for multi-user isolation.
 - **Mount/network enforcement needs bubblewrap.** Without it, those policies are declared but not enforced (the runtime tells you which).
