@@ -595,16 +595,23 @@ pub(crate) fn resolve_command_path(program: &str) -> Option<PathBuf> {
 /// Best effort: when the groups cannot be dropped on this host, launches
 /// behave as before and keep them; `doctor` reports why.
 pub(crate) fn sandbox_launcher_prefix() -> Vec<String> {
-    group_drop_prefix().unwrap_or_default()
+    cached_group_drop().clone().unwrap_or_default()
 }
 
 /// Whether sandboxed launches drop the owner's supplementary groups here, and
-/// why not when they cannot.
+/// why not when they cannot. Computed once per process: a daemon started
+/// before the host was fixed keeps its result until it restarts.
 pub(crate) fn group_drop_status() -> std::result::Result<bool, String> {
-    match group_drop_prefix() {
-        Ok(prefix) => Ok(!prefix.is_empty()),
-        Err(error) => Err(format!("{error:#}")),
-    }
+    cached_group_drop()
+        .as_ref()
+        .map(|prefix| !prefix.is_empty())
+        .map_err(Clone::clone)
+}
+
+fn cached_group_drop() -> &'static std::result::Result<Vec<String>, String> {
+    static PREFIX: std::sync::OnceLock<std::result::Result<Vec<String>, String>> =
+        std::sync::OnceLock::new();
+    PREFIX.get_or_init(|| group_drop_prefix().map_err(|error| format!("{error:#}")))
 }
 
 fn group_drop_prefix() -> Result<Vec<String>> {
@@ -662,42 +669,48 @@ fn util_linux_version(text: &str) -> Option<(u32, u32)> {
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
 }
 
-/// Runs the wrapper once per process with `true`, so a host that refuses it
-/// (user namespaces restricted by AppArmor, newuidmap denied) fails the
-/// launch with the reason instead of every app exiting right after spawn.
+/// Runs the real chain once (the wrapper, then bubblewrap inside it), so a
+/// host that refuses either (user namespaces restricted by AppArmor,
+/// newuidmap denied, no_new_privs) keeps the previous behavior instead of
+/// every app exiting right after spawn.
 fn group_drop_preflight(prefix: &[String]) -> Result<()> {
-    static RESULT: std::sync::OnceLock<std::result::Result<(), String>> =
-        std::sync::OnceLock::new();
-    RESULT
-        .get_or_init(|| {
-            let truth =
-                resolve_executable_path("true").ok_or_else(|| "true not found".to_string())?;
-            let output = Command::new(&prefix[0])
-                .args(&prefix[1..])
-                .arg(truth)
-                .env_clear()
-                .output()
-                .map_err(|error| format!("could not run unshare: {error}"))?;
-            if output.status.success() {
-                return Ok(());
-            }
-            let restricted =
-                fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
-                    .is_ok_and(|value| value.trim() == "1");
-            Err(format!(
-                "supplementary groups are kept in sandboxed launches: dropping them failed ({}){}",
-                String::from_utf8_lossy(&output.stderr).trim(),
-                if restricted {
-                    ". AppArmor restricts unprivileged user namespaces here \
-                     (kernel.apparmor_restrict_unprivileged_userns=1); see the README section \
-                     on supplementary groups"
-                } else {
-                    ""
-                }
-            ))
-        })
-        .clone()
-        .map_err(|error| anyhow::anyhow!(error))
+    let bwrap = resolve_executable_path("bwrap").context("bwrap not found")?;
+    let truth = resolve_executable_path("true").context("true not found")?;
+    let output = Command::new(&prefix[0])
+        .args(&prefix[1..])
+        .arg(bwrap)
+        .args([
+            "--ro-bind",
+            "/",
+            "/",
+            "--dev",
+            "/dev",
+            "--unshare-pid",
+            "--proc",
+            "/proc",
+            "--unshare-net",
+            "--",
+        ])
+        .arg(truth)
+        .env_clear()
+        .output()
+        .context("could not run unshare")?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let restricted = fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
+        .is_ok_and(|value| value.trim() == "1");
+    bail!(
+        "supplementary groups are kept in sandboxed launches: dropping them failed ({}){}",
+        String::from_utf8_lossy(&output.stderr).trim(),
+        if restricted {
+            ". AppArmor restricts unprivileged user namespaces here \
+             (kernel.apparmor_restrict_unprivileged_userns=1); see the README section \
+             on supplementary groups"
+        } else {
+            ""
+        }
+    )
 }
 
 /// A sandboxed launch command and the private descriptor carrying its
@@ -752,32 +765,42 @@ pub(crate) fn sandboxed_command(
     Ok(SandboxedCommand { command, args_fd })
 }
 
-/// `--clearenv`, the environment and the sandbox options, as NUL-separated
-/// bubblewrap arguments in a close-on-exec memfd.
+/// The environment (`--setenv`) and the sandbox options, as NUL-separated
+/// bubblewrap arguments in a close-on-exec memfd. bubblewrap itself starts
+/// with an empty environment, so it passes only these variables on.
 fn bwrap_args_memfd(
     sandbox_args: &[String],
     env: &[(std::ffi::OsString, std::ffi::OsString)],
 ) -> Result<std::os::fd::OwnedFd> {
     use std::os::fd::FromRawFd;
     use std::os::unix::ffi::OsStrExt;
+    // Arguments are NUL-separated: a NUL inside any value would split it
+    // into extra bubblewrap options.
+    let mut bytes = Vec::new();
+    let mut push = |value: &[u8]| -> Result<()> {
+        if value.contains(&0) {
+            bail!("sandbox argument or environment value contains a NUL byte");
+        }
+        bytes.extend_from_slice(value);
+        bytes.push(0);
+        Ok(())
+    };
+    for (name, value) in env {
+        push(b"--setenv")?;
+        push(name.as_bytes())?;
+        push(value.as_bytes())?;
+    }
+    for arg in sandbox_args {
+        push(arg.as_bytes())?;
+    }
     let raw = unsafe { libc::memfd_create(c"bwrap-args".as_ptr(), libc::MFD_CLOEXEC) };
     if raw < 0 {
         return Err(std::io::Error::last_os_error()).context("create bwrap argument memfd");
     }
     let args_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-    let mut bytes = Vec::new();
-    let mut push = |value: &[u8]| {
-        bytes.extend_from_slice(value);
-        bytes.push(0);
-    };
-    push(b"--clearenv");
-    for (name, value) in env {
-        push(b"--setenv");
-        push(name.as_bytes());
-        push(value.as_bytes());
-    }
-    for arg in sandbox_args {
-        push(arg.as_bytes());
+    // A memfd on a standard stream would be replaced by the child's stdio.
+    if raw <= 2 {
+        bail!("bwrap argument memfd landed on standard stream {raw}");
     }
     let mut file = std::fs::File::from(args_fd.try_clone()?);
     std::io::Write::write_all(&mut file, &bytes).context("write bwrap arguments")?;
@@ -869,9 +892,8 @@ mod tests {
             .map(|arg| String::from_utf8_lossy(arg).into_owned())
             .collect::<Vec<_>>();
         assert_eq!(
-            &args[..10],
+            &args[..9],
             [
-                "--clearenv",
                 "--setenv",
                 "LD_PRELOAD",
                 "/tmp/inject.so",
@@ -883,6 +905,8 @@ mod tests {
                 "/",
             ]
         );
+        assert!(bwrap_args_memfd(&["--chdir".into(), "/w\0--bind\0/\0/x".into()], &[]).is_err());
+        assert!(bwrap_args_memfd(&[], &[("A".into(), "b\0c".into())]).is_err());
     }
 
     #[test]

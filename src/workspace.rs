@@ -156,8 +156,8 @@ pub struct RuntimeReport {
     pub screenshot: Check,
     pub clipboard: Check,
     pub policy: PolicyRuntimeCapabilities,
-    /// Whether sandboxed launches can drop the owner's supplementary groups;
-    /// when they cannot, sandboxed launches are refused.
+    /// Whether sandboxed launches drop the owner's supplementary groups; when
+    /// they cannot, sandboxed apps keep them as before.
     pub sandbox_group_drop: Check,
 }
 

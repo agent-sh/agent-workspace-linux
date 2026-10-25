@@ -872,6 +872,9 @@ fn validate_mount_path(path: &Path, field: &str) -> Result<()> {
     if path.as_os_str().is_empty() {
         bail!("profile mount {field} cannot be empty");
     }
+    if std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).contains(&0) {
+        bail!("profile mount {field} cannot contain a NUL byte");
+    }
     if path
         .components()
         .any(|component| matches!(component, Component::ParentDir))
