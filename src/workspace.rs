@@ -1957,6 +1957,7 @@ pub fn preview_launch_app(
             &running_status,
             applied_policy.as_ref(),
             spec.cwd.as_deref(),
+            None,
         ) {
             Ok(sandbox) => {
                 (mount_isolation, network_isolation) =
@@ -3606,6 +3607,11 @@ fn prepare_workspace_start(mut options: WorkspaceStartOptions) -> Result<Workspa
     let runtime_dir = workspace_dir(&id);
     let socket_path = runtime_dir.join("control.sock");
     validate_unix_socket_path(&socket_path)?;
+    // Native compositors bind the Wayland display socket, the longest fixed
+    // socket name in the runtime; reject paths they cannot bind up front.
+    if options.session.backend.requires_client_application_bus() {
+        validate_unix_socket_path(&runtime_dir.join(crate::session::kwin::WAYLAND_SOCKET))?;
+    }
     create_private_runtime_dir(&runtime_dir)?;
     create_client_runtime(&runtime_dir)?;
     remove_stale_socket(&socket_path)?;
@@ -3748,21 +3754,24 @@ fn write_applied_policy_file(
 }
 
 fn create_client_runtime(runtime: &Path) -> Result<()> {
+    create_owned_private_dir(&runtime.join("client"), "workspace client runtime")
+}
+
+fn create_owned_private_dir(path: &Path, what: &str) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
-    let path = runtime.join("client");
     match fs::DirBuilder::new()
         .mode(PRIVATE_RUNTIME_DIR_MODE)
-        .create(&path)
+        .create(path)
     {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(&path)?;
+            let metadata = fs::symlink_metadata(path)?;
             if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-                bail!("workspace client runtime is not an owned directory");
+                bail!("{what} is not an owned directory");
             }
             Ok(())
         }
-        Err(error) => Err(error).context("create workspace client runtime"),
+        Err(error) => Err(error).with_context(|| format!("create {what}")),
     }
 }
 
@@ -3775,10 +3784,15 @@ fn terminal_socket_path(runtime: &Path, id: &str) -> PathBuf {
     if UnixStream::connect(&legacy).is_ok() {
         legacy
     } else {
-        runtime
-            .join("client")
-            .join(format!("terminal-{id}.tmux.sock"))
+        client_terminal_socket_path(runtime, id)
     }
+}
+
+fn client_terminal_socket_path(runtime: &Path, id: &str) -> PathBuf {
+    runtime
+        .join("client")
+        .join(format!("terminal-{id}"))
+        .join("tmux.sock")
 }
 
 fn create_private_runtime_dir(path: &Path) -> Result<()> {
@@ -6873,13 +6887,22 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
         .context("workspace launch exceeds the MCP permission ceiling")?;
     validate_launch_policy_ack(&spec)?;
     create_client_runtime(&state.status.runtime_dir)?;
+    let terminal_dir =
+        terminal_cleanup::managed_terminal_client_dir(&state.status.runtime_dir, &spec.command);
+    if let Some(dir) = &terminal_dir {
+        create_owned_private_dir(dir, "managed terminal client directory")?;
+    }
     let log_paths = prepare_app_log_paths(&state.status.runtime_dir)?;
     let effective_policy = spec
         .applied_policy
         .as_ref()
         .or(state.status.applied_policy.as_ref());
-    let sandbox =
-        bubblewrap_sandbox_for_launch(&state.status, effective_policy, spec.cwd.as_deref())?;
+    let sandbox = bubblewrap_sandbox_for_launch(
+        &state.status,
+        effective_policy,
+        spec.cwd.as_deref(),
+        terminal_dir.as_deref(),
+    )?;
     let (mount_isolation, network_isolation) =
         launch_isolation_labels_from_sandbox(sandbox.as_ref());
     let mut child_command = if let Some(sandbox) = &sandbox {
@@ -8698,7 +8721,7 @@ fn validate_unix_socket_path(socket_path: &Path) -> Result<()> {
     let byte_len = socket_path.as_os_str().as_bytes().len();
     if byte_len > MAX_UNIX_SOCKET_PATH_BYTES {
         bail!(
-            "workspace control socket path {} is {byte_len} bytes; Unix socket paths must be at most {MAX_UNIX_SOCKET_PATH_BYTES} bytes. Use a shorter workspace id or a shorter XDG_RUNTIME_DIR",
+            "workspace socket path {} is {byte_len} bytes; Unix socket paths must be at most {MAX_UNIX_SOCKET_PATH_BYTES} bytes. Use a shorter workspace id or a shorter XDG_RUNTIME_DIR",
             socket_path.display()
         );
     }
@@ -9462,7 +9485,7 @@ mod tests {
             std::env::temp_dir().join(format!("awl-term-{}-{unique}", std::process::id()));
         fs::create_dir_all(&runtime).expect("create test runtime");
         let legacy = runtime.join("terminal-t.tmux.sock");
-        let client = runtime.join("client").join("terminal-t.tmux.sock");
+        let client = client_terminal_socket_path(&runtime, "t");
 
         assert_eq!(terminal_socket_path(&runtime, "t"), client);
 
@@ -10065,6 +10088,7 @@ mod tests {
             &status,
             Some(status.applied_policy.as_ref().expect("policy")),
             Some(Path::new("/workspace/project")),
+            None,
         )
         .expect("sandbox build")
         .expect("net-only sandbox should exist");
@@ -10120,6 +10144,7 @@ mod tests {
             Some(&policy),
             Some(Path::new("/workspace/project")),
             LaunchNetworkPlan::Host,
+            None,
         )
         .expect("mount namespace args");
 
@@ -10186,6 +10211,7 @@ mod tests {
             Some(&policy),
             Some(Path::new("/workspace/project")),
             LaunchNetworkPlan::Host,
+            None,
         )
         .expect("mount namespace args");
 

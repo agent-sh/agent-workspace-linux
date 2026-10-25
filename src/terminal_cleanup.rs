@@ -17,7 +17,21 @@ use std::{
 };
 
 fn managed_socket(runtime: &Path, app: &WorkspaceApp) -> Option<(PathBuf, PathBuf)> {
-    let a = &app.command;
+    managed_command_socket(runtime, &app.command)
+}
+
+/// Each managed terminal owns `runtime/client/terminal-ID/`, the only client
+/// directory its sandbox may see. Returns that directory for a launch command
+/// built by `terminal_launch_plan`; legacy runtime-root sockets have none.
+pub(super) fn managed_terminal_client_dir(runtime: &Path, command: &[String]) -> Option<PathBuf> {
+    let (_, socket) = managed_command_socket(runtime, command)?;
+    socket
+        .parent()
+        .filter(|dir| dir.parent() == Some(runtime.join("client").as_path()))
+        .map(Path::to_path_buf)
+}
+
+fn managed_command_socket(runtime: &Path, a: &[String]) -> Option<(PathBuf, PathBuf)> {
     if a.len() < 17
         || a[1] != "-title"
         || a[3] != "-fa"
@@ -33,9 +47,9 @@ fn managed_socket(runtime: &Path, app: &WorkspaceApp) -> Option<(PathBuf, PathBu
     }
     let id = sanitize_terminal_id(&a[16]).ok()?;
     let socket = PathBuf::from(&a[12]);
-    let name = format!("terminal-{id}.tmux.sock");
     if id != a[16]
-        || (socket != runtime.join(&name) && socket != runtime.join("client").join(&name))
+        || (socket != runtime.join(format!("terminal-{id}.tmux.sock"))
+            && socket != super::client_terminal_socket_path(runtime, &id))
     {
         return None;
     }

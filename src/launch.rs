@@ -183,10 +183,14 @@ impl LaunchNetworkPlan {
     }
 }
 
+/// `terminal_dir` is the private client directory of a managed terminal launch.
+/// It is the only client directory bound into the sandbox: sharing one across
+/// launches would let any sandboxed app drive another terminal's tmux server.
 pub(crate) fn bubblewrap_sandbox_for_launch(
     status: &WorkspaceStatus,
     policy: Option<&AppliedWorkspacePolicy>,
     cwd: Option<&Path>,
+    terminal_dir: Option<&Path>,
 ) -> Result<Option<BubblewrapSandbox>> {
     let network = launch_network_plan(policy);
     let mounts = uses_bubblewrap_mount_isolation(policy);
@@ -196,7 +200,7 @@ pub(crate) fn bubblewrap_sandbox_for_launch(
 
     if mounts {
         Ok(Some(BubblewrapSandbox {
-            args: restricted_mount_namespace_args(status, policy, cwd, network)?,
+            args: restricted_mount_namespace_args(status, policy, cwd, network, terminal_dir)?,
             mount_isolation: "bubblewrap_mount_namespace".to_string(),
             network_isolation: network.isolation_label().to_string(),
         }))
@@ -213,14 +217,8 @@ pub(crate) fn bubblewrap_sandbox_for_launch(
         ];
         // Host desktop/system IPC is not part of ordinary host file access.
         // Rebind only this workspace's display endpoints below.
-        for path in [
-            PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() })),
-            PathBuf::from("/run/dbus"),
-            PathBuf::from("/tmp/.X11-unix"),
-        ] {
-            if path.is_dir() {
-                args.extend(["--tmpfs".to_string(), path.display().to_string()]);
-            }
+        for path in host_desktop_ipc_dirs() {
+            args.extend(["--tmpfs".to_string(), path.display().to_string()]);
         }
         // Keep desktop control/configuration private even for network-only
         // profiles whose ordinary host files remain visible. Fresh procfs in the
@@ -234,8 +232,14 @@ pub(crate) fn bubblewrap_sandbox_for_launch(
                 .map(|relative| runtime_target.join(relative))
                 .unwrap_or_else(|_| path.to_path_buf())
         };
+        // Mask every workspace under the runtime base, not just this one:
+        // sibling control sockets and buses are otherwise reachable whenever
+        // the base is outside the masked host runtime directory.
+        if let Some(base) = runtime_target.parent() {
+            args.extend(["--tmpfs".to_string(), base.display().to_string()]);
+        }
         args.extend(["--tmpfs".to_string(), runtime_target.display().to_string()]);
-        let resources = app_session_resources(status)?;
+        let resources = app_session_resources(status, terminal_dir)?;
         let mut dirs = BTreeSet::new();
         for path in resources
             .read_only_binds
@@ -329,7 +333,38 @@ pub(crate) fn uses_bubblewrap_mount_isolation(policy: Option<&AppliedWorkspacePo
     })
 }
 
-fn app_session_resources(status: &WorkspaceStatus) -> Result<SessionSandboxResources> {
+/// Host directories that hold desktop session IPC: the user runtime dir (also
+/// a non-standard XDG_RUNTIME_DIR), the system bus, X11 sockets and IBus,
+/// whose input-method bus lives in the cache dir and can log or inject keys.
+fn host_desktop_ipc_dirs() -> Vec<PathBuf> {
+    let home = env::var_os("HOME").map(PathBuf::from);
+    let xdg_dir = |name: &str, fallback: &str| {
+        env::var_os(name)
+            .map(PathBuf::from)
+            .filter(|path| path.is_absolute())
+            .or_else(|| home.as_ref().map(|home| home.join(fallback)))
+    };
+    let mut dirs = vec![
+        PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() })),
+        PathBuf::from("/run/dbus"),
+        PathBuf::from("/tmp/.X11-unix"),
+    ];
+    dirs.extend(env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from));
+    dirs.extend(xdg_dir("XDG_CACHE_HOME", ".cache").map(|path| path.join("ibus")));
+    dirs.extend(xdg_dir("XDG_CONFIG_HOME", ".config").map(|path| path.join("ibus")));
+    let mut masked = BTreeSet::new();
+    dirs.into_iter()
+        .filter(|path| path.is_absolute() && path.is_dir())
+        .filter_map(|path| fs::canonicalize(path).ok())
+        .filter(|path| path != Path::new("/") && home.as_deref() != Some(path.as_path()))
+        .filter(|path| masked.insert(path.clone()))
+        .collect()
+}
+
+fn app_session_resources(
+    status: &WorkspaceStatus,
+    terminal_dir: Option<&Path>,
+) -> Result<SessionSandboxResources> {
     let mut resources = status.session.sandbox_resources(
         &status.xauthority_path,
         &status.runtime_dir,
@@ -353,9 +388,14 @@ fn app_session_resources(status: &WorkspaceStatus) -> Result<SessionSandboxResou
             *path = client_bus.clone();
         }
     }
-    let client = status.runtime_dir.join("client");
-    if client.is_dir() {
-        resources.read_write_binds.push(client);
+    if let Some(dir) = terminal_dir {
+        if !dir.starts_with(status.runtime_dir.join("client")) || !dir.is_dir() {
+            bail!(
+                "managed terminal directory {} is not a workspace client directory",
+                dir.display()
+            );
+        }
+        resources.read_write_binds.push(dir.to_path_buf());
     }
     Ok(resources)
 }
@@ -365,8 +405,9 @@ pub(crate) fn restricted_mount_namespace_args(
     policy: Option<&AppliedWorkspacePolicy>,
     cwd: Option<&Path>,
     network: LaunchNetworkPlan,
+    terminal_dir: Option<&Path>,
 ) -> Result<Vec<String>> {
-    let resources = app_session_resources(status)?;
+    let resources = app_session_resources(status, terminal_dir)?;
     restricted_mount_namespace_args_with_resources(policy, cwd, network, resources)
 }
 
@@ -634,7 +675,7 @@ mod tests {
         ];
 
         for policy in &policies {
-            let error = match bubblewrap_sandbox_for_launch(&status, Some(policy), None) {
+            let error = match bubblewrap_sandbox_for_launch(&status, Some(policy), None, None) {
                 Err(error) => error,
                 Ok(_) => panic!("missing client bus must fail closed"),
             };
@@ -642,6 +683,79 @@ mod tests {
         }
 
         fs::remove_dir_all(runtime).expect("remove test runtime");
+    }
+
+    #[test]
+    fn sandboxes_bind_only_their_own_terminal_client_dir() {
+        let runtime = test_runtime("terminal-client-dir");
+        let own = runtime.join("client").join("terminal-own");
+        let other = runtime.join("client").join("terminal-other");
+        fs::create_dir_all(&own).expect("own terminal dir");
+        fs::create_dir_all(&other).expect("other terminal dir");
+        let status = native_status(&runtime, crate::session::SessionBackend::X11);
+        let canonical = fs::canonicalize(&runtime).expect("canonical runtime");
+        let bound = |args: &[String], dir: &Path| {
+            let dir = dir.display().to_string();
+            args.windows(3)
+                .any(|window| window[0] == "--bind" && window[2] == dir)
+        };
+        let client = |name: &str| canonical.join("client").join(name);
+
+        for network in [NetworkMode::Disabled, NetworkMode::InheritHost] {
+            let mounts = if matches!(network, NetworkMode::InheritHost) {
+                vec![crate::policy::ProfileMount {
+                    host_path: runtime.clone(),
+                    workspace_path: PathBuf::from("/workspace/data"),
+                    mode: crate::policy::MountMode::ReadOnly,
+                }]
+            } else {
+                Vec::new()
+            };
+            let policy = sandbox_policy(mounts, network);
+            let app = bubblewrap_sandbox_for_launch(&status, Some(&policy), None, None)
+                .expect("app sandbox")
+                .expect("sandbox");
+            assert!(!bound(&app.args, &canonical.join("client")));
+            assert!(!bound(&app.args, &client("terminal-own")));
+
+            let terminal = bubblewrap_sandbox_for_launch(&status, Some(&policy), None, Some(&own))
+                .expect("terminal sandbox")
+                .expect("sandbox");
+            assert!(bound(&terminal.args, &client("terminal-own")) || bound(&terminal.args, &own));
+            assert!(!bound(&terminal.args, &client("terminal-other")));
+            assert!(!bound(&terminal.args, &other));
+        }
+
+        let outside = runtime.join("not-client");
+        fs::create_dir_all(&outside).expect("outside dir");
+        let policy = sandbox_policy(Vec::new(), NetworkMode::Disabled);
+        assert!(
+            bubblewrap_sandbox_for_launch(&status, Some(&policy), None, Some(&outside)).is_err()
+        );
+
+        fs::remove_dir_all(runtime).expect("remove test runtime");
+    }
+
+    #[test]
+    fn network_only_sandboxes_mask_every_workspace_runtime() {
+        let base = test_runtime("runtime-base");
+        let runtime = base.join("agent-workspace-linux").join("own");
+        fs::create_dir_all(&runtime).expect("runtime");
+        let status = native_status(&runtime, crate::session::SessionBackend::X11);
+        let policy = sandbox_policy(Vec::new(), NetworkMode::Disabled);
+        let sandbox = bubblewrap_sandbox_for_launch(&status, Some(&policy), None, None)
+            .expect("sandbox")
+            .expect("network sandbox");
+        let workspaces = fs::canonicalize(base.join("agent-workspace-linux"))
+            .expect("canonical base")
+            .display()
+            .to_string();
+        assert!(sandbox
+            .args
+            .windows(2)
+            .any(|window| window[0] == "--tmpfs" && window[1] == workspaces));
+
+        fs::remove_dir_all(base).expect("remove test runtime");
     }
 
     fn assert_sandboxes_bind_client_bus(backend: crate::session::SessionBackend) {
@@ -677,7 +791,7 @@ mod tests {
         .map(|path| path.display().to_string());
 
         for policy in &policies {
-            let sandbox = bubblewrap_sandbox_for_launch(&status, Some(policy), None)
+            let sandbox = bubblewrap_sandbox_for_launch(&status, Some(policy), None, None)
                 .expect("working client bus sandbox")
                 .expect("sandbox");
             assert!(sandbox.args.windows(3).any(|window| {
@@ -723,7 +837,7 @@ mod tests {
             .expect("host bus scrubbed");
         assert_eq!(address.1, None);
         let policy = sandbox_policy(Vec::new(), NetworkMode::Disabled);
-        let sandbox = bubblewrap_sandbox_for_launch(&x11, Some(&policy), None)
+        let sandbox = bubblewrap_sandbox_for_launch(&x11, Some(&policy), None, None)
             .expect("X11 sandbox after native crash")
             .expect("network sandbox");
         let client_bus = fs::canonicalize(&runtime)

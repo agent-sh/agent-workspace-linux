@@ -162,7 +162,7 @@ async function waitForTerminalText(workspaceId, terminalId, pattern) {
 const ownedSockets = new Set();
 const extraWorkspaceIds = [];
 function terminalSocket(id, terminalId) {
-  const socket = path.join(runtimeDir, "agent-workspace-linux", id, "client", `terminal-${terminalId}.tmux.sock`);
+  const socket = path.join(runtimeDir, "agent-workspace-linux", id, "client", `terminal-${terminalId}`, "tmux.sock");
   ownedSockets.add(socket);
   return socket;
 }
