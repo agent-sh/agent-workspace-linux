@@ -10223,9 +10223,10 @@ mod tests {
         )
         .expect("resolv symlink");
 
+        // The helper returns the canonical target; TMPDIR may be a symlink.
         assert_eq!(
             external_symlink_target_parent(&etc.join("resolv.conf"), &etc),
-            Some(resolver)
+            Some(fs::canonicalize(&resolver).expect("canonical resolver dir"))
         );
 
         fs::remove_dir_all(root).expect("cleanup");
