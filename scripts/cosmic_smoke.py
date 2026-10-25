@@ -28,8 +28,10 @@ def command(*args, expected=True):
     (ARTIFACTS / f"{sequence:03d}.json").write_text(result.stdout)
     (ARTIFACTS / f"{sequence:03d}.stderr").write_text(result.stderr)
     if not expected:
-        assert result.returncode != 0, (args, result.stdout)
-        return
+        # Daemon refusals exit 0 with ok=false; CLI refusals exit nonzero.
+        refused = result.returncode != 0 or json.loads(result.stdout).get("ok") is False
+        assert refused, (args, result.stdout)
+        return result.stdout + result.stderr
     assert result.returncode == 0, (args, result.stderr)
     value = json.loads(result.stdout)
     assert value.get("ok", True), (args, value)
@@ -270,6 +272,10 @@ for scale in (1, 1.5):
         workspace(id,"key","shift+a")
         workspace(id,"key","exclam")
         wait_for(lambda:json.loads(receipt.read_text())["text"]==text+"A!","shifted symbols from native keymap")
+        # COSMIC would drop or reinterpret control characters; typing must fail instead.
+        assert "U+0001" in command("workspace", "type", "--id", id, "bad\u0001", expected=False)
+        time.sleep(0.5)
+        assert json.loads(receipt.read_text())["text"]==text+"A!","rejected text reached the app"
         after=workspace(id,"screenshot")["screenshot"]; captures["output"]+=1
         assert before_bytes!=Path(after["path"]).read_bytes(),"native frame did not update after typing"
         workspace(id,"clipboard-set","clipboard שלום")
@@ -372,9 +378,20 @@ command("profile","import","--json",profile)
 id="cosmic-restricted"
 try:
     workspace(id,"start","--profile","cosmic-restricted","--ack-hidden-workspace", "--purpose","Legacy XWayland sandbox acceptance")
-    launch=workspace(id,"launch","--wait-window","--window-timeout-ms",10000,"--","xterm","-fa","monospace","-e","sh","-c","printf ready > /workspace/project/ready; exec tail -f /dev/null")
+    launch=workspace(id,"launch","--wait-window","--window-timeout-ms",10000,"--","xterm","-fa","monospace","-e","sh","-c","printf ready > /workspace/project/ready; exec cat > /workspace/project/typed")
     assert launch["windows"], launch
     wait_for(lambda:(project/"ready").exists(),"XWayland terminal in enforced sandbox")
+    # X11 clients have no text-input. They get the seat layout's own keys, and
+    # characters outside that layout are refused before anything is typed.
+    workspace(id,"focus-window",launch["windows"][0]["id"])
+    typed="XWayland typed: Hello, World! ~|{}<>?_+ 123\tdone\n"
+    workspace(id,"type",typed)
+    wait_for(lambda:(project/"typed").exists() and (project/"typed").read_text(encoding="utf-8")==typed,"XWayland layout typing")
+    refused=command("workspace","type","--id",id,"café שלום\n",expected=False)
+    assert "not in the COSMIC keyboard layout" in refused,refused
+    assert "U+0001" in command("workspace","type","--id",id,"bad\u0001",expected=False)
+    workspace(id,"type","after refusal\n")
+    wait_for(lambda:(project/"typed").read_text(encoding="utf-8")==typed+"after refusal\n","refused text typed nothing")
     app=launch["apps"][0]
     assert app["mount_isolation"]=="bubblewrap_mount_namespace",app
     assert app["network_isolation"]=="bubblewrap_unshare_net",app

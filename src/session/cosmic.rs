@@ -166,6 +166,19 @@ pub(crate) fn control(runtime: &Path, operation: &str, args: &Value) -> Result<V
     };
     run_helper(runtime, &endpoint, operation, args, |_| {})
 }
+/// Whether keyboard focus is on an XWayland client.
+pub(crate) fn x11_keyboard_focus(runtime: &Path, display: &str, xauthority: &Path) -> Result<bool> {
+    if display.is_empty() {
+        return Ok(false);
+    }
+    run_helper(runtime, "xwayland", "x11-focus", &json!({}), |command| {
+        command
+            .env("DISPLAY", display)
+            .env("XAUTHORITY", xauthority);
+    })?["x11"]
+        .as_bool()
+        .context("COSMIC XWayland focus unavailable")
+}
 fn run_helper(
     runtime: &Path,
     endpoint: &str,
@@ -201,6 +214,8 @@ pub(crate) fn helper(args: &[String]) -> Result<()> {
     let args: Value = serde_json::from_str(args.get(2).context("COSMIC arguments missing")?)?;
     let value = if operation == "input" {
         crate::desktop::cosmic_input::run(endpoint, &args)?
+    } else if operation == "x11-focus" {
+        crate::desktop::cosmic::x11_focus_probe()?
     } else {
         crate::desktop::cosmic_protocol::run(Path::new(endpoint), operation, &args)?
     };

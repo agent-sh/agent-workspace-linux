@@ -1,7 +1,7 @@
 //! COSMIC native desktop control. Geometry and confirmations come from the compositor.
 use super::{resolve_screenshot_path, resolve_window_screenshot_path, DesktopControl};
 use crate::{
-    session::cosmic::{configure_process_environment, control},
+    session::cosmic::{configure_process_environment, control, x11_keyboard_focus},
     workspace::{
         validate_click_options, validate_clipboard_text, validate_scroll_options,
         validate_window_size_for_workspace, validate_workspace_coordinates,
@@ -306,6 +306,30 @@ impl DesktopControl for CosmicDesktopControl<'_> {
         self.input(actions)
     }
     fn type_text(&self, text: &str) -> Result<()> {
+        // Newlines become Return key actions; everything else must be text COSMIC delivers.
+        super::cosmic_input::check_text_deliverable(&text.replace('\n', ""))?;
+        if x11_keyboard_focus(
+            &self.status.runtime_dir,
+            &self.status.display,
+            &self.status.xauthority_path,
+        )? {
+            // X11 clients have no text-input. COSMIC's fallback binds the text to
+            // keycodes in a temporary keymap, which XWayland applies too late,
+            // so X11 clients see the seat layout's keys for those keycodes.
+            // Type with the seat layout's own keys; the helper refuses before
+            // sending anything if a character has no key in that layout.
+            let mut actions = Vec::new();
+            for character in text.chars() {
+                let keysym = if character == '\n' {
+                    0xff0d
+                } else {
+                    xkbcommon::xkb::utf32_to_keysym(character as u32).raw()
+                };
+                actions.push(json!({"kind":"key","keysym":keysym,"pressed":true}));
+                actions.push(json!({"kind":"key","keysym":keysym,"pressed":false}));
+            }
+            return self.input(actions);
+        }
         let mut actions = Vec::new();
         for (line, segment) in text.split('\n').enumerate() {
             if line > 0 {
@@ -359,6 +383,17 @@ impl DesktopControl for CosmicDesktopControl<'_> {
             content: Some(text),
         })
     }
+}
+/// Runs in a helper process whose DISPLAY and XAUTHORITY name the workspace's
+/// XWayland. COSMIC's X11 window manager releases X input focus whenever
+/// keyboard focus moves to a Wayland surface.
+pub(crate) fn x11_focus_probe() -> Result<Value> {
+    use x11rb::connection::Connection as _;
+    use x11rb::protocol::xproto::ConnectionExt as _;
+    let (connection, screen) = x11rb::connect(None).context("connect COSMIC XWayland")?;
+    let root = connection.setup().roots[screen].root;
+    let focus = connection.get_input_focus()?.reply()?.focus;
+    Ok(json!({"x11": focus > 1 && focus != root, "window": focus}))
 }
 fn button_code(button: u8) -> Result<u32> {
     match button {
