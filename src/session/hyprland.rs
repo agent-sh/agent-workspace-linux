@@ -1,6 +1,6 @@
 //! A private Hyprland instance nested in a private KWin virtual renderer.
 //! Aquamarine requires a dma-buf allocator; neither compositor uses a host display.
-use super::private::{prepare_child, wait_for, PrivateSession};
+use super::private::{prepare_child, unreaped_exit, wait_for, PrivateSession, UnreapedExit};
 use crate::{
     launch::SessionSandboxResources,
     workspace::{command_path_check, DaemonOptions},
@@ -245,7 +245,9 @@ impl HyprlandSession {
         wait_for(
             Duration::from_secs(15),
             || {
-                if let Some(exit) = session.parent.as_mut().unwrap().try_wait()? {
+                if let UnreapedExit::Exited(exit) =
+                    unreaped_exit(session.parent.as_ref().unwrap().id())
+                {
                     bail!("private Hyprland renderer exited {exit}");
                 }
                 Ok(connect_socket(&parent_socket).is_ok())
@@ -335,7 +337,7 @@ impl HyprlandSession {
             Duration::from_secs(15),
             || {
                 let child = session.compositor.as_mut().unwrap();
-                if let Some(exit) = child.try_wait()? {
+                if let UnreapedExit::Exited(exit) = unreaped_exit(child.id()) {
                     bail!("Hyprland exited {exit}; see hyprland.log");
                 }
                 if let Some(path) = own_socket(runtime, child.id())? {
@@ -466,13 +468,13 @@ impl HyprlandSession {
             && self
                 .compositor
                 .as_mut()
-                .is_some_and(|child| child.try_wait().ok().flatten().is_none())
+                .is_some_and(|child| still_running(child))
         {
             let _ = request(&self.runtime, "dispatch exit");
             if let Some(child) = &mut self.compositor {
                 let _ = wait_for(
                     Duration::from_secs(5),
-                    || Ok(child.try_wait()?.is_some()),
+                    || Ok(!still_running(child)),
                     "Hyprland graceful exit",
                 );
             }
@@ -481,13 +483,15 @@ impl HyprlandSession {
         for slot in [&mut self.compositor, &mut self.parent] {
             if let Some(mut child) = slot.take() {
                 let group = -(child.id() as i32);
-                if child.try_wait().ok().flatten().is_none() {
+                // Never reap before the group signals below: the unreaped
+                // leader keeps the group number from being recycled.
+                if still_running(&child) {
                     unsafe {
                         libc::kill(group, libc::SIGTERM);
                     }
                     let _ = wait_for(
                         Duration::from_secs(5),
-                        || Ok(child.try_wait()?.is_some()),
+                        || Ok(!still_running(&child)),
                         "native compositor shutdown",
                     );
                 }
@@ -503,6 +507,10 @@ impl HyprlandSession {
         let _ = fs::remove_file(self.runtime.join(WAYLAND_SOCKET));
     }
 }
+fn still_running(child: &std::process::Child) -> bool {
+    matches!(unreaped_exit(child.id()), UnreapedExit::Running)
+}
+
 impl Drop for HyprlandSession {
     fn drop(&mut self) {
         self.shutdown();
