@@ -8,21 +8,33 @@ import sys
 gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib
 output = Path(sys.argv[1])
-state = {'clicks': 0, 'text': '', 'scrolls': [], 'motions': []}
+state = {'clicks': 0, 'activations': 0, 'text': '', 'scrolls': [], 'motions': []}
 app = Gtk.Application(application_id=os.environ.get('GNOME_FIXTURE_APP_ID','org.agent_sh.GnomeFixture'))
 def save():
     state.update(scale=window.get_scale_factor(), width=window.get_width(), height=window.get_height())
     ok, bounds = button.compute_bounds(window)
     if ok: state['button_rect']=[bounds.get_x(),bounds.get_y(),bounds.get_width(),bounds.get_height()]
+    ok, bounds = entry.compute_bounds(window)
+    if ok: state['entry_rect']=[bounds.get_x(),bounds.get_y(),bounds.get_width(),bounds.get_height()]
+    state['role'] = entry.get_accessible_role().value_nick
     output.write_text(json.dumps(state))
 def activate(app):
-    global window, button
+    global window, button, entry
     window = Gtk.ApplicationWindow(application=app, title='Native GNOME fixture')
     window.set_default_size(480, 320)
     box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
     window.set_child(box)
-    entry = Gtk.Entry()
+    # GNOME_FIXTURE_ENTRY_ROLE=search-box exposes AT-SPI role "entry", as
+    # Chromium, Firefox and Electron fields do.
+    if os.environ.get('GNOME_FIXTURE_ENTRY_ROLE') == 'search-box':
+        entry = Gtk.Text(accessible_role=Gtk.AccessibleRole.SEARCH_BOX)
+    else:
+        entry = Gtk.Entry()
     entry.set_placeholder_text('Native text input')
+    def activated(_):
+        state['activations'] += 1
+        save()
+    entry.connect('activate', activated)
     entry.connect('changed', lambda e: (state.update(text=e.get_text()), save()))
     box.append(entry)
     button = Gtk.Button(label='Native click target')
