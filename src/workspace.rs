@@ -4613,8 +4613,11 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                                 }
                             }
                             Err(error) => {
-                                let mut response =
-                                    response_with_status(false, error.to_string(), &state.status);
+                                let mut response = response_with_status(
+                                    false,
+                                    format!("{error:#}"),
+                                    &state.status,
+                                );
                                 response.apps = Some(vec![app]);
                                 (response, false)
                             }
@@ -4635,7 +4638,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     }
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -4678,7 +4681,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -4724,7 +4727,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -4754,7 +4757,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -4776,7 +4779,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -4821,7 +4824,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -4867,7 +4870,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -4884,7 +4887,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -4912,7 +4915,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 &criteria.app_id,
             ) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match screenshot_workspace_window(
@@ -4954,7 +4957,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -4980,13 +4983,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -5013,7 +5016,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 true,
             ) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match focus_matching_workspace_window(state, &criteria) {
@@ -5049,7 +5052,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -5074,7 +5077,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -5098,7 +5101,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -5126,7 +5129,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 true,
             ) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) if dry_run => match wait_workspace_window(state, &criteria)
@@ -5166,7 +5169,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -5202,7 +5205,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -5235,7 +5238,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_workspace_coordinates(&state.status, x, y, "window move"))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => {
@@ -5271,7 +5274,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
@@ -5306,7 +5309,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_window_size_for_workspace(&state.status, width, height))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match resize_workspace_window_target(
@@ -5346,7 +5349,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -5375,7 +5378,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 &criteria.app_id,
             ) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => {
@@ -5411,7 +5414,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
@@ -5441,7 +5444,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 &criteria.app_id,
             ) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => {
@@ -5477,7 +5480,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
@@ -5507,7 +5510,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 &criteria.app_id,
             ) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => {
@@ -5540,7 +5543,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
@@ -5568,13 +5571,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -5608,7 +5611,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_click_options(button, count))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => {
@@ -5653,7 +5656,11 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                                     (response, false)
                                 }
                                 Err(error) => (
-                                    response_with_status(false, error.to_string(), &state.status),
+                                    response_with_status(
+                                        false,
+                                        format!("{error:#}"),
+                                        &state.status,
+                                    ),
                                     false,
                                 ),
                             }
@@ -5668,7 +5675,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
@@ -5687,13 +5694,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -5724,7 +5731,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_relative_click_coordinates(x, y))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match move_workspace_pointer_window(
@@ -5764,7 +5771,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                                 (response, false)
                             }
                             Err(error) => (
-                                response_with_status(false, error.to_string(), &state.status),
+                                response_with_status(false, format!("{error:#}"), &state.status),
                                 false,
                             ),
                         }
@@ -5779,7 +5786,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -5813,13 +5820,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -5855,7 +5862,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_click_options(button, DEFAULT_CLICK_COUNT))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match drag_workspace_window(
@@ -5900,7 +5907,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                                 (response, false)
                             }
                             Err(error) => (
-                                response_with_status(false, error.to_string(), &state.status),
+                                response_with_status(false, format!("{error:#}"), &state.status),
                                 false,
                             ),
                         }
@@ -5915,7 +5922,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -5947,13 +5954,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -5987,7 +5994,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_scroll_options(direction, amount))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match scroll_workspace_window(
@@ -6031,7 +6038,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                                 (response, false)
                             }
                             Err(error) => (
-                                response_with_status(false, error.to_string(), &state.status),
+                                response_with_status(false, format!("{error:#}"), &state.status),
                                 false,
                             ),
                         }
@@ -6046,7 +6053,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -6063,7 +6070,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -6099,7 +6106,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 Ok(())
             }) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match key_workspace_window(state, window_id.as_deref(), &criteria, key) {
@@ -6133,7 +6140,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -6154,7 +6161,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -6190,7 +6197,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 Ok(())
             }) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => {
@@ -6228,7 +6235,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
@@ -6256,7 +6263,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -6277,7 +6284,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6305,7 +6312,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -6339,7 +6346,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_key_text(&key))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match paste_workspace_window(
@@ -6386,7 +6393,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -6416,7 +6423,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6456,7 +6463,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6477,7 +6484,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6513,13 +6520,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6558,13 +6565,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6606,13 +6613,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6627,7 +6634,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6642,7 +6649,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -6673,7 +6680,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -6701,7 +6708,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
