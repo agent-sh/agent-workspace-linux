@@ -3766,12 +3766,13 @@ fn create_client_runtime(runtime: &Path) -> Result<()> {
     }
 }
 
+/// Terminals started before the client runtime split keep their tmux server at
+/// the runtime root. Attach there only while that server still accepts
+/// connections; a stale socket file must not steer new launches or lookups away
+/// from the sandbox-visible client directory.
 fn terminal_socket_path(runtime: &Path, id: &str) -> PathBuf {
     let legacy = runtime.join(format!("terminal-{id}.tmux.sock"));
-    if legacy
-        .symlink_metadata()
-        .is_ok_and(|meta| meta.file_type().is_socket())
-    {
+    if UnixStream::connect(&legacy).is_ok() {
         legacy
     } else {
         runtime
@@ -9449,6 +9450,34 @@ mod tests {
             .expect_err("too-long socket path should fail before daemon spawn");
 
         assert!(error.to_string().contains("Unix socket paths"));
+    }
+
+    #[test]
+    fn terminal_socket_ignores_stale_legacy_socket_and_attaches_to_live_one() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let runtime =
+            std::env::temp_dir().join(format!("awl-term-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&runtime).expect("create test runtime");
+        let legacy = runtime.join("terminal-t.tmux.sock");
+        let client = runtime.join("client").join("terminal-t.tmux.sock");
+
+        assert_eq!(terminal_socket_path(&runtime, "t"), client);
+
+        let stale = UnixListener::bind(&legacy).expect("bind legacy socket");
+        drop(stale);
+        assert!(legacy
+            .symlink_metadata()
+            .is_ok_and(|meta| meta.file_type().is_socket()));
+        assert_eq!(terminal_socket_path(&runtime, "t"), client);
+
+        fs::remove_file(&legacy).expect("remove stale legacy socket");
+        let _live = UnixListener::bind(&legacy).expect("bind live legacy socket");
+        assert_eq!(terminal_socket_path(&runtime, "t"), legacy);
+
+        fs::remove_dir_all(runtime).expect("remove test runtime");
     }
 
     #[test]
