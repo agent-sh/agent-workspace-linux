@@ -199,9 +199,13 @@ impl DesktopControl for CosmicDesktopControl<'_> {
     fn move_window(&self, id: &str, x: i32, y: i32) -> Result<WorkspaceWindow> {
         self.focus_window(id)?;
         let g = self.window_info(id)?.geometry;
-        let fx = g.x + g.width as i32 / 2;
-        let fy = g.y + g.height as i32 / 2;
-        self.gesture(fx, fy, fx + x - g.x, fy + y - g.y, 1, true)?;
+        // Super+drag can grab any point of the window; pick one whose start
+        // and end both stay on screen, so every reachable target is accepted.
+        let ox = grab_offset(g.x, x, g.width, self.status.width)
+            .context("COSMIC can only move a window to where part of it stays on screen")?;
+        let oy = grab_offset(g.y, y, g.height, self.status.height)
+            .context("COSMIC can only move a window to where part of it stays on screen")?;
+        self.gesture(g.x + ox, g.y + oy, x + ox, y + oy, 1, true)?;
         self.wait_window(id, "move", |w| {
             (w["geometry"]["x"].as_i64().unwrap_or(i64::MAX) - x as i64).abs() <= 1
                 && (w["geometry"]["y"].as_i64().unwrap_or(i64::MAX) - y as i64).abs() <= 1
@@ -214,6 +218,16 @@ impl DesktopControl for CosmicDesktopControl<'_> {
         let inset = self.status.session.scale.ceil() as i32 + 1;
         let fx = g.x + g.width as i32 - inset;
         let fy = g.y + g.height as i32 - inset;
+        let (tx, ty) = (
+            fx + width as i32 - g.width as i32,
+            fy + height as i32 - g.height as i32,
+        );
+        if tx < 0 || ty < 0 || tx as u32 >= self.status.width || ty as u32 >= self.status.height {
+            bail!(
+                "COSMIC resizes by dragging the bottom-right corner, which would end off screen \
+                 at {tx},{ty}; move the window so a {width}x{height} window fits first"
+            );
+        }
         self.gesture(
             fx,
             fy,
@@ -352,5 +366,30 @@ fn button_code(button: u8) -> Result<u32> {
         2 => Ok(274),
         3 => Ok(273),
         _ => bail!("COSMIC pointer button must be 1, 2 or 3"),
+    }
+}
+
+/// An offset into a window of `size` pixels such that the window's point at
+/// that offset is on a screen of `screen` pixels both at `from` and at `to`.
+fn grab_offset(from: i32, to: i32, size: u32, screen: u32) -> Option<i32> {
+    let low = 0.max(-from).max(-to);
+    let high = (size as i32)
+        .min(screen as i32 - from)
+        .min(screen as i32 - to);
+    (low < high).then(|| low + (high - low) / 2)
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn grab_offsets_keep_both_drag_ends_on_screen() {
+        // A wide window moved right: its centre would leave the screen.
+        let ox = super::grab_offset(100, 900, 600, 1200).expect("reachable");
+        assert!((0..600).contains(&ox) && 100 + ox < 1200 && 900 + ox < 1200);
+        // Moving partly above the screen still works from a lower point.
+        let oy = super::grab_offset(50, -100, 400, 900).expect("reachable");
+        assert!(-100 + oy >= 0 && 50 + oy < 900);
+        // No point of the window would stay on screen.
+        assert_eq!(super::grab_offset(0, 1300, 100, 1200), None);
     }
 }
