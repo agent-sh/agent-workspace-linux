@@ -141,6 +141,7 @@ pub(crate) fn configure_launch_environment(
 }
 
 fn configure_application_bus(command: &mut Command, status: &WorkspaceStatus) {
+    status.session.configure_sandboxed_environment(command);
     if status.session.backend.requires_client_application_bus() {
         let bus = status.runtime_dir.join("client-bus");
         command.env(

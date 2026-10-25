@@ -150,6 +150,15 @@ impl SessionSpec {
         }
     }
 
+    /// Environment for sandboxed launches only, applied after
+    /// `configure_process_environment`. Attached controllers and unsandboxed
+    /// launches keep the latter, as they do the control bus.
+    pub(crate) fn configure_sandboxed_environment(self, command: &mut Command) {
+        if self.backend == SessionBackend::Cosmic {
+            cosmic::configure_sandboxed_environment(command);
+        }
+    }
+
     pub(crate) fn sandbox_resources(
         self,
         xauthority_path: &Path,

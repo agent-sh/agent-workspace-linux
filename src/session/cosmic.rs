@@ -12,10 +12,10 @@ use std::{
     fs,
     io::Read,
     os::{
-        fd::{AsRawFd, FromRawFd},
+        fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::{
             fs::{MetadataExt, PermissionsExt},
-            net::UnixStream,
+            net::{UnixListener, UnixStream},
             process::CommandExt,
         },
     },
@@ -24,6 +24,37 @@ use std::{
     time::Duration,
 };
 const ENV_FILE: &str = "cosmic-client.json";
+/// Sandboxed applications connect here. COSMIC gives clients of this socket a
+/// security context, so it withholds its privileged globals from them. The
+/// compositor socket named in `ENV_FILE` stays with the daemon's helpers,
+/// attached controllers and unsandboxed launches. Those run as the same user
+/// with full file access and could open it by path anyway, and desktop
+/// services such as portals need capture, as with the control bus.
+pub(crate) const APP_SOCKET: &str = "wayland-apps";
+/// Globals COSMIC 8cb1802 filters with `client_not_sandboxed` or
+/// `client_has_no_security_context`. None may reach a launched application.
+pub(crate) const PRIVILEGED_GLOBALS: &[&str] = &[
+    "zcosmic_toplevel_info_v1",
+    "zcosmic_toplevel_manager_v1",
+    "zcosmic_workspace_manager_v2",
+    "ext_workspace_manager_v1",
+    "ext_image_copy_capture_manager_v1",
+    "ext_output_image_capture_source_manager_v1",
+    "ext_foreign_toplevel_image_capture_source_manager_v1",
+    "zcosmic_workspace_image_capture_source_manager_v1",
+    "zwlr_output_manager_v1",
+    "zwlr_output_power_manager_v1",
+    "zwp_virtual_keyboard_manager_v1",
+    "zwp_input_method_manager_v2",
+    "zwlr_layer_shell_v1",
+    "ext_session_lock_manager_v1",
+    "cosmic_session_lock_layer_manager_v1",
+    "zcosmic_keyboard_layout_manager_v1",
+    "ext_data_control_manager_v1",
+    "zwlr_data_control_manager_v1",
+    "cosmic_a11y_manager_v1",
+    "wp_security_context_manager_v1",
+];
 pub(crate) fn blockers() -> Vec<String> {
     ["cosmic-comp",
         "bwrap","weston","Xwayland","xrdb","xauth","dbus-daemon","wl-copy","wl-paste","timeout"].into_iter().filter(|n|!command_path_check(n).ok).map(|n|format!("Install {n} for native COSMIC workspaces (COSMIC 1.0 with EI text input, Weston headless kiosk shell). ")).collect()
@@ -90,6 +121,10 @@ pub(crate) fn configure_process_environment(
             .env("XAUTHORITY", xauthority);
     }
 }
+/// Sandboxed launches use the restricted socket, the only one bound into them.
+pub(crate) fn configure_sandboxed_environment(command: &mut Command) {
+    command.env("WAYLAND_DISPLAY", APP_SOCKET);
+}
 pub(crate) fn sandbox_resources(
     runtime: &Path,
     xauthority: &Path,
@@ -100,8 +135,10 @@ pub(crate) fn sandbox_resources(
         read_only_binds.push(xauthority.to_owned());
     }
     let mut read_write_binds = vec![runtime.join("session-bus")];
-    if let Ok(socket) = wayland_socket(runtime) {
-        read_write_binds.push(socket);
+    // Never the compositor socket: sandboxed clients must have a security context.
+    let apps = runtime.join(APP_SOCKET);
+    if apps.exists() {
+        read_write_binds.push(apps);
     }
     if let Some(number) = display
         .strip_prefix(':')
@@ -127,19 +164,28 @@ pub(crate) fn control(runtime: &Path, operation: &str, args: &Value) -> Result<V
     } else {
         wayland_socket(runtime)?.to_string_lossy().into_owned()
     };
+    run_helper(runtime, &endpoint, operation, args, |_| {})
+}
+fn run_helper(
+    runtime: &Path,
+    endpoint: &str,
+    operation: &str,
+    args: &Value,
+    prepare: impl FnOnce(&mut Command),
+) -> Result<Value> {
     let mut command = Command::new("timeout");
     configure_process_environment(&mut command, runtime, "", &runtime.join("Xauthority"));
-    let result = command
+    command
         .args(["--kill-after=1s", "8s"])
         .arg(crate::workspace::daemon_executable_path()?)
         .args([
             "__cosmic-control",
-            &endpoint,
+            endpoint,
             operation,
             &serde_json::to_string(args)?,
-        ])
-        .output()
-        .context("run COSMIC control helper")?;
+        ]);
+    prepare(&mut command);
+    let result = command.output().context("run COSMIC control helper")?;
     if !result.status.success() {
         bail!(
             "COSMIC {operation} failed ({}): {}",
@@ -292,6 +338,76 @@ fn set_cookie(authority: &Path, display: &str, cookie: &str) -> Result<()> {
     fs::set_permissions(authority, fs::Permissions::from_mode(0o600))?;
     Ok(())
 }
+/// Create the restricted application socket and register it with COSMIC.
+/// Returns the write end of the close descriptor; COSMIC stops accepting
+/// connections on the socket when it is closed.
+fn create_application_socket(runtime: &Path, instance: &str) -> Result<OwnedFd> {
+    let path = runtime.join(APP_SOCKET);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    let listener = UnixListener::bind(&path)?;
+    let mut fds = [0; 2];
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    let (close_read, close_write) =
+        unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+    let (listen_fd, close_fd) = (listener.as_raw_fd(), close_read.as_raw_fd());
+    run_helper(
+        runtime,
+        &wayland_socket(runtime)?.to_string_lossy(),
+        "security-context",
+        &json!({"listen_fd": listen_fd, "close_fd": close_fd, "instance_id": instance}),
+        |command| unsafe {
+            command.pre_exec(move || {
+                for fd in [listen_fd, close_fd] {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        },
+    )?;
+    drop((listener, close_read));
+    // Fail closed: apps must never see a socket COSMIC treats as unsandboxed.
+    let registry = run_helper(
+        runtime,
+        &path.to_string_lossy(),
+        "registry",
+        &json!({}),
+        |_| {},
+    )?;
+    let interfaces = registry["interfaces"]
+        .as_array()
+        .context("COSMIC application registry missing")?
+        .iter()
+        .filter_map(Value::as_str)
+        .collect::<Vec<_>>();
+    if !interfaces.contains(&"wl_compositor") || !interfaces.contains(&"xdg_wm_base") {
+        bail!("COSMIC application socket lacks core globals: {interfaces:?}");
+    }
+    let exposed = PRIVILEGED_GLOBALS
+        .iter()
+        .filter(|name| interfaces.contains(name))
+        .collect::<Vec<_>>();
+    if !exposed.is_empty() {
+        bail!("COSMIC application socket exposes privileged globals: {exposed:?}");
+    }
+    Ok(close_write)
+}
+/// One append-mode file for both streams, so neither overwrites the other.
+fn log_file(path: &Path) -> Result<(Stdio, Stdio)> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)?;
+    file.set_len(0)?;
+    Ok((Stdio::from(file.try_clone()?), Stdio::from(file)))
+}
 /// Copy the allowlisted launcher into a separate, read-only mount. A network-only
 /// client can write host files, so permissions on the host PATH directory alone
 /// are insufficient. Neither chmod nor replacing that directory changes this copy.
@@ -355,6 +471,7 @@ pub(crate) struct CosmicSession {
     stopped: bool,
     xwayland_files: Vec<(PathBuf, u64, u64)>,
     xwayland_lock_pid: Option<u32>,
+    application_socket: Option<OwnedFd>,
 }
 impl CosmicSession {
     pub(crate) fn start(options: &mut DaemonOptions) -> Result<Self> {
@@ -411,7 +528,9 @@ impl CosmicSession {
             }))?,
         )?;
         fs::set_permissions(bin.join("xwayland.json"), fs::Permissions::from_mode(0o400))?;
-        fs::set_permissions(&bin, fs::Permissions::from_mode(0o500))?;
+        // The compositor never uses this directory directly: Bubblewrap copies
+        // its files into a read-only mount. It stays writable by the owner so
+        // stop and stale cleanup can remove the runtime.
         // No cosmic-session, panels, settings service, portal launcher or system bus.
         let mut private = PrivateSession::start(
             runtime,
@@ -429,6 +548,7 @@ impl CosmicSession {
             stopped: false,
             xwayland_files: vec![],
             xwayland_lock_pid: None,
+            application_socket: None,
         };
         let parent_socket = runtime.join("cosmic-parent");
         if parent_socket.exists() {
@@ -453,15 +573,8 @@ impl CosmicSession {
             .arg(format!("--width={}", options.width))
             .arg(format!("--height={}", options.height));
         prepare_child(&mut parent);
-        parent
-            .stdout(Stdio::from(fs::File::create(
-                runtime.join("cosmic-parent.log"),
-            )?))
-            .stderr(Stdio::from(
-                fs::OpenOptions::new()
-                    .append(true)
-                    .open(runtime.join("cosmic-parent.log"))?,
-            ));
+        let (stdout, stderr) = log_file(&runtime.join("cosmic-parent.log"))?;
+        parent.stdout(stdout).stderr(stderr);
         session.parent = Some(parent.spawn()?);
         wait_for(
             Duration::from_secs(10),
@@ -503,13 +616,8 @@ impl CosmicSession {
         }
         session.lifetime = Some(lifetime);
         prepare_child(&mut compositor);
-        compositor
-            .stdout(Stdio::from(fs::File::create(runtime.join("cosmic.log"))?))
-            .stderr(Stdio::from(
-                fs::OpenOptions::new()
-                    .append(true)
-                    .open(runtime.join("cosmic.log"))?,
-            ));
+        let (stdout, stderr) = log_file(&runtime.join("cosmic.log"))?;
+        compositor.stdout(stdout).stderr(stderr);
         session.private.compositor = Some(compositor.spawn()?);
         wait_for(
             Duration::from_secs(20),
@@ -562,6 +670,7 @@ impl CosmicSession {
             .context("COSMIC height unavailable")? as u32;
         // Probe input before advertising a ready desktop. No synthesized events.
         control(runtime, "input", &json!([]))?;
+        session.application_socket = Some(create_application_socket(runtime, &options.session_id)?);
         Ok(session)
     }
     pub(crate) fn pid(&self) -> Option<u32> {
@@ -572,6 +681,8 @@ impl CosmicSession {
             return;
         }
         self.stopped = true;
+        self.application_socket.take();
+        let _ = fs::remove_file(self.runtime.join(APP_SOCKET));
         self.lifetime.take();
         let socket = wayland_socket(&self.runtime).ok();
         if let Some(child) = self.private.compositor.as_mut() {
@@ -649,5 +760,27 @@ pub(crate) fn cleanup_stale_processes(pid: Option<u32>, dry_run: bool, actions: 
             dry_run,
             actions,
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn compositor_log_keeps_interleaved_stdout_and_stderr() {
+        let dir = std::env::temp_dir().join(format!("awl-cosmic-log-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("cosmic.log");
+        std::fs::write(&path, "previous session\n").unwrap();
+        let (stdout, stderr) = super::log_file(&path).unwrap();
+        let status = std::process::Command::new("sh")
+            .args(["-c", "echo out1; echo err1 >&2; echo out2; echo err2 >&2"])
+            .stdout(stdout)
+            .stderr(stderr)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        let log = std::fs::read_to_string(&path).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(log, "out1\nerr1\nout2\nerr2\n");
     }
 }

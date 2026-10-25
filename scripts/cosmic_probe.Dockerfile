@@ -9,7 +9,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     x11-utils xterm tmux wl-clipboard python3 python3-pyqt6 qt6-wayland \
     libasound2t64 libxkbcommon-x11-0 libvulkan1 libegl1 libfontconfig1 \
     libxcb-xfixes0 libxcb-randr0 libxcb-shape0 libxcb-xkb1 libxcb-render0 \
-    libxcb-present0 libxcb-dri3-0 libx11-xcb1 procps \
+    libxcb-present0 libxcb-dri3-0 libx11-xcb1 procps wayland-utils \
     && rm -rf /var/lib/apt/lists/*
 COPY cosmic_smoke.py cosmic_fixture.py kwin_mcp.py runtime_isolation_smoke.py /opt/cosmic-probe/
 ENTRYPOINT ["python3", "/opt/cosmic-probe/cosmic_smoke.py"]
