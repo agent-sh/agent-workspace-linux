@@ -32,8 +32,11 @@ fn managed_socket(runtime: &Path, app: &WorkspaceApp) -> Option<(PathBuf, PathBu
         return None;
     }
     let id = sanitize_terminal_id(&a[16]).ok()?;
-    let socket = runtime.join(format!("terminal-{id}.tmux.sock"));
-    if id != a[16] || Path::new(&a[12]) != socket {
+    let socket = PathBuf::from(&a[12]);
+    let name = format!("terminal-{id}.tmux.sock");
+    if id != a[16]
+        || (socket != runtime.join(&name) && socket != runtime.join("client").join(&name))
+    {
         return None;
     }
     Some((PathBuf::from(&a[10]), socket))

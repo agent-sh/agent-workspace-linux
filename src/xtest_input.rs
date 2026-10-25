@@ -76,6 +76,22 @@ pub fn run(args: &[String]) -> Result<()> {
     };
 
     match args.first().map(String::as_str) {
+        Some("window-pid") if args.len() == 2 => {
+            use x11rb::protocol::res::{ClientIdMask, ClientIdSpec, ConnectionExt as _};
+            let window: u32 = args[1].parse().context("invalid X11 window id")?;
+            let reply = conn
+                .res_query_client_ids(&[ClientIdSpec {
+                    client: window,
+                    mask: ClientIdMask::LOCAL_CLIENT_PID,
+                }])?
+                .reply()?;
+            let pid = reply
+                .ids
+                .iter()
+                .find_map(|id| id.value.first().copied())
+                .context("XRes did not return a local client PID")?;
+            println!("{pid}");
+        }
         Some("content-check") if args.len() >= 2 => {
             let window: u32 = args[1].parse().context("invalid X11 window id")?;
             let visible = args[2..]

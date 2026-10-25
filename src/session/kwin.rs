@@ -1,5 +1,7 @@
 //! A private KWin virtual compositor, with its own bus, runtime and settings.
 //! No parent X11/Wayland display and no host input device is used.
+pub(crate) use super::private::bus_address;
+use super::private::{prepare_child, wait_for, PrivateSession};
 use crate::{
     launch::SessionSandboxResources,
     workspace::{cleanup_stale_process_pid, command_path_check, DaemonOptions},
@@ -7,11 +9,9 @@ use crate::{
 use anyhow::{bail, Context, Result};
 use std::{
     fs,
-    os::unix::process::CommandExt,
     path::Path,
-    process::{Child, Command, Stdio},
-    thread,
-    time::{Duration, Instant},
+    process::{Command, Stdio},
+    time::Duration,
 };
 
 pub(crate) const WAYLAND_SOCKET: &str = "workspace-wayland";
@@ -49,23 +49,6 @@ pub(crate) fn blockers() -> Vec<String> {
         blockers.push("Native KWin capture requires access to a DRM render node (/dev/dri/renderD*); no host display or input devices are needed.".to_owned());
     }
     blockers
-}
-
-pub(crate) fn bus_address(runtime: &Path) -> String {
-    socket_address(&runtime.join("session-bus"))
-}
-
-fn socket_address(path: &Path) -> String {
-    use std::{fmt::Write as _, os::unix::ffi::OsStrExt};
-    let mut address = String::from("unix:path=");
-    for byte in path.as_os_str().as_bytes() {
-        if byte.is_ascii_alphanumeric() || b"_-/.\\".contains(byte) {
-            address.push(*byte as char);
-        } else {
-            write!(address, "%{byte:02X}").expect("write to String");
-        }
-    }
-    address
 }
 
 pub(crate) fn configure_process_environment(
@@ -140,44 +123,8 @@ pub(crate) fn sandbox_resources(
     }
 }
 
-struct AccessibilityBus {
-    address: String,
-}
-#[zbus::interface(name = "org.a11y.Bus")]
-impl AccessibilityBus {
-    fn get_address(&self) -> &str {
-        &self.address
-    }
-}
-struct AccessibilityStatus {
-    enabled: bool,
-    screen_reader_enabled: bool,
-}
-#[zbus::interface(name = "org.a11y.Status")]
-impl AccessibilityStatus {
-    #[zbus(property)]
-    fn is_enabled(&self) -> bool {
-        self.enabled
-    }
-    #[zbus(property)]
-    fn set_is_enabled(&mut self, enabled: bool) {
-        self.enabled = enabled;
-    }
-    #[zbus(property)]
-    fn screen_reader_enabled(&self) -> bool {
-        self.screen_reader_enabled
-    }
-    #[zbus(property)]
-    fn set_screen_reader_enabled(&mut self, enabled: bool) {
-        self.screen_reader_enabled = enabled;
-    }
-}
-
 pub(crate) struct KwinSession {
-    compositor: Option<Child>,
-    bus: Option<Child>,
-    accessibility_bus: Option<Child>,
-    accessibility_service: Option<zbus::blocking::Connection>,
+    private: PrivateSession,
 }
 impl KwinSession {
     pub(crate) fn start(options: &mut DaemonOptions) -> Result<Self> {
@@ -223,55 +170,15 @@ impl KwinSession {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        // Discard addresses and service directories left by a stopped session.
-        let address_file = runtime.join("atspi-address");
-        if address_file.exists() {
-            fs::remove_file(&address_file)?;
-        }
         let mut session = Self {
-            compositor: None,
-            bus: None,
-            accessibility_bus: None,
-            accessibility_service: None,
-        };
-        session.bus = Some(start_private_bus(
-            runtime,
-            "session",
-            &bus_address(runtime),
-            &[],
-        )?);
-        let registry =
-            Path::new("/usr/share/dbus-1/accessibility-services/org.a11y.atspi.Registry.service");
-        if registry.is_file() {
-            fs::create_dir_all(runtime.join("at-spi"))?;
-            let address = socket_address(&runtime.join("at-spi/bus"));
-            session.accessibility_bus = Some(start_private_bus(
+            private: PrivateSession::start(
                 runtime,
-                "accessibility",
-                &address,
-                &[registry],
-            )?);
-            session.accessibility_service = Some(
-                zbus::blocking::connection::Builder::address(bus_address(runtime).as_str())?
-                    .method_timeout(Duration::from_secs(5))
-                    .name("org.a11y.Bus")?
-                    .serve_at(
-                        "/org/a11y/bus",
-                        AccessibilityBus {
-                            address: address.clone(),
-                        },
-                    )?
-                    .serve_at(
-                        "/org/a11y/bus",
-                        AccessibilityStatus {
-                            enabled: true,
-                            screen_reader_enabled: false,
-                        },
-                    )?
-                    .build()?,
-            );
-            fs::write(address_file, address)?;
-        }
+                |command| {
+                    configure_process_environment(command, runtime, "", &options.xauthority_path)
+                },
+                "",
+            )?,
+        };
         let client_env = runtime.join("kwin-client.json");
         if client_env.exists() {
             fs::remove_file(&client_env)?;
@@ -329,7 +236,7 @@ impl KwinSession {
                 .append(true)
                 .open(runtime.join("kwin.log"))?,
         ));
-        session.compositor = Some(
+        session.private.compositor = Some(
             command
                 .spawn()
                 .context("start private KWin virtual compositor")?,
@@ -337,7 +244,7 @@ impl KwinSession {
         wait_for(
             Duration::from_secs(15),
             || {
-                if let Some(status) = session.compositor.as_mut().unwrap().try_wait()? {
+                if let Some(status) = session.private.compositor.as_mut().unwrap().try_wait()? {
                     bail!(
                         "KWin exited with {status}; see {}",
                         runtime.join("kwin.log").display()
@@ -431,164 +338,12 @@ impl KwinSession {
         Ok(session)
     }
     pub(crate) fn pid(&self) -> Option<u32> {
-        self.compositor.as_ref().map(Child::id)
+        self.private.pid()
     }
     pub(crate) fn shutdown(&mut self) {
-        self.accessibility_service.take();
-        for slot in [
-            &mut self.compositor,
-            &mut self.accessibility_bus,
-            &mut self.bus,
-        ] {
-            if let Some(mut child) = slot.take() {
-                // Allow KWin to unlink its Wayland/XWayland sockets before
-                // reaping all remaining private-session services.
-                let group = -(child.id() as i32);
-                unsafe {
-                    libc::kill(group, libc::SIGTERM);
-                }
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while Instant::now() < deadline {
-                    if child.try_wait().ok().flatten().is_some() {
-                        break;
-                    }
-                    thread::sleep(Duration::from_millis(20));
-                }
-                unsafe {
-                    libc::kill(group, libc::SIGKILL);
-                }
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-        }
+        self.private.shutdown();
     }
 }
-impl Drop for KwinSession {
-    fn drop(&mut self) {
-        self.shutdown();
-    }
-}
-
-fn start_private_bus(
-    runtime: &Path,
-    kind: &str,
-    address: &str,
-    services: &[&Path],
-) -> Result<Child> {
-    let service_dir = runtime.join(format!("{kind}-services"));
-    if service_dir.symlink_metadata().is_ok() {
-        if service_dir.symlink_metadata()?.file_type().is_symlink() {
-            fs::remove_file(&service_dir)?;
-        } else {
-            fs::remove_dir_all(&service_dir)?;
-        }
-    }
-    fs::create_dir_all(&service_dir)?;
-    for service in services {
-        fs::copy(
-            service,
-            service_dir.join(service.file_name().context("service file name")?),
-        )?;
-    }
-    let escape = |value: &str| {
-        value
-            .replace('&', "&amp;")
-            .replace('<', "&lt;")
-            .replace('>', "&gt;")
-            .replace('"', "&quot;")
-    };
-    let config = runtime.join(format!("{kind}-bus.conf"));
-    fs::write(
-        &config,
-        format!(
-            r#"<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN" "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
-<busconfig><type>{kind}</type><auth>EXTERNAL</auth><listen>{address}</listen>
-<servicedir>{services}</servicedir>
-<policy context="default">
-<allow user="{uid}"/><allow own="*"/><allow send_destination="*"/><allow receive_sender="*"/>
-<deny send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus" send_member="UpdateActivationEnvironment"/>
-<deny send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus" send_member="ReloadConfig"/>
-</policy></busconfig>"#,
-            address = escape(address),
-            services = escape(&service_dir.to_string_lossy()),
-            uid = unsafe { libc::geteuid() }
-        ),
-    )?;
-    let socket = if kind == "session" {
-        runtime.join("session-bus")
-    } else {
-        runtime.join("at-spi/bus")
-    };
-    if socket.exists() {
-        fs::remove_file(&socket)?;
-    }
-    let mut command = Command::new("dbus-daemon");
-    configure_process_environment(&mut command, runtime, "", &runtime.join("Xauthority"));
-    command
-        .env("HOME", runtime.join("session-home"))
-        .env("GSETTINGS_BACKEND", "memory")
-        .args(["--nofork", "--nopidfile", "--config-file"])
-        .arg(config)
-        .stdout(Stdio::null())
-        .stderr(Stdio::from(fs::File::create(
-            runtime.join(format!("{kind}-bus.log")),
-        )?));
-    prepare_child(&mut command);
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("start private {kind} bus"))?;
-    if let Err(error) = wait_for(
-        Duration::from_secs(5),
-        || {
-            if let Some(status) = child.try_wait()? {
-                bail!("private {kind} bus exited with {status}");
-            }
-            Ok(socket.exists())
-        },
-        &format!("private {kind} bus"),
-    ) {
-        let _ = child.kill();
-        let _ = child.wait();
-        return Err(error);
-    }
-    Ok(child)
-}
-
-fn prepare_child(command: &mut Command) {
-    let parent = std::process::id();
-    command.stdin(Stdio::null()).process_group(0);
-    // Only async-signal-safe syscalls in the post-fork child. Kill the owned
-    // server if its workspace daemon crashes, including the fork/prctl race.
-    unsafe {
-        command.pre_exec(move || {
-            // Ignore executable file capabilities in this private session.
-            // This also keeps the parent-death signal across compositor exec.
-            if libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-
-            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            if libc::getppid() != parent as i32 {
-                libc::_exit(1);
-            }
-            Ok(())
-        });
-    }
-}
-
-fn wait_for(timeout: Duration, mut ready: impl FnMut() -> Result<bool>, name: &str) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if ready()? {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(50));
-    }
-    bail!("timed out waiting for {name}")
-}
-
 pub(crate) fn cleanup_stale_processes(pid: Option<u32>, dry_run: bool, actions: &mut Vec<String>) {
     if let Some(pid) = pid {
         cleanup_stale_process_pid(pid, "KWin compositor", &["kwin_wayland"], dry_run, actions);

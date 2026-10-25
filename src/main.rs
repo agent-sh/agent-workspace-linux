@@ -4424,8 +4424,8 @@ Usage:
   agent-workspace-linux profile template project-dev [--id ID] [--host-path PATH]
   agent-workspace-linux profile template restricted-chrome [--id ID] [--browser-path PATH]
   agent-workspace-linux profile template browser-session [--id ID] [--browser-path PATH] --user-data-dir PATH
-  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--ack-unenforced-policy] [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11|kwin] [--scale N] [--width PX] [--height PX]
-  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] [--ack-unenforced-policy] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11|kwin] [--scale N] [--width PX] [--height PX]
+  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--ack-unenforced-policy] [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome] [--scale N] [--width PX] [--height PX]
+  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] [--ack-unenforced-policy] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome] [--scale N] [--width PX] [--height PX]
   agent-workspace-linux workspace list
   agent-workspace-linux workspace cleanup [--id ID] [--dry-run]
   agent-workspace-linux workspace status [--id ID]
@@ -4557,7 +4557,7 @@ mod tests {
 
     #[test]
     fn start_options_reject_unimplemented_session_backend() {
-        let error = match parse_start_options(&args(&["--session", "gnome"])) {
+        let error = match parse_start_options(&args(&["--session", "unknown"])) {
             Ok(_) => panic!("unimplemented backend must be rejected"),
             Err(error) => error,
         };

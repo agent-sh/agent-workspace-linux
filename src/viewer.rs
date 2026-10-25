@@ -263,12 +263,17 @@ struct ViewerSnapshot {
     doctor_blockers: Vec<String>,
     kwin_doctor_ready: bool,
     kwin_doctor_blockers: Vec<String>,
+    gnome_doctor_ready: bool,
+    gnome_doctor_blockers: Vec<String>,
 }
 
 impl ViewerSnapshot {
     fn start_readiness(&self, session: crate::session::SessionSpec) -> (bool, &[String]) {
         match session.backend {
             crate::session::SessionBackend::X11 => (self.doctor_ready, &self.doctor_blockers),
+            crate::session::SessionBackend::Gnome => {
+                (self.gnome_doctor_ready, &self.gnome_doctor_blockers)
+            }
             crate::session::SessionBackend::Kwin => {
                 (self.kwin_doctor_ready, &self.kwin_doctor_blockers)
             }
@@ -2493,6 +2498,8 @@ fn compute_viewer_refresh(
                 doctor_blockers: doctor.blockers,
                 kwin_doctor_ready: doctor.ready_for_kwin_workspace,
                 kwin_doctor_blockers: doctor.kwin_blockers,
+                gnome_doctor_ready: doctor.ready_for_gnome_workspace,
+                gnome_doctor_blockers: doctor.gnome_blockers,
             };
 
             let (active_window, frame_update, error) = if running {
@@ -2735,8 +2742,8 @@ impl Render for AgentWorkspaceViewer {
             .map(|s| s.session)
             .or_else(|| manifest.map(|m| m.session))
             .unwrap_or_default();
-        let display_label = if session.backend == crate::session::SessionBackend::Kwin {
-            format!("KWin Wayland | {:.0}%", session.scale * 100.0)
+        let display_label = if session.backend != crate::session::SessionBackend::X11 {
+            format!("{session} Wayland | {:.0}%", session.scale * 100.0)
         } else {
             display.to_string()
         };
@@ -5925,6 +5932,18 @@ mod tests {
             (false, &["Install Xvfb".into()][..])
         );
         assert_eq!(snapshot.start_readiness(kwin), (true, &[][..]));
+        let gnome = SessionSpec {
+            backend: SessionBackend::Gnome,
+            scale: 1.5,
+        };
+        snapshot.gnome_doctor_blockers = vec!["Install GNOME".into()];
+        assert_eq!(
+            snapshot.start_readiness(gnome),
+            (false, &["Install GNOME".into()][..])
+        );
+        snapshot.gnome_doctor_ready = true;
+        snapshot.gnome_doctor_blockers.clear();
+        assert_eq!(snapshot.start_readiness(gnome), (true, &[][..]));
         snapshot.doctor_ready = true;
         snapshot.doctor_blockers.clear();
         snapshot.kwin_doctor_ready = false;
