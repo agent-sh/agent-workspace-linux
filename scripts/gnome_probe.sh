@@ -13,7 +13,7 @@ docker build --file "$ROOT_DIR/scripts/gnome_probe.Dockerfile" --tag "$IMAGE" "$
 # llvmpipe only: no host display, bus, input, GPU, or parent compositor.
 docker run --rm --network none --ipc private --read-only --cap-drop ALL \
     --security-opt no-new-privileges --security-opt seccomp=unconfined \
-    --security-opt apparmor=unconfined --user 65534:65534 --pids-limit 256 \
+    --security-opt apparmor=unconfined --security-opt systempaths=unconfined --user 65534:65534 --pids-limit 256 \
     --env LP_NUM_THREADS=2 --stop-timeout 5 --tmpfs /tmp:rw,nosuid,nodev,size=1g \
     --mount "type=bind,src=$ARTIFACT_DIR,dst=/artifacts" \
     --mount "type=bind,src=$BIN,dst=/opt/agent-workspace-linux,readonly" \

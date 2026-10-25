@@ -78,10 +78,15 @@ pub(crate) fn request(runtime: &Path, pid: u32, kind: u32, payload: &str) -> Res
     if ok != 0 || peer.pid as u32 != pid || peer.uid != unsafe { libc::geteuid() } {
         bail!("i3 IPC peer is not this workspace's window manager");
     }
-    socket.write_all(b"i3-ipc")?;
-    socket.write_all(&u32::try_from(payload.len())?.to_ne_bytes())?;
-    socket.write_all(&kind.to_ne_bytes())?;
-    socket.write_all(payload.as_bytes())?;
+    // One write: i3 reads the header from a nonblocking socket and drops the
+    // client on EAGAIN (libi3 ipc_recv_message), so a header split across
+    // writes intermittently resets the connection.
+    let mut message = Vec::with_capacity(14 + payload.len());
+    message.extend_from_slice(b"i3-ipc");
+    message.extend_from_slice(&u32::try_from(payload.len())?.to_ne_bytes());
+    message.extend_from_slice(&kind.to_ne_bytes());
+    message.extend_from_slice(payload.as_bytes());
+    socket.write_all(&message)?;
     let mut header = [0u8; 14];
     socket.read_exact(&mut header)?;
     if &header[..6] != b"i3-ipc" || u32::from_ne_bytes(header[10..14].try_into()?) != kind {

@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-xfixes0 libxcb-randr0 libxcb-shape0 libxcb-xkb1 libxcb-render0 \
     libxcb-present0 libxcb-dri3-0 libx11-xcb1 wayland-utils \
     && rm -rf /var/lib/apt/lists/*
-RUN apt-get update && apt-get install -y --no-install-recommends xdotool && rm -rf /var/lib/apt/lists/*
-COPY gnome_smoke.py gnome_fixture.py kwin_mcp.py /opt/gnome-probe/
+# ibus installs /etc/xdg/Xwayland-session.d/10-ibus-x11; the probe proves it never runs.
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pyqt6 python3-pil ibus && rm -rf /var/lib/apt/lists/*
+COPY gnome_smoke.py gnome_fixture.py gnome_qt_fixture.py gnome_primary_reader.py kwin_mcp.py /opt/gnome-probe/
 ENTRYPOINT ["python3","/opt/gnome-probe/gnome_smoke.py"]

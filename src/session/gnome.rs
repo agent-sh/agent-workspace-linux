@@ -4,18 +4,46 @@ use crate::workspace::{command_path_check, DaemonOptions};
 use anyhow::{bail, Context, Result};
 use std::{
     fs,
-    path::Path,
+    path::{Path, PathBuf},
     process::{Command, Stdio},
     time::Duration,
 };
 
 pub(crate) const WAYLAND_SOCKET: &str = "workspace-wayland";
 
+/// Apps get the client bus; only the daemon and compositor use this control
+/// bus. Same-user code that reaches its socket must still not get capture,
+/// remote input, privileged Wayland or Shell control. The daemon itself uses
+/// only org.gnome.Mutter.DisplayConfig and org.agent_sh.Workspace.Gnome.
+const CONTROL_BUS_POLICY: &str = r#"<deny send_interface="org.gnome.Shell"/>
+<deny send_interface="org.gnome.Shell.Extensions"/>
+<deny send_interface="org.gnome.Shell.Screenshot"/>
+<deny send_interface="org.gnome.Shell.Screencast"/>
+<deny send_interface="org.gnome.Shell.Introspect"/>
+<deny send_interface="org.gnome.Shell.PortalHelper"/>
+<deny send_interface="org.gnome.Shell.PerfHelper"/>
+<deny send_interface="org.gnome.Mutter.RemoteDesktop"/>
+<deny send_interface="org.gnome.Mutter.RemoteDesktop.Session"/>
+<deny send_interface="org.gnome.Mutter.ScreenCast"/>
+<deny send_interface="org.gnome.Mutter.ScreenCast.Session"/>
+<deny send_interface="org.gnome.Mutter.ScreenCast.Stream"/>
+<deny send_interface="org.gnome.Mutter.InputCapture"/>
+<deny send_interface="org.gnome.Mutter.InputCapture.Session"/>
+<deny send_interface="org.gnome.Mutter.ServiceChannel"/>
+<deny send_interface="org.gnome.Mutter.InputMapping"/>
+<deny send_interface="org.gnome.Mutter.DebugControl"/>
+<deny send_interface="org.gnome.Mutter.Devkit"/>
+<deny send_interface="org.gnome.Mutter.X11"/>
+<deny send_interface="org.gnome.Mutter.IdleMonitor"/>
+<deny send_interface="org.gnome.Mutter.ColorManager"/>
+<deny send_interface="org.gnome.Mutter.ColorManager.Calibration"/>
+<deny send_interface="org.freedesktop.Application"/>
+<deny send_interface="org.gtk.Application"/>"#;
+
 pub(crate) fn blockers() -> Vec<String> {
     let mut blockers: Vec<String> = [
         "gnome-shell",
         "Xwayland",
-        "xdotool",
         "bwrap",
         "dbus-daemon",
         "gsettings",
@@ -125,6 +153,7 @@ impl GnomeSession {
             "session-cache",
             "session-data",
             "session-home",
+            "session-xdg",
             "at-spi",
         ] {
             fs::create_dir_all(runtime.join(directory))?;
@@ -152,11 +181,7 @@ impl GnomeSession {
                 |command| {
                     configure_process_environment(command, runtime, "", &options.xauthority_path)
                 },
-                r#"<deny send_interface="org.gnome.Shell"/>
-<deny send_interface="org.gnome.Shell.Extensions"/>
-<deny send_interface="org.gnome.Shell.Screenshot"/>
-<deny send_interface="org.freedesktop.Application"/>
-<deny send_interface="org.gtk.Application"/>"#,
+                CONTROL_BUS_POLICY,
             )?,
         };
         session.private.start_system_bus(runtime, |command| {
@@ -210,6 +235,9 @@ impl GnomeSession {
                 "AGENT_WORKSPACE_CONTROLLER_PID",
                 std::process::id().to_string(),
             )
+            // No system autostart or Xwayland-session.d hooks: those run
+            // helpers such as ibus-x11 by absolute path outside launch policy.
+            .env("XDG_CONFIG_DIRS", runtime.join("session-xdg"))
             .env("LIBGL_ALWAYS_SOFTWARE", "1")
             .env_remove("WAYLAND_DISPLAY")
             .args([
@@ -233,6 +261,7 @@ impl GnomeSession {
                 .spawn()
                 .context("start private GNOME headless compositor")?,
         );
+        let compositor = session.pid().context("GNOME compositor PID missing")?;
         let mut last_error = String::new();
         wait_for(
             Duration::from_secs(20),
@@ -243,7 +272,11 @@ impl GnomeSession {
                         runtime.join("gnome.log").display()
                     );
                 }
-                match crate::desktop::gnome::call(runtime, serde_json::json!({"op":"probe"})) {
+                match crate::desktop::gnome::call(
+                    runtime,
+                    compositor,
+                    serde_json::json!({"op":"probe"}),
+                ) {
                     Ok(probe) => Ok(probe["ready"] == true),
                     Err(error) => {
                         last_error = error.to_string();
@@ -254,8 +287,9 @@ impl GnomeSession {
             "GNOME native control extension",
         )
         .with_context(|| last_error)?;
-        crate::desktop::gnome::apply_scale(runtime, options.session.scale)?;
-        let probe = crate::desktop::gnome::call(runtime, serde_json::json!({"op":"probe"}))?;
+        crate::desktop::gnome::apply_scale(runtime, compositor, options.session.scale)?;
+        let probe =
+            crate::desktop::gnome::call(runtime, compositor, serde_json::json!({"op":"probe"}))?;
         fs::write(
             runtime.join("output-config.json"),
             serde_json::to_vec_pretty(&probe)?,
@@ -282,7 +316,7 @@ impl GnomeSession {
         let mut capture_error = String::new();
         wait_for(
             Duration::from_secs(5),
-            || match crate::desktop::gnome::probe_capture(runtime) {
+            || match crate::desktop::gnome::probe_capture(runtime, compositor) {
                 Ok(size) => {
                     dimensions = Some(size);
                     Ok(true)
@@ -350,12 +384,14 @@ impl GnomeSession {
             }
             // GNOME treats loss of mandatory XWayland as fatal. Give Shell
             // SIGTERM first so it can stop its child and unlink sockets itself.
+            // Do not reap it here: the unreaped leader keeps its process group
+            // ID reserved until PrivateSession signals and reaps the group.
             unsafe {
                 libc::kill(child.id() as i32, libc::SIGTERM);
             }
             let deadline = std::time::Instant::now() + Duration::from_secs(5);
             while std::time::Instant::now() < deadline {
-                if child.try_wait().ok().flatten().is_some() {
+                if exited_unreaped(child.id()) {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(20));
@@ -378,14 +414,266 @@ impl Drop for GnomeSession {
     }
 }
 
+/// True once `pid` (a child of this process) has exited, without reaping it.
+fn exited_unreaped(pid: u32) -> bool {
+    let mut info = unsafe { std::mem::zeroed::<libc::siginfo_t>() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    // ECHILD means it was already reaped elsewhere.
+    result != 0 || unsafe { info.si_pid() } != 0
+}
+
+fn split_nul(bytes: &[u8]) -> Vec<&[u8]> {
+    bytes
+        .split(|byte| *byte == 0)
+        .filter(|part| !part.is_empty())
+        .collect()
+}
+
+fn single_env<'a>(environ: &'a [u8], key: &str) -> Result<&'a [u8], String> {
+    let prefix = format!("{key}=");
+    let mut values = split_nul(environ)
+        .into_iter()
+        .filter_map(|entry| entry.strip_prefix(prefix.as_bytes()));
+    match (values.next(), values.next()) {
+        (Some(value), None) => Ok(value),
+        (None, _) => Err(format!("{key} is not set")),
+        _ => Err(format!("{key} is set more than once")),
+    }
+}
+
+fn has_args(args: &[&[u8]], expected: &[&[u8]]) -> bool {
+    args.windows(expected.len())
+        .any(|window| window == expected)
+}
+
+/// Exact markers of a compositor started by GnomeSession::start: the
+/// private session mode, the private Wayland socket, the runtime it was
+/// given and the PID of the daemon that started it.
+fn compositor_markers(cmdline: &[u8], environ: &[u8]) -> Result<(PathBuf, u32), String> {
+    use std::os::unix::ffi::OsStrExt;
+    let args = split_nul(cmdline);
+    let program = args.first().ok_or("empty command line")?;
+    if Path::new(std::ffi::OsStr::from_bytes(program)).file_name()
+        != Some(std::ffi::OsStr::new("gnome-shell"))
+    {
+        return Err("not gnome-shell".into());
+    }
+    if !has_args(&args, &[b"--mode", b"agent-workspace"])
+        || !has_args(&args, &[b"--wayland-display", WAYLAND_SOCKET.as_bytes()])
+        || !args.contains(&b"--headless".as_slice())
+    {
+        return Err("not the private workspace session mode".into());
+    }
+    let runtime = PathBuf::from(std::ffi::OsStr::from_bytes(single_env(
+        environ,
+        "XDG_RUNTIME_DIR",
+    )?));
+    let controller = std::str::from_utf8(single_env(environ, "AGENT_WORKSPACE_CONTROLLER_PID")?)
+        .ok()
+        .and_then(|pid| pid.parse::<u32>().ok())
+        .filter(|pid| *pid > 0)
+        .ok_or("invalid AGENT_WORKSPACE_CONTROLLER_PID")?;
+    if !runtime.is_absolute() {
+        return Err("XDG_RUNTIME_DIR is not absolute".into());
+    }
+    Ok((runtime, controller))
+}
+
+/// The runtime's own manifest must name this compositor and its daemon.
+fn manifest_records(manifest: &serde_json::Value, pid: u32, controller: u32) -> bool {
+    manifest["session"]["backend"] == "gnome"
+        && manifest["window_manager_pid"].as_u64() == Some(u64::from(pid))
+        && manifest["daemon_pid"].as_u64() == Some(u64::from(controller))
+}
+
+/// Whether a process command line is the workspace daemon for `runtime`.
+fn is_daemon_for(cmdline: &[u8], runtime: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let args = split_nul(cmdline);
+    args.get(1) == Some(&b"daemon".as_slice())
+        && has_args(&args, &[b"--runtime-dir", runtime.as_os_str().as_bytes()])
+}
+
+fn live_process(pid: u32) -> bool {
+    fs::read_to_string(format!("/proc/{pid}/stat"))
+        .ok()
+        .and_then(|stat| {
+            stat.rsplit_once(") ")
+                .and_then(|(_, rest)| rest.chars().next())
+        })
+        .is_some_and(|state| state != 'Z' && state != 'X')
+}
+
+/// A stale compositor is one this backend started for a runtime whose
+/// manifest records it and whose daemon is gone. A host gnome-shell, another
+/// GNOME helper or a live workspace's compositor never matches.
+fn stale_compositor(pid: u32) -> Result<(), String> {
+    let read = |name: &str| {
+        fs::read(format!("/proc/{pid}/{name}")).map_err(|error| format!("read {name}: {error}"))
+    };
+    let (runtime, controller) = compositor_markers(&read("cmdline")?, &read("environ")?)?;
+    let manifest = fs::read(runtime.join("workspace.json"))
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .ok_or_else(|| format!("no workspace manifest in {}", runtime.display()))?;
+    if !manifest_records(&manifest, pid, controller) {
+        return Err(format!(
+            "manifest in {} does not record this compositor",
+            runtime.display()
+        ));
+    }
+    if live_process(controller)
+        && fs::read(format!("/proc/{controller}/cmdline"))
+            .is_ok_and(|cmdline| is_daemon_for(&cmdline, &runtime))
+    {
+        return Err(format!("its workspace daemon pid {controller} is running"));
+    }
+    Ok(())
+}
+
+fn pidfd_signal(fd: &std::os::fd::OwnedFd, signal: i32) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_pidfd_send_signal,
+            fd.as_raw_fd(),
+            signal,
+            std::ptr::null::<libc::siginfo_t>(),
+            0,
+        )
+    };
+    let error = std::io::Error::last_os_error();
+    if result == 0 || error.raw_os_error() == Some(libc::ESRCH) {
+        Ok(())
+    } else {
+        Err(error)
+    }
+}
+
+fn pidfd_exited(fd: &std::os::fd::OwnedFd, timeout: Duration) -> bool {
+    use std::os::fd::AsRawFd;
+    let mut poll = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let millis = timeout.as_millis().min(i32::MAX as u128) as i32;
+    unsafe { libc::poll(&mut poll, 1, millis) > 0 && poll.revents & libc::POLLIN != 0 }
+}
+
 pub(crate) fn cleanup_stale_processes(pid: Option<u32>, dry_run: bool, actions: &mut Vec<String>) {
-    if let Some(pid) = pid {
-        crate::workspace::cleanup_stale_process_pid(
-            pid,
-            "GNOME compositor",
-            &["gnome-shell"],
-            dry_run,
-            actions,
+    use std::os::fd::{FromRawFd, OwnedFd};
+    let Some(pid) = pid.filter(|pid| *pid > 0 && *pid <= i32::MAX as u32) else {
+        return;
+    };
+    // Hold a pidfd across the identity check so the signal cannot reach a
+    // process that reused the PID after the check.
+    let raw = unsafe { libc::syscall(libc::SYS_pidfd_open, pid as libc::pid_t, 0) };
+    if raw < 0 {
+        return;
+    }
+    let fd = unsafe { OwnedFd::from_raw_fd(raw as i32) };
+    if !live_process(pid) {
+        actions.push(format!(
+            "skipped GNOME compositor pid {pid}: process is already defunct"
+        ));
+        return;
+    }
+    if let Err(reason) = stale_compositor(pid) {
+        actions.push(format!("skipped GNOME compositor pid {pid}: {reason}"));
+        return;
+    }
+    if dry_run {
+        actions.push(format!("would terminate GNOME compositor pid {pid}"));
+        return;
+    }
+    let result = pidfd_signal(&fd, libc::SIGTERM).and_then(|()| {
+        if pidfd_exited(&fd, Duration::from_secs(5)) {
+            return Ok(());
+        }
+        pidfd_signal(&fd, libc::SIGKILL)?;
+        pidfd_exited(&fd, Duration::from_secs(5));
+        Ok(())
+    });
+    actions.push(match result {
+        Ok(()) => format!("terminated GNOME compositor pid {pid}"),
+        Err(error) => format!("failed to terminate GNOME compositor pid {pid}: {error}"),
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OURS: &[u8] = b"/usr/bin/gnome-shell\0--headless\0--wayland-display\0workspace-wayland\0--mode\0agent-workspace\0--virtual-monitor\x001200x900\0";
+
+    #[test]
+    fn compositor_markers_accept_the_private_workspace_compositor() {
+        let environ = b"PATH=/x\0XDG_RUNTIME_DIR=/run/w/agent-workspace-linux/a\0AGENT_WORKSPACE_CONTROLLER_PID=42\0";
+        assert_eq!(
+            compositor_markers(OURS, environ),
+            Ok((PathBuf::from("/run/w/agent-workspace-linux/a"), 42))
         );
+    }
+
+    #[test]
+    fn compositor_markers_reject_host_gnome_processes() {
+        let host_env = b"XDG_RUNTIME_DIR=/run/user/1000\0DISPLAY=:0\0";
+        for cmdline in [
+            b"/usr/bin/gnome-shell\0--mode=ubuntu\0".as_slice(),
+            b"/usr/bin/gnome-shell\0".as_slice(),
+            b"/usr/libexec/gnome-shell-calendar-server\0".as_slice(),
+            b"/usr/bin/gjs\0-m\0/usr/share/gnome-shell/org.gnome.Shell.Notifications\0".as_slice(),
+        ] {
+            assert!(
+                compositor_markers(cmdline, host_env).is_err(),
+                "{cmdline:?}"
+            );
+        }
+        // Our argv with the host environment still lacks the workspace markers.
+        assert!(compositor_markers(OURS, host_env).is_err());
+        // A duplicated marker is ambiguous and rejected.
+        assert!(compositor_markers(
+            OURS,
+            b"XDG_RUNTIME_DIR=/a\0XDG_RUNTIME_DIR=/b\0AGENT_WORKSPACE_CONTROLLER_PID=1\0"
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn manifest_must_record_this_compositor_and_daemon() {
+        let manifest = serde_json::json!({
+            "session": {"backend": "gnome"},
+            "window_manager_pid": 7,
+            "daemon_pid": 42,
+        });
+        assert!(manifest_records(&manifest, 7, 42));
+        assert!(!manifest_records(&manifest, 8, 42));
+        assert!(!manifest_records(&manifest, 7, 43));
+        let kwin = serde_json::json!({
+            "session": {"backend": "kwin"},
+            "window_manager_pid": 7,
+            "daemon_pid": 42,
+        });
+        assert!(!manifest_records(&kwin, 7, 42));
+    }
+
+    #[test]
+    fn daemon_detection_requires_the_same_runtime() {
+        let runtime = Path::new("/run/w/agent-workspace-linux/a");
+        let daemon = b"/bin/agent-workspace-linux\0daemon\0--id\0a\0--runtime-dir\0/run/w/agent-workspace-linux/a\0";
+        assert!(is_daemon_for(daemon, runtime));
+        assert!(!is_daemon_for(
+            daemon,
+            Path::new("/run/w/agent-workspace-linux/b")
+        ));
+        assert!(!is_daemon_for(b"/usr/bin/sleep\x00100\0", runtime));
     }
 }

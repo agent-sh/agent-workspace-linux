@@ -67,6 +67,7 @@ const SIGKILL: i32 = 9;
 const ESRCH: i32 = 3;
 const PRIVATE_RUNTIME_DIR_MODE: u32 = 0o700;
 const PRIVATE_SOCKET_MODE: u32 = 0o600;
+const DAEMON_PID_FILE: &str = "daemon.pid";
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 pub(crate) const MAX_CLIPBOARD_TEXT_BYTES: usize = 64 * 1024;
 const APPLIED_POLICY_FILE: &str = "applied_policy.json";
@@ -363,6 +364,21 @@ pub struct WorkspaceManifest {
     pub last_event_sequence: u64,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub apps: Vec<WorkspaceApp>,
+    /// Kernel start times of the recorded pids. Stale cleanup signals a pid
+    /// only while its start time still matches, so a recycled pid (a host
+    /// compositor, another workspace's daemon) is never terminated.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub process_start_ticks: Option<ProcessStartTicks>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
+pub struct ProcessStartTicks {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub x_server: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_manager: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1234,14 +1250,7 @@ pub fn start_workspace(options: WorkspaceStartOptions) -> Result<IpcResponse> {
         }),
         WorkspaceStartPlan::Start(daemon_options) => {
             spawn_detached_daemon(&daemon_options)?;
-            wait_for_socket(
-                &daemon_options.socket_path,
-                if daemon_options.session.backend != crate::session::SessionBackend::X11 {
-                    Duration::from_secs(30)
-                } else {
-                    Duration::from_secs(5)
-                },
-            )?;
+            wait_for_daemon_startup(&daemon_options)?;
             request(&daemon_options.socket_path, IpcRequest::Status)
         }
     }
@@ -1664,13 +1673,35 @@ fn cleanup_stale_workspace_processes(
             false,
         )?
     });
-    manifest.session.cleanup_stale_processes(
+    let recorded = manifest.process_start_ticks.as_ref();
+    let window_manager_pid = recorded_process(
         manifest.window_manager_pid,
+        recorded,
+        |ticks| ticks.window_manager,
+        "window manager or compositor",
+        &mut actions,
+    );
+    let x_server_pid = recorded_process(
         manifest.x_server_pid,
+        recorded,
+        |ticks| ticks.x_server,
+        "X server",
+        &mut actions,
+    );
+    manifest.session.cleanup_stale_processes(
+        window_manager_pid,
+        x_server_pid,
         dry_run,
         &mut actions,
     );
-    if let Some(pid) = manifest.daemon_pid {
+    let daemon_pid = recorded_process(
+        manifest.daemon_pid,
+        recorded,
+        |ticks| ticks.daemon,
+        "workspace daemon",
+        &mut actions,
+    );
+    if let Some(pid) = daemon_pid {
         cleanup_stale_process_pid(
             pid,
             "workspace daemon",
@@ -1957,6 +1988,7 @@ pub fn preview_launch_app(
             &running_status,
             applied_policy.as_ref(),
             spec.cwd.as_deref(),
+            None,
         ) {
             Ok(sandbox) => {
                 (mount_isolation, network_isolation) =
@@ -3324,6 +3356,11 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
     validate_unix_socket_path(&options.socket_path)?;
     create_private_runtime_dir(&options.runtime_dir)?;
     remove_stale_socket(&options.socket_path)?;
+    fs::write(
+        options.runtime_dir.join(DAEMON_PID_FILE),
+        format!("{}\n", std::process::id()),
+    )
+    .context("record workspace daemon pid")?;
 
     // Load the spawn-time MCP permission ceiling (if any) before serving any
     // IPC. Fail closed: if a ceiling path was provided but cannot be read or
@@ -3606,9 +3643,15 @@ fn prepare_workspace_start(mut options: WorkspaceStartOptions) -> Result<Workspa
     let runtime_dir = workspace_dir(&id);
     let socket_path = runtime_dir.join("control.sock");
     validate_unix_socket_path(&socket_path)?;
+    // Native compositors bind the Wayland display socket, the longest fixed
+    // socket name in the runtime; reject paths they cannot bind up front.
+    if options.session.backend.requires_client_application_bus() {
+        validate_unix_socket_path(&runtime_dir.join(crate::session::kwin::WAYLAND_SOCKET))?;
+    }
     create_private_runtime_dir(&runtime_dir)?;
     create_client_runtime(&runtime_dir)?;
     remove_stale_socket(&socket_path)?;
+    remove_stale_socket(&runtime_dir.join(DAEMON_PID_FILE))?;
     let xauthority_path = runtime_dir.join("Xauthority");
     let display = if matches!(
         options.session.backend,
@@ -3748,21 +3791,20 @@ fn write_applied_policy_file(
 }
 
 fn create_client_runtime(runtime: &Path) -> Result<()> {
+    create_owned_private_dir(&runtime.join("client"), "workspace client runtime")
+}
+
+fn create_owned_private_dir(path: &Path, what: &str) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
-    let path = runtime.join("client");
     match fs::DirBuilder::new()
         .mode(PRIVATE_RUNTIME_DIR_MODE)
-        .create(&path)
+        .create(path)
     {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(&path)?;
-            if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-                bail!("workspace client runtime is not an owned directory");
-            }
-            Ok(())
+            verify_owned_dir(path, what).map(drop)
         }
-        Err(error) => Err(error).context("create workspace client runtime"),
+        Err(error) => Err(error).with_context(|| format!("create {what}")),
     }
 }
 
@@ -3775,17 +3817,64 @@ fn terminal_socket_path(runtime: &Path, id: &str) -> PathBuf {
     if UnixStream::connect(&legacy).is_ok() {
         legacy
     } else {
-        runtime
-            .join("client")
-            .join(format!("terminal-{id}.tmux.sock"))
+        client_terminal_socket_path(runtime, id)
     }
 }
 
+fn client_terminal_socket_path(runtime: &Path, id: &str) -> PathBuf {
+    runtime
+        .join("client")
+        .join(format!("terminal-{id}"))
+        .join("tmux.sock")
+}
+
+/// `path` is `ROOT/agent-workspace-linux/ID`. ROOT may be the predictable
+/// `/tmp` fallback, so never follow a symlink or reuse a directory another user
+/// created or can write: either would let them swap sockets and auth files.
 fn create_private_runtime_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_RUNTIME_DIR_MODE))
-        .with_context(|| format!("failed to set private permissions on {}", path.display()))?;
+    let base = path
+        .parent()
+        .context("workspace runtime directory has no parent")?;
+    let root = base
+        .parent()
+        .context("workspace runtime base has no parent")?;
+    if !root.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(PRIVATE_RUNTIME_DIR_MODE)
+            .create(root)
+            .with_context(|| format!("failed to create {}", root.display()))?;
+    }
+    let metadata = verify_owned_dir(root, "workspace runtime root")?;
+    if metadata.mode() & 0o002 != 0 {
+        bail!(
+            "workspace runtime root {} is world-writable; use a private XDG_RUNTIME_DIR",
+            root.display()
+        );
+    }
+    for (dir, what) in [
+        (base, "workspace runtime base"),
+        (path, "workspace runtime directory"),
+    ] {
+        create_owned_private_dir(dir, what)?;
+        // Older releases created these with the process umask (often 0775).
+        fs::set_permissions(dir, fs::Permissions::from_mode(PRIVATE_RUNTIME_DIR_MODE))
+            .with_context(|| format!("failed to set private permissions on {}", dir.display()))?;
+    }
     Ok(())
+}
+
+fn verify_owned_dir(path: &Path, what: &str) -> Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {what} {}", path.display()))?;
+    if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "{what} {} must be a real directory owned by this user",
+            path.display()
+        );
+    }
+    Ok(metadata)
 }
 
 fn workspace_manifest(status: &WorkspaceStatus, stopped_at_unix: Option<u64>) -> WorkspaceManifest {
@@ -3819,7 +3908,54 @@ fn workspace_manifest(status: &WorkspaceStatus, stopped_at_unix: Option<u64>) ->
         daemon_stderr_path: status.runtime_dir.join("daemon.err.log"),
         last_event_sequence: status.last_event_sequence,
         apps: status.apps.clone(),
+        process_start_ticks: Some(ProcessStartTicks {
+            daemon: status.daemon_pid.and_then(process_start_ticks),
+            x_server: Some(status.x_server_pid)
+                .filter(|pid| *pid != 0)
+                .and_then(process_start_ticks),
+            window_manager: status.window_manager_pid.and_then(process_start_ticks),
+        }),
     }
+}
+
+fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    process_start_ticks_from_proc_stat(&stat)
+}
+
+/// Field 22 of /proc/PID/stat; fields after the parenthesised comm start at 3.
+fn process_start_ticks_from_proc_stat(stat: &str) -> Option<u64> {
+    stat.rsplit_once(") ")?
+        .1
+        .split_whitespace()
+        .nth(19)?
+        .parse()
+        .ok()
+}
+
+/// Pass a recorded pid on to stale cleanup only while it is still the process
+/// the manifest recorded. Manifests from older releases carry no start times
+/// and keep the name-based identity check alone.
+fn recorded_process(
+    pid: Option<u32>,
+    recorded: Option<&ProcessStartTicks>,
+    ticks: impl Fn(&ProcessStartTicks) -> Option<u64>,
+    label: &str,
+    actions: &mut Vec<String>,
+) -> Option<u32> {
+    let pid = pid.filter(|pid| *pid != 0)?;
+    let Some(recorded) = recorded else {
+        return Some(pid);
+    };
+    if ticks(recorded).is_some_and(|expected| process_start_ticks(pid) == Some(expected)) {
+        return Some(pid);
+    }
+    if process_is_alive(pid) {
+        actions.push(format!(
+            "skipped {label} pid {pid}: it is no longer the process this workspace started"
+        ));
+    }
+    None
 }
 
 fn write_workspace_manifest(
@@ -4561,8 +4697,11 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                                 }
                             }
                             Err(error) => {
-                                let mut response =
-                                    response_with_status(false, error.to_string(), &state.status);
+                                let mut response = response_with_status(
+                                    false,
+                                    format!("{error:#}"),
+                                    &state.status,
+                                );
                                 response.apps = Some(vec![app]);
                                 (response, false)
                             }
@@ -4583,7 +4722,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     }
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -4626,7 +4765,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -4672,7 +4811,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -4702,7 +4841,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -4724,7 +4863,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -4769,7 +4908,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -4815,7 +4954,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -4832,7 +4971,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -4860,7 +4999,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 &criteria.app_id,
             ) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match screenshot_workspace_window(
@@ -4902,7 +5041,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -4928,13 +5067,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -4961,7 +5100,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 true,
             ) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match focus_matching_workspace_window(state, &criteria) {
@@ -4997,7 +5136,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -5022,7 +5161,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -5046,7 +5185,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -5074,7 +5213,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 true,
             ) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) if dry_run => match wait_workspace_window(state, &criteria)
@@ -5114,7 +5253,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -5150,7 +5289,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -5183,7 +5322,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_workspace_coordinates(&state.status, x, y, "window move"))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => {
@@ -5219,7 +5358,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
@@ -5254,7 +5393,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_window_size_for_workspace(&state.status, width, height))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match resize_workspace_window_target(
@@ -5294,7 +5433,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -5323,7 +5462,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 &criteria.app_id,
             ) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => {
@@ -5359,7 +5498,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
@@ -5389,7 +5528,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 &criteria.app_id,
             ) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => {
@@ -5425,7 +5564,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
@@ -5455,7 +5594,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 &criteria.app_id,
             ) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => {
@@ -5488,7 +5627,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
@@ -5516,13 +5655,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -5556,7 +5695,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_click_options(button, count))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => {
@@ -5601,7 +5740,11 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                                     (response, false)
                                 }
                                 Err(error) => (
-                                    response_with_status(false, error.to_string(), &state.status),
+                                    response_with_status(
+                                        false,
+                                        format!("{error:#}"),
+                                        &state.status,
+                                    ),
                                     false,
                                 ),
                             }
@@ -5616,7 +5759,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
@@ -5635,13 +5778,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -5672,7 +5815,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_relative_click_coordinates(x, y))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match move_workspace_pointer_window(
@@ -5712,7 +5855,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                                 (response, false)
                             }
                             Err(error) => (
-                                response_with_status(false, error.to_string(), &state.status),
+                                response_with_status(false, format!("{error:#}"), &state.status),
                                 false,
                             ),
                         }
@@ -5727,7 +5870,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -5761,13 +5904,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -5803,7 +5946,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_click_options(button, DEFAULT_CLICK_COUNT))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match drag_workspace_window(
@@ -5848,7 +5991,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                                 (response, false)
                             }
                             Err(error) => (
-                                response_with_status(false, error.to_string(), &state.status),
+                                response_with_status(false, format!("{error:#}"), &state.status),
                                 false,
                             ),
                         }
@@ -5863,7 +6006,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -5895,13 +6038,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -5935,7 +6078,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_scroll_options(direction, amount))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match scroll_workspace_window(
@@ -5979,7 +6122,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                                 (response, false)
                             }
                             Err(error) => (
-                                response_with_status(false, error.to_string(), &state.status),
+                                response_with_status(false, format!("{error:#}"), &state.status),
                                 false,
                             ),
                         }
@@ -5994,7 +6137,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -6011,7 +6154,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -6047,7 +6190,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 Ok(())
             }) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match key_workspace_window(state, window_id.as_deref(), &criteria, key) {
@@ -6081,7 +6224,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -6102,7 +6245,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -6138,7 +6281,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 Ok(())
             }) {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => {
@@ -6176,7 +6319,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             (response, false)
                         }
                         Err(error) => (
-                            response_with_status(false, error.to_string(), &state.status),
+                            response_with_status(false, format!("{error:#}"), &state.status),
                             false,
                         ),
                     }
@@ -6204,7 +6347,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -6225,7 +6368,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6253,7 +6396,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -6287,7 +6430,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             .and_then(|()| validate_key_text(&key))
             {
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
                 Ok(()) => match paste_workspace_window(
@@ -6334,7 +6477,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 },
@@ -6364,7 +6507,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6404,7 +6547,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6425,7 +6568,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6461,13 +6604,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6506,13 +6649,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6554,13 +6697,13 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                         (response, false)
                     }
                     Err(error) => (
-                        response_with_status(false, error.to_string(), &state.status),
+                        response_with_status(false, format!("{error:#}"), &state.status),
                         false,
                     ),
                 }
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6575,7 +6718,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6590,7 +6733,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -6621,7 +6764,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     (response, false)
                 }
                 Err(error) => (
-                    response_with_status(false, error.to_string(), &state.status),
+                    response_with_status(false, format!("{error:#}"), &state.status),
                     false,
                 ),
             }
@@ -6649,7 +6792,7 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                 (response, false)
             }
             Err(error) => (
-                response_with_status(false, error.to_string(), &state.status),
+                response_with_status(false, format!("{error:#}"), &state.status),
                 false,
             ),
         },
@@ -6873,13 +7016,22 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
         .context("workspace launch exceeds the MCP permission ceiling")?;
     validate_launch_policy_ack(&spec)?;
     create_client_runtime(&state.status.runtime_dir)?;
+    let terminal_dir =
+        terminal_cleanup::managed_terminal_client_dir(&state.status.runtime_dir, &spec.command);
+    if let Some(dir) = &terminal_dir {
+        create_owned_private_dir(dir, "managed terminal client directory")?;
+    }
     let log_paths = prepare_app_log_paths(&state.status.runtime_dir)?;
     let effective_policy = spec
         .applied_policy
         .as_ref()
         .or(state.status.applied_policy.as_ref());
-    let sandbox =
-        bubblewrap_sandbox_for_launch(&state.status, effective_policy, spec.cwd.as_deref())?;
+    let sandbox = bubblewrap_sandbox_for_launch(
+        &state.status,
+        effective_policy,
+        spec.cwd.as_deref(),
+        terminal_dir.as_deref(),
+    )?;
     let (mount_isolation, network_isolation) =
         launch_isolation_labels_from_sandbox(sandbox.as_ref());
     let mut child_command = if let Some(sandbox) = &sandbox {
@@ -8547,22 +8699,95 @@ fn request(socket_path: &Path, request: IpcRequest) -> Result<IpcResponse> {
     Ok(response)
 }
 
-fn wait_for_socket(socket_path: &Path, timeout: Duration) -> Result<()> {
-    let deadline = std::time::Instant::now() + timeout;
-    while std::time::Instant::now() < deadline {
-        if socket_path.exists() {
+/// Every startup step in the daemon is bounded and reports failure through
+/// `daemon.err.log` or by exiting, so wait for one of those rather than a fixed
+/// budget that slow native compositors can outlast. The cap only guards a hung
+/// daemon (summed worst-case native startup is about 70 s), and a daemon that
+/// hits it is stopped instead of left running behind a failed start.
+const DAEMON_STARTUP_HANG_GUARD: Duration = Duration::from_secs(120);
+
+fn wait_for_daemon_startup(options: &DaemonOptions) -> Result<()> {
+    let pid_path = options.runtime_dir.join(DAEMON_PID_FILE);
+    let deadline = Instant::now() + DAEMON_STARTUP_HANG_GUARD;
+    let mut pid = None;
+    while Instant::now() < deadline {
+        if daemon_socket_ready(&options.socket_path)? {
             return Ok(());
         }
-        if let Some(parent) = socket_path.parent() {
-            if let Ok(error) = fs::read_to_string(parent.join("daemon.err.log")) {
-                if error.starts_with("Error:") {
-                    bail!("workspace startup failed: {}", error.trim());
+        if pid.is_none() {
+            pid = fs::read_to_string(&pid_path)
+                .ok()
+                .and_then(|text| text.trim().parse::<i32>().ok());
+        }
+        if let Some(pid) = pid {
+            if !owned_daemon_running(pid, &options.session_id) {
+                // The daemon may have written its error just before exiting.
+                if daemon_socket_ready(&options.socket_path)? {
+                    return Ok(());
                 }
+                bail!(
+                    "workspace daemon exited before it was ready; see {}",
+                    options.runtime_dir.join("daemon.err.log").display()
+                );
             }
         }
         thread::sleep(Duration::from_millis(100));
     }
-    bail!("timed out waiting for workspace IPC socket");
+    if let Some(pid) = pid.filter(|pid| owned_daemon_running(*pid, &options.session_id)) {
+        unsafe {
+            libc::kill(pid, libc::SIGTERM);
+        }
+        let grace = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < grace && owned_daemon_running(pid, &options.session_id) {
+            thread::sleep(Duration::from_millis(100));
+        }
+        if owned_daemon_running(pid, &options.session_id) {
+            unsafe {
+                libc::kill(pid, libc::SIGKILL);
+            }
+        }
+    }
+    bail!(
+        "workspace daemon did not become ready within {} s and was stopped",
+        DAEMON_STARTUP_HANG_GUARD.as_secs()
+    )
+}
+
+/// True while `pid` is a live daemon for exactly this start, matched by its
+/// unique session id so a recycled PID is never signalled.
+fn owned_daemon_running(pid: i32, session_id: &str) -> bool {
+    let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) else {
+        return false;
+    };
+    if stat
+        .rsplit_once(") ")
+        .and_then(|(_, rest)| rest.split_whitespace().next())
+        .is_some_and(|state| matches!(state, "Z" | "X"))
+    {
+        return false;
+    }
+    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let args = cmdline.split(|byte| *byte == 0).collect::<Vec<_>>();
+    args.windows(2)
+        .any(|pair| pair[0] == b"--session-id" && pair[1] == session_id.as_bytes())
+}
+
+/// Ok(true) once the daemon serves IPC, an error once it reported a startup
+/// failure, Ok(false) while it is still starting.
+fn daemon_socket_ready(socket_path: &Path) -> Result<bool> {
+    if socket_path.exists() {
+        return Ok(true);
+    }
+    if let Some(parent) = socket_path.parent() {
+        if let Ok(error) = fs::read_to_string(parent.join("daemon.err.log")) {
+            if error.starts_with("Error:") {
+                bail!("workspace startup failed: {}", error.trim());
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn wait_for_socket_removed(socket_path: &Path, timeout: Duration) -> Result<()> {
@@ -8579,7 +8804,7 @@ fn wait_for_socket_removed(socket_path: &Path, timeout: Duration) -> Result<()> 
     );
 }
 
-fn pick_display() -> Result<String> {
+pub(crate) fn pick_display() -> Result<String> {
     for number in DISPLAY_RANGE {
         let display = format!(":{number}");
         let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
@@ -8698,7 +8923,7 @@ fn validate_unix_socket_path(socket_path: &Path) -> Result<()> {
     let byte_len = socket_path.as_os_str().as_bytes().len();
     if byte_len > MAX_UNIX_SOCKET_PATH_BYTES {
         bail!(
-            "workspace control socket path {} is {byte_len} bytes; Unix socket paths must be at most {MAX_UNIX_SOCKET_PATH_BYTES} bytes. Use a shorter workspace id or a shorter XDG_RUNTIME_DIR",
+            "workspace socket path {} is {byte_len} bytes; Unix socket paths must be at most {MAX_UNIX_SOCKET_PATH_BYTES} bytes. Use a shorter workspace id or a shorter XDG_RUNTIME_DIR",
             socket_path.display()
         );
     }
@@ -9453,6 +9678,125 @@ mod tests {
     }
 
     #[test]
+    fn stale_cleanup_skips_pids_whose_start_time_changed() {
+        let stat = "123 (a) b) S 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17 18 424242 20";
+        assert_eq!(process_start_ticks_from_proc_stat(stat), Some(424242));
+
+        let pid = std::process::id();
+        let ours = process_start_ticks(pid).expect("own start time");
+        let mut actions = Vec::new();
+        let recorded = |window_manager| ProcessStartTicks {
+            window_manager,
+            ..ProcessStartTicks::default()
+        };
+        let pick = |ticks: &ProcessStartTicks| ticks.window_manager;
+
+        assert_eq!(
+            recorded_process(
+                Some(pid),
+                Some(&recorded(Some(ours))),
+                pick,
+                "wm",
+                &mut actions
+            ),
+            Some(pid)
+        );
+        assert_eq!(
+            recorded_process(
+                Some(pid),
+                Some(&recorded(Some(ours + 1))),
+                pick,
+                "wm",
+                &mut actions
+            ),
+            None
+        );
+        assert_eq!(
+            recorded_process(Some(pid), Some(&recorded(None)), pick, "wm", &mut actions),
+            None
+        );
+        assert_eq!(actions.len(), 2);
+        assert_eq!(
+            recorded_process(Some(pid), None, pick, "wm", &mut actions),
+            Some(pid)
+        );
+        assert_eq!(
+            recorded_process(Some(0), None, pick, "wm", &mut actions),
+            None
+        );
+    }
+
+    #[test]
+    fn owned_daemon_matches_only_its_live_session() {
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30", "daemon", "--session-id", "session-test-1"])
+            .spawn()
+            .expect("spawn stand-in daemon");
+        let pid = child.id() as i32;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !owned_daemon_running(pid, "session-test-1") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(owned_daemon_running(pid, "session-test-1"));
+        assert!(!owned_daemon_running(pid, "session-test-2"));
+        assert!(!owned_daemon_running(pid, "session-test"));
+        child.kill().expect("kill stand-in");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while owned_daemon_running(pid, "session-test-1") && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !owned_daemon_running(pid, "session-test-1"),
+            "zombie counts as gone"
+        );
+        child.wait().expect("reap stand-in");
+    }
+
+    #[test]
+    fn private_runtime_dir_rejects_symlinked_or_shared_roots() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let scratch = std::env::temp_dir().join(format!("awl-rt-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&scratch).expect("scratch");
+        let runtime = |root: &Path| root.join("agent-workspace-linux").join("ws");
+
+        let owned = scratch.join("owned");
+        create_private_runtime_dir(&runtime(&owned)).expect("fresh root is created private");
+        create_private_runtime_dir(&runtime(&owned)).expect("existing private root is reused");
+        let base = owned.join("agent-workspace-linux");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o775)).expect("chmod base");
+        create_private_runtime_dir(&runtime(&owned)).expect("umask-created base is accepted");
+        assert_eq!(
+            fs::metadata(&base).expect("base").mode() & 0o777,
+            PRIVATE_RUNTIME_DIR_MODE
+        );
+
+        let shared = scratch.join("shared");
+        fs::create_dir(&shared).expect("shared root");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert!(create_private_runtime_dir(&runtime(&shared)).is_err());
+        assert!(!shared.join("agent-workspace-linux").exists());
+
+        let linked = scratch.join("linked");
+        std::os::unix::fs::symlink(&owned, &linked).expect("symlink root");
+        assert!(create_private_runtime_dir(&runtime(&linked)).is_err());
+
+        let base_link = scratch.join("base-link");
+        fs::create_dir(&base_link).expect("root");
+        fs::set_permissions(&base_link, fs::Permissions::from_mode(0o700)).expect("chmod");
+        std::os::unix::fs::symlink(
+            owned.join("agent-workspace-linux"),
+            base_link.join("agent-workspace-linux"),
+        )
+        .expect("symlink base");
+        assert!(create_private_runtime_dir(&runtime(&base_link)).is_err());
+
+        fs::remove_dir_all(scratch).expect("remove scratch");
+    }
+
+    #[test]
     fn terminal_socket_ignores_stale_legacy_socket_and_attaches_to_live_one() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -9462,12 +9806,17 @@ mod tests {
             std::env::temp_dir().join(format!("awl-term-{}-{unique}", std::process::id()));
         fs::create_dir_all(&runtime).expect("create test runtime");
         let legacy = runtime.join("terminal-t.tmux.sock");
-        let client = runtime.join("client").join("terminal-t.tmux.sock");
+        let client = client_terminal_socket_path(&runtime, "t");
 
         assert_eq!(terminal_socket_path(&runtime, "t"), client);
 
         let stale = UnixListener::bind(&legacy).expect("bind legacy socket");
         drop(stale);
+        // A parallel test that forks before exec briefly holds the listener.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while UnixStream::connect(&legacy).is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         assert!(legacy
             .symlink_metadata()
             .is_ok_and(|meta| meta.file_type().is_socket()));
@@ -10065,6 +10414,7 @@ mod tests {
             &status,
             Some(status.applied_policy.as_ref().expect("policy")),
             Some(Path::new("/workspace/project")),
+            None,
         )
         .expect("sandbox build")
         .expect("net-only sandbox should exist");
@@ -10120,6 +10470,7 @@ mod tests {
             Some(&policy),
             Some(Path::new("/workspace/project")),
             LaunchNetworkPlan::Host,
+            None,
         )
         .expect("mount namespace args");
 
@@ -10186,6 +10537,7 @@ mod tests {
             Some(&policy),
             Some(Path::new("/workspace/project")),
             LaunchNetworkPlan::Host,
+            None,
         )
         .expect("mount namespace args");
 
@@ -10223,9 +10575,10 @@ mod tests {
         )
         .expect("resolv symlink");
 
+        // The helper returns the canonical target; TMPDIR may be a symlink.
         assert_eq!(
             external_symlink_target_parent(&etc.join("resolv.conf"), &etc),
-            Some(resolver)
+            Some(fs::canonicalize(&resolver).expect("canonical resolver dir"))
         );
 
         fs::remove_dir_all(root).expect("cleanup");

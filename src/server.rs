@@ -10397,6 +10397,7 @@ mod tests {
             daemon_stderr_path: PathBuf::from("/tmp/agent-workspace-linux/stopped/daemon.err"),
             last_event_sequence: 7,
             apps,
+            process_start_ticks: None,
         }
     }
 

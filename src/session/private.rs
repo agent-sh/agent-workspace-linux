@@ -181,11 +181,11 @@ impl PrivateSession {
                 unsafe {
                     libc::kill(group, libc::SIGTERM);
                 }
+                // Observe the exit without reaping: the unreaped leader keeps
+                // its PID, so the group SIGKILL below cannot reach a recycled
+                // process group.
                 let deadline = Instant::now() + Duration::from_secs(5);
-                while Instant::now() < deadline {
-                    if child.try_wait().ok().flatten().is_some() {
-                        break;
-                    }
+                while Instant::now() < deadline && !exited_unreaped(child.id()) {
                     thread::sleep(Duration::from_millis(20));
                 }
                 unsafe {
@@ -196,6 +196,19 @@ impl PrivateSession {
             }
         }
     }
+}
+fn exited_unreaped(pid: u32) -> bool {
+    let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+    let result = unsafe {
+        libc::waitid(
+            libc::P_PID,
+            pid as libc::id_t,
+            &mut info,
+            libc::WEXITED | libc::WNOHANG | libc::WNOWAIT,
+        )
+    };
+    // An error means the child is gone or not ours; stop waiting either way.
+    result != 0 || unsafe { info.si_pid() } != 0
 }
 impl Drop for PrivateSession {
     fn drop(&mut self) {
