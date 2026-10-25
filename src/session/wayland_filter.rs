@@ -238,7 +238,8 @@ impl WaylandFilter {
             std::thread::Builder::new()
                 .name("sandbox-wayland".into())
                 .spawn(move || {
-                    accept_loop(&listener, &address, &stop, &links, Limits::from_rlimit())
+                    let budget = Arc::new(Budget::new(Limits::from_rlimit()));
+                    accept_loop(&listener, &address, &stop, &links, &budget)
                 })?
         };
         Ok(Self {
@@ -514,13 +515,8 @@ fn accept_loop(
     upstream: &SocketAddress,
     stop: &AtomicBool,
     links: &Arc<Mutex<HashMap<u64, Arc<Link>>>>,
-    limits: Limits,
+    budget: &Arc<Budget>,
 ) {
-    let budget = Arc::new(Budget {
-        queued: AtomicUsize::new(0),
-        limit: limits.queued_fds,
-        per_connection: limits.per_connection_fds,
-    });
     for (id, client) in (0u64..).zip(listener.incoming()) {
         if stop.load(Ordering::SeqCst) {
             return;
@@ -532,11 +528,11 @@ fn accept_loop(
         };
         if links
             .lock()
-            .map_or(true, |list| list.len() >= limits.connections)
+            .map_or(true, |list| list.len() >= budget.connections)
         {
             eprintln!(
                 "sandbox Wayland relay refused a client: {} connections already open",
-                limits.connections
+                budget.connections
             );
             continue;
         }
@@ -568,6 +564,18 @@ struct Budget {
     queued: AtomicUsize,
     limit: usize,
     per_connection: usize,
+    connections: usize,
+}
+
+impl Budget {
+    fn new(limits: Limits) -> Self {
+        Self {
+            queued: AtomicUsize::new(0),
+            limit: limits.queued_fds,
+            per_connection: limits.per_connection_fds,
+            connections: limits.connections,
+        }
+    }
 }
 
 struct Link {
@@ -971,6 +979,7 @@ mod tests {
         listener: Arc<UnixListener>,
         stop: Arc<AtomicBool>,
         thread: Option<JoinHandle<()>>,
+        budget: Arc<Budget>,
     }
 
     impl Harness {
@@ -982,10 +991,11 @@ mod tests {
             let listener = Arc::new(UnixListener::bind(dir.join("in")).unwrap());
             let address = SocketAddress::new(&dir.join("up")).unwrap();
             let stop = Arc::new(AtomicBool::new(false));
+            let budget = Arc::new(Budget::new(limits));
             let thread = {
-                let (listener, stop) = (listener.clone(), stop.clone());
+                let (listener, stop, budget) = (listener.clone(), stop.clone(), budget.clone());
                 let links = Arc::new(Mutex::new(HashMap::new()));
-                std::thread::spawn(move || accept_loop(&listener, &address, &stop, &links, limits))
+                std::thread::spawn(move || accept_loop(&listener, &address, &stop, &links, &budget))
             };
             Self {
                 dir,
@@ -993,6 +1003,7 @@ mod tests {
                 listener,
                 stop,
                 thread: Some(thread),
+                budget,
             }
         }
 
@@ -1025,21 +1036,15 @@ mod tests {
         per_connection_fds: MAX_QUEUED_FDS,
     };
 
-    /// Waits until the relay has read everything `stream` sent, so the
-    /// descriptors it carried are counted before the test goes on. The pump
-    /// counts them just after the read; the next step (a new connection
-    /// through a forked holder) is far slower than that gap.
-    fn drained(stream: &UnixStream) {
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            let mut queued: libc::c_int = 0;
-            let ok = unsafe { libc::ioctl(stream.as_raw_fd(), libc::TIOCOUTQ, &mut queued) };
-            assert_eq!(ok, 0, "SIOCOUTQ");
-            if queued == 0 {
-                return;
+    impl Harness {
+        /// Waits until the relay has counted `count` queued descriptors, so a
+        /// test can order connections by what the shared budget has seen.
+        fn wait_queued(&self, count: usize) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(5);
+            while self.budget.queued.load(Ordering::SeqCst) < count {
+                assert!(std::time::Instant::now() < deadline, "relay did not count");
+                std::thread::sleep(Duration::from_millis(5));
             }
-            assert!(std::time::Instant::now() < deadline, "relay did not read");
-            std::thread::sleep(Duration::from_millis(5));
         }
     }
 
@@ -1287,7 +1292,7 @@ mod tests {
         );
         let (first, first_server) = harness.connect();
         send_fds(&first, partial, 28).unwrap();
-        drained(&first);
+        harness.wait_queued(28);
         let (second, second_server) = harness.connect();
         send_fds(&second, partial, 28).unwrap();
         let _ = send_fds(&second, &[0], 28);
