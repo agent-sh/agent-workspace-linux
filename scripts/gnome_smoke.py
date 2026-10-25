@@ -19,14 +19,17 @@ for key in ('XDG_RUNTIME_DIR', 'XDG_CONFIG_HOME', 'HOME'):
 sequence = 0
 
 
-def command(*args, expected=True):
+def command(*args, expected=True, failure=None):
     global sequence
     sequence += 1
     result = subprocess.run([BIN, *map(str, args)], capture_output=True, text=True, timeout=60)
     (ARTIFACTS / f'{sequence:03d}.json').write_text(result.stdout)
     (ARTIFACTS / f'{sequence:03d}.stderr').write_text(result.stderr)
     if not expected:
-        assert result.returncode != 0, (args, result.stdout)
+        # Denials are either a nonzero exit or a JSON {ok:false}; both must
+        # carry the expected reason so an unrelated error cannot pass.
+        assert result.returncode != 0 or not json.loads(result.stdout).get('ok', True), (args, result.stdout)
+        assert failure and failure in result.stdout + result.stderr, (args, failure, result.stdout, result.stderr)
         return
     assert result.returncode == 0, (args, result.stderr)
     value = json.loads(result.stdout)
@@ -61,7 +64,7 @@ def png_size(path):
 
 
 def save_logs(runtime, id):
-    for path in [*runtime.glob('*.log'), *runtime.glob('*-bus.conf'), runtime / 'output-config.json']:
+    for path in [*runtime.glob('*.log'), *runtime.glob('apps/*.stderr.log'), *runtime.glob('*-bus.conf'), runtime / 'output-config.json']:
         if path.is_file():
             (ARTIFACTS / f'{id}-{path.name}').write_bytes(path.read_bytes())
 
@@ -71,7 +74,8 @@ assert not Path('/dev/dri').exists() and not Path('/dev/input').exists()
 Path('/tmp/.X11-unix').mkdir(mode=0o1777, exist_ok=True)
 assert command('doctor')['ready_for_gnome_workspace']
 command('workspace', 'start', '--id', 'gnome-invalid-scale', '--ack-hidden-workspace',
-    '--session', 'gnome', '--scale', 1.5, '--width', 960, '--height', 720, expected=False)
+    '--session', 'gnome', '--scale', 1.5, '--width', 960, '--height', 720, expected=False,
+    failure='GNOME monitor does not support scale 1.5')
 wait(lambda: 'gnome-shell' not in subprocess.check_output(['ps', '-eo', 'comm='], text=True).splitlines(),
     'failed startup compositor cleanup')
 for scale in (1, 1.5):
@@ -126,7 +130,7 @@ for scale in (1, 1.5):
             assert forbidden.returncode != 0 and 'ServiceUnknown' in forbidden.stderr, forbidden
         assert not marker.exists()
         evidence = Path(f'/tmp/fixture-{scale}.json')
-        ws(id, 'launch', '--wait-window', '--', 'python3', '/opt/gnome-probe/gnome_fixture.py', evidence)
+        ws(id, 'launch', '--wait-window', '--window-timeout-ms', 10000, '--', 'python3', '/opt/gnome-probe/gnome_fixture.py', evidence)
         wait(lambda: evidence.exists() and len(ws(id, 'windows')['windows']) == 1, 'native fixture ready')
         wid = ws(id, 'windows')['windows'][0]['id']
         assert wid.startswith('gnome:')
@@ -202,7 +206,7 @@ for scale in (1, 1.5):
             wait(lambda: process_stopped(status['window_manager_pid']), 'compositor shutdown')
             wait(lambda: all(process_stopped(pid) for pid in terminal_pids), 'managed terminal cleanup')
             assert not (runtime / 'workspace-wayland').exists(), 'stale Wayland socket'
-            for name in ('session-bus','system-bus','at-spi/bus'):
+            for name in ('session-bus','client-bus','system-bus','at-spi/bus'):
                 assert not (runtime / name).exists(), f'stale private bus {name}'
             assert not Path('/tmp/.X11-unix/X' + status['display'][1:]).exists(), 'stale XWayland socket'
         else:
@@ -220,21 +224,58 @@ command('profile', 'import', '--json', profile)
 id = 'gnome-restricted'
 try:
     ws(id, 'start', '--profile', id, '--ack-hidden-workspace')
-    native = ws(id, 'launch', '--wait-window', '--', 'python3', '/opt/gnome-probe/gnome_fixture.py', '/workspace/project/native.json')
+    native = ws(id, 'launch', '--wait-window', '--window-timeout-ms', 10000, '--', 'python3', '/opt/gnome-probe/gnome_fixture.py', '/workspace/project/native.json')
     wait(lambda: (project / 'native.json').exists(), 'restricted native client')
     app = native['apps'][0]
     assert app['mount_isolation'] == 'bubblewrap_mount_namespace' and app['network_isolation'] == 'bubblewrap_unshare_net', app
-    legacy = ws(id, 'launch', '--wait-window', '--', 'xterm', '-e', 'sh', '-c', 'printf ready > /workspace/project/legacy; exec tail -f /dev/null')
+    legacy_fixture = ws(id, 'launch', '--wait-window', '--window-timeout-ms', 10000, '--',
+        'env', 'GDK_BACKEND=x11', 'GTK_IM_MODULE=simple', 'GNOME_FIXTURE_APP_ID=org.agent_sh.GnomeLegacyFixture',
+        'python3', '/opt/gnome-probe/gnome_fixture.py', '/workspace/project/x11.json')
+    legacy_id = legacy_fixture['windows'][0]['id']
+    ws(id, 'focus-window', legacy_id)
+    ws(id, 'type', 'Legacy café שלום 日本語')
+    wait(lambda: (project/'x11.json').exists() and json.loads((project/'x11.json').read_text())['text']=='Legacy café שלום 日本語', 'XWayland Unicode delivery')
+    (ARTIFACTS/'legacy-fixture.json').write_text((project/'x11.json').read_text())
+    ws(id,'key','ctrl+a')
+    ws(id,'type','Replacement 😀')
+    wait(lambda: json.loads((project/'x11.json').read_text())['text']=='Replacement 😀','GTK selection replacement')
+    ws(id,'key','Home')
+    ws(id,'key','Right')
+    ws(id,'type','א')
+    wait(lambda: json.loads((project/'x11.json').read_text())['text']=='Rאeplacement 😀','GTK caret insertion')
+    qt=ws(id,'launch','--wait-window','--window-timeout-ms',10000,'--','env','QT_QPA_PLATFORM=xcb','QT_IM_MODULE=compose',
+        'python3','/opt/gnome-probe/gnome_qt_fixture.py','/workspace/project/qt.json')
+    ws(id,'focus-window',qt['windows'][0]['id'])
+    ws(id,'type','Qt café שלום 日本語')
+    wait(lambda:(project/'qt.json').exists() and json.loads((project/'qt.json').read_text())['text']=='Qt café שלום 日本語','cold Qt Unicode insertion')
+    ws(id,'key','ctrl+a')
+    ws(id,'type','Replacement 😀')
+    wait(lambda:json.loads((project/'qt.json').read_text())['text']=='Replacement 😀','Qt selection replacement')
+    ws(id,'key','Home')
+    ws(id,'key','Right')
+    ws(id,'type','א')
+    wait(lambda:json.loads((project/'qt.json').read_text())['text']=='Rאeplacement 😀','Qt caret insertion')
+    legacy = ws(id, 'launch', '--wait-window', '--window-timeout-ms', 10000, '--', 'xterm', '-e', 'sh', '-c', 'printf ready > /workspace/project/legacy; exec tail -f /dev/null')
     assert legacy['windows'], legacy
     wait(lambda: (project / 'legacy').exists(), 'restricted XWayland client')
+    terminal=ws(id,'launch','--wait-window','--window-timeout-ms',10000,'--','xterm','-e','python3','-c',
+        "import pathlib,time; pathlib.Path('/workspace/project/terminal.txt').write_text(input()); time.sleep(60)")
+    ws(id,'focus-window',terminal['windows'][0]['id'])
+    ws(id,'clipboard-set','CLIPBOARD SENTINEL')
+    ws(id,'type','Terminal café שלום 日本語\n')
+    wait(lambda:(project/'terminal.txt').exists() and (project/'terminal.txt').read_text()=='Terminal café שלום 日本語','xterm PRIMARY Unicode paste')
+    assert ws(id,'clipboard-get')['clipboard']['content']=='CLIPBOARD SENTINEL'
+
 finally:
     save_logs(Path(os.environ['XDG_RUNTIME_DIR']) / 'agent-workspace-linux' / id, id)
+    for name in ('native','x11','qt'):
+        if (project/f'{name}.json').exists(): (ARTIFACTS/f'restricted-{name}.json').write_text((project/f'{name}.json').read_text())
     ws(id, 'stop')
 
 # Spawn-time app ceiling remains effective after the originating MCP exits.
 permissions = Path('/tmp/gnome-permissions.json')
 permissions.write_text(json.dumps({'apps': {'allow': ['/usr/bin/true']}}))
-wrapper = Path('/tmp/gnome-ceiling-bin')
+wrapper = ARTIFACTS / 'gnome-ceiling-bin'
 wrapper.write_text('#!/bin/sh\nexec /opt/agent-workspace-linux "$@" --permissions /tmp/gnome-permissions.json\n')
 wrapper.chmod(0o700)
 mcp = Mcp(str(wrapper), ARTIFACTS / 'ceiling-mcp.log', headless=True)
@@ -245,7 +286,8 @@ try:
     assert start['ok'], start
     mcp.close()
     mcp = None
-    command('workspace', 'launch', '--id', id, '--', '/usr/bin/sh', '-c', 'true', expected=False)
+    command('workspace', 'launch', '--id', id, '--', '/usr/bin/sh', '-c', 'true', expected=False,
+        failure='workspace launch exceeds the MCP permission ceiling')
     ws(id, 'launch', '--', '/usr/bin/true')
 finally:
     if mcp:

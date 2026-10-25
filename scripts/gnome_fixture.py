@@ -9,7 +9,7 @@ gi.require_version('Gtk', '4.0')
 from gi.repository import Gtk, GLib
 output = Path(sys.argv[1])
 state = {'clicks': 0, 'text': '', 'scrolls': [], 'motions': []}
-app = Gtk.Application(application_id='org.agent_sh.GnomeFixture')
+app = Gtk.Application(application_id=os.environ.get('GNOME_FIXTURE_APP_ID','org.agent_sh.GnomeFixture'))
 def save():
     state.update(scale=window.get_scale_factor(), width=window.get_width(), height=window.get_height())
     ok, bounds = button.compute_bounds(window)

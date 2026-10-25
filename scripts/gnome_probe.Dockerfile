@@ -7,6 +7,6 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libxcb-xfixes0 libxcb-randr0 libxcb-shape0 libxcb-xkb1 libxcb-render0 \
     libxcb-present0 libxcb-dri3-0 libx11-xcb1 wayland-utils \
     && rm -rf /var/lib/apt/lists/*
-RUN apt-get update && apt-get install -y --no-install-recommends xdotool && rm -rf /var/lib/apt/lists/*
-COPY gnome_smoke.py gnome_fixture.py kwin_mcp.py /opt/gnome-probe/
+RUN apt-get update && apt-get install -y --no-install-recommends python3-pyqt6 && rm -rf /var/lib/apt/lists/*
+COPY gnome_smoke.py gnome_fixture.py gnome_qt_fixture.py kwin_mcp.py /opt/gnome-probe/
 ENTRYPOINT ["python3","/opt/gnome-probe/gnome_smoke.py"]
