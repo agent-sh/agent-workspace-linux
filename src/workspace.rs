@@ -3765,11 +3765,7 @@ fn create_owned_private_dir(path: &Path, what: &str) -> Result<()> {
     {
         Ok(()) => Ok(()),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-            let metadata = fs::symlink_metadata(path)?;
-            if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
-                bail!("{what} is not an owned directory");
-            }
-            Ok(())
+            verify_owned_dir(path, what).map(drop)
         }
         Err(error) => Err(error).with_context(|| format!("create {what}")),
     }
@@ -3795,11 +3791,53 @@ fn client_terminal_socket_path(runtime: &Path, id: &str) -> PathBuf {
         .join("tmux.sock")
 }
 
+/// `path` is `ROOT/agent-workspace-linux/ID`. ROOT may be the predictable
+/// `/tmp` fallback, so never follow a symlink or reuse a directory another user
+/// created or can write: either would let them swap sockets and auth files.
 fn create_private_runtime_dir(path: &Path) -> Result<()> {
-    fs::create_dir_all(path).with_context(|| format!("failed to create {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(PRIVATE_RUNTIME_DIR_MODE))
-        .with_context(|| format!("failed to set private permissions on {}", path.display()))?;
+    let base = path
+        .parent()
+        .context("workspace runtime directory has no parent")?;
+    let root = base
+        .parent()
+        .context("workspace runtime base has no parent")?;
+    if !root.exists() {
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(PRIVATE_RUNTIME_DIR_MODE)
+            .create(root)
+            .with_context(|| format!("failed to create {}", root.display()))?;
+    }
+    let metadata = verify_owned_dir(root, "workspace runtime root")?;
+    if metadata.mode() & 0o002 != 0 {
+        bail!(
+            "workspace runtime root {} is world-writable; use a private XDG_RUNTIME_DIR",
+            root.display()
+        );
+    }
+    for (dir, what) in [
+        (base, "workspace runtime base"),
+        (path, "workspace runtime directory"),
+    ] {
+        create_owned_private_dir(dir, what)?;
+        // Older releases created these with the process umask (often 0775).
+        fs::set_permissions(dir, fs::Permissions::from_mode(PRIVATE_RUNTIME_DIR_MODE))
+            .with_context(|| format!("failed to set private permissions on {}", dir.display()))?;
+    }
     Ok(())
+}
+
+fn verify_owned_dir(path: &Path, what: &str) -> Result<fs::Metadata> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect {what} {}", path.display()))?;
+    if !metadata.file_type().is_dir() || metadata.uid() != unsafe { libc::geteuid() } {
+        bail!(
+            "{what} {} must be a real directory owned by this user",
+            path.display()
+        );
+    }
+    Ok(metadata)
 }
 
 fn workspace_manifest(status: &WorkspaceStatus, stopped_at_unix: Option<u64>) -> WorkspaceManifest {
@@ -9476,6 +9514,50 @@ mod tests {
     }
 
     #[test]
+    fn private_runtime_dir_rejects_symlinked_or_shared_roots() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock after epoch")
+            .as_nanos();
+        let scratch = std::env::temp_dir().join(format!("awl-rt-{}-{unique}", std::process::id()));
+        fs::create_dir_all(&scratch).expect("scratch");
+        let runtime = |root: &Path| root.join("agent-workspace-linux").join("ws");
+
+        let owned = scratch.join("owned");
+        create_private_runtime_dir(&runtime(&owned)).expect("fresh root is created private");
+        create_private_runtime_dir(&runtime(&owned)).expect("existing private root is reused");
+        let base = owned.join("agent-workspace-linux");
+        fs::set_permissions(&base, fs::Permissions::from_mode(0o775)).expect("chmod base");
+        create_private_runtime_dir(&runtime(&owned)).expect("umask-created base is accepted");
+        assert_eq!(
+            fs::metadata(&base).expect("base").mode() & 0o777,
+            PRIVATE_RUNTIME_DIR_MODE
+        );
+
+        let shared = scratch.join("shared");
+        fs::create_dir(&shared).expect("shared root");
+        fs::set_permissions(&shared, fs::Permissions::from_mode(0o777)).expect("chmod");
+        assert!(create_private_runtime_dir(&runtime(&shared)).is_err());
+        assert!(!shared.join("agent-workspace-linux").exists());
+
+        let linked = scratch.join("linked");
+        std::os::unix::fs::symlink(&owned, &linked).expect("symlink root");
+        assert!(create_private_runtime_dir(&runtime(&linked)).is_err());
+
+        let base_link = scratch.join("base-link");
+        fs::create_dir(&base_link).expect("root");
+        fs::set_permissions(&base_link, fs::Permissions::from_mode(0o700)).expect("chmod");
+        std::os::unix::fs::symlink(
+            owned.join("agent-workspace-linux"),
+            base_link.join("agent-workspace-linux"),
+        )
+        .expect("symlink base");
+        assert!(create_private_runtime_dir(&runtime(&base_link)).is_err());
+
+        fs::remove_dir_all(scratch).expect("remove scratch");
+    }
+
+    #[test]
     fn terminal_socket_ignores_stale_legacy_socket_and_attaches_to_live_one() {
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -9491,6 +9573,11 @@ mod tests {
 
         let stale = UnixListener::bind(&legacy).expect("bind legacy socket");
         drop(stale);
+        // A parallel test that forks before exec briefly holds the listener.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while UnixStream::connect(&legacy).is_ok() && Instant::now() < deadline {
+            thread::sleep(Duration::from_millis(10));
+        }
         assert!(legacy
             .symlink_metadata()
             .is_ok_and(|meta| meta.file_type().is_socket()));
