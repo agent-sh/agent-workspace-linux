@@ -3913,47 +3913,59 @@ fn create_private_runtime_dir(path: &Path) -> Result<()> {
 
 /// True when `gid` is this user's own group: their primary group, named after
 /// them, with no other listed members (the user-private-group convention).
+/// Users whose primary group is this gid are not listed in the group entry;
+/// that convention assumes none besides the owner.
 fn user_private_group(gid: u32) -> bool {
     if gid != unsafe { libc::getegid() } {
         return false;
     }
-    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
-    let mut user: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut user_result = std::ptr::null_mut();
-    let mut group: libc::group = unsafe { std::mem::zeroed() };
-    let mut group_result = std::ptr::null_mut();
-    let mut group_buffer = vec![0 as libc::c_char; 16 * 1024];
+    let Some(user) = lookup_entry(
+        |buffer, length, result: &mut *mut libc::passwd, entry| unsafe {
+            libc::getpwuid_r(libc::geteuid(), entry, buffer, length, result)
+        },
+    ) else {
+        return false;
+    };
+    let Some(group) = lookup_entry(
+        |buffer, length, result: &mut *mut libc::group, entry| unsafe {
+            libc::getgrgid_r(gid, entry, buffer, length, result)
+        },
+    ) else {
+        return false;
+    };
+    let (user_entry, _user_buffer) = &user;
+    let (group_entry, _group_buffer) = &group;
     unsafe {
-        if libc::getpwuid_r(
-            libc::geteuid(),
-            &mut user,
-            buffer.as_mut_ptr(),
-            buffer.len(),
-            &mut user_result,
-        ) != 0
-            || user_result.is_null()
-            || libc::getgrgid_r(
-                gid,
-                &mut group,
-                group_buffer.as_mut_ptr(),
-                group_buffer.len(),
-                &mut group_result,
-            ) != 0
-            || group_result.is_null()
-        {
+        let name = std::ffi::CStr::from_ptr(user_entry.pw_name);
+        if std::ffi::CStr::from_ptr(group_entry.gr_name) != name {
             return false;
         }
-        let same_name =
-            std::ffi::CStr::from_ptr(user.pw_name) == std::ffi::CStr::from_ptr(group.gr_name);
-        let mut members = group.gr_mem;
-        let mut others = false;
+        let mut members = group_entry.gr_mem;
         while !members.is_null() && !(*members).is_null() {
-            if std::ffi::CStr::from_ptr(*members) != std::ffi::CStr::from_ptr(user.pw_name) {
-                others = true;
+            if std::ffi::CStr::from_ptr(*members) != name {
+                return false;
             }
             members = members.add(1);
         }
-        same_name && !others
+    }
+    true
+}
+
+/// Calls a reentrant passwd/group lookup, growing its buffer on ERANGE. The
+/// entry's strings point into the returned buffer, so both are returned.
+fn lookup_entry<T>(
+    mut call: impl FnMut(*mut libc::c_char, usize, &mut *mut T, *mut T) -> libc::c_int,
+) -> Option<(T, Vec<libc::c_char>)> {
+    let mut length = 16 * 1024;
+    loop {
+        let mut buffer = vec![0 as libc::c_char; length];
+        let mut entry: T = unsafe { std::mem::zeroed() };
+        let mut result = std::ptr::null_mut();
+        match call(buffer.as_mut_ptr(), buffer.len(), &mut result, &mut entry) {
+            0 if !result.is_null() => return Some((entry, buffer)),
+            libc::ERANGE if length < 1 << 20 => length *= 2,
+            _ => return None,
+        }
     }
 }
 
@@ -7281,22 +7293,81 @@ fn terminal_info(id: &str, terminal_id: &str, app_id: Option<String>) -> Result<
     })
 }
 
-/// Managed terminals launch with the workspace default policy (their launch
-/// spec carries none), so their client sandbox is that policy's sandbox with
-/// only the terminal's own client directory bound.
+/// Every per-terminal socket gets the same minimal client sandbox, whatever
+/// policy launched the terminal: read-only system directories, the terminal's
+/// own directory, no network and no home. A tmux client needs nothing else,
+/// and this is never weaker than the terminal's own sandbox. Legacy sockets
+/// at the runtime root only exist for terminals launched by older daemons.
 fn terminal_client_sandbox(status: &WorkspaceStatus, socket: &Path) -> Result<TmuxClientSandbox> {
     let terminal_dir = socket
         .parent()
         .filter(|dir| dir.parent() == Some(status.runtime_dir.join("client").as_path()));
-    match bubblewrap_sandbox_for_launch(status, status.applied_policy.as_ref(), None, terminal_dir)?
-    {
-        None => Ok(TmuxClientSandbox::Host),
-        Some(_) if terminal_dir.is_none() => bail!(
+    match terminal_dir {
+        Some(dir) => Ok(TmuxClientSandbox::Bubblewrap(tmux_client_sandbox_args(
+            dir,
+        )?)),
+        None if bubblewrap_sandbox_for_launch(
+            status,
+            status.applied_policy.as_ref(),
+            None,
+            None,
+        )?
+        .is_none() =>
+        {
+            Ok(TmuxClientSandbox::Host)
+        }
+        None => bail!(
             "terminal socket {} predates per-terminal sandboxes; restart the workspace to use it",
             socket.display()
         ),
-        Some(sandbox) => Ok(TmuxClientSandbox::Bubblewrap(sandbox.args)),
     }
+}
+
+fn tmux_client_sandbox_args(terminal_dir: &Path) -> Result<Vec<String>> {
+    let source = fs::canonicalize(terminal_dir)
+        .with_context(|| format!("managed terminal directory {}", terminal_dir.display()))?;
+    let mut args = [
+        "--unshare-net",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--ro-bind",
+        "/usr",
+        "/usr",
+        "--ro-bind",
+        "/etc",
+        "/etc",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+    ]
+    .map(str::to_string)
+    .to_vec();
+    // Merged-/usr systems link these into /usr; older layouts have real dirs.
+    for path in ["/bin", "/sbin", "/lib", "/lib64"] {
+        match fs::read_link(path) {
+            Ok(target) => args.extend([
+                "--symlink".to_string(),
+                target.display().to_string(),
+                path.to_string(),
+            ]),
+            Err(_) if Path::new(path).is_dir() => {
+                args.extend(["--ro-bind".to_string(), path.to_string(), path.to_string()])
+            }
+            Err(_) => {}
+        }
+    }
+    args.extend([
+        "--bind".to_string(),
+        source.display().to_string(),
+        terminal_dir.display().to_string(),
+        "--chdir".to_string(),
+        "/".to_string(),
+    ]);
+    Ok(args)
 }
 
 fn tmux_capture_pane(
@@ -9994,9 +10065,15 @@ mod tests {
             panic!("sandboxed terminal must get a sandboxed tmux client");
         };
         let canonical_dir = fs::canonicalize(&terminal_dir).expect("canonical dir");
-        assert!(args
-            .windows(3)
-            .any(|window| window[0] == "--bind" && Path::new(&window[2]) == canonical_dir));
+        assert!(args.windows(3).any(|window| window[0] == "--bind"
+            && Path::new(&window[1]) == canonical_dir
+            && Path::new(&window[2]) == terminal_dir));
+        // Nothing of the host beyond system directories and this terminal.
+        assert!(args.iter().any(|arg| arg == "--unshare-net"));
+        assert!(!args.windows(2).any(|pair| {
+            matches!(pair[0].as_str(), "--bind" | "--ro-bind")
+                && matches!(pair[1].as_str(), "/" | "/home")
+        }));
         let command = tmux_command(&socket, &TmuxClientSandbox::Bubblewrap(args), &["ls"])
             .expect("client command");
         assert_eq!(command.get_program(), "bwrap");
@@ -10010,8 +10087,13 @@ mod tests {
         assert!(terminal_client_sandbox(&status, &legacy).is_err());
 
         status.applied_policy = None;
+        // Even a terminal launched without a policy gets the minimal sandbox.
+        assert!(matches!(
+            terminal_client_sandbox(&status, &socket).expect("client"),
+            TmuxClientSandbox::Bubblewrap(_)
+        ));
         assert_eq!(
-            terminal_client_sandbox(&status, &socket).expect("host client"),
+            terminal_client_sandbox(&status, &legacy).expect("legacy host client"),
             TmuxClientSandbox::Host
         );
         assert!(tmux_command(&socket, &TmuxClientSandbox::Unknown, &["ls"]).is_err());

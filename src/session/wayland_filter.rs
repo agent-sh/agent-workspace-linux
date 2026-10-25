@@ -405,10 +405,12 @@ fn connect_through_holder(
 unsafe fn holder(control: RawFd, upstream: &SocketAddress) -> ! {
     // Keep only the control socket: inherited copies of other relays'
     // descriptors would hold their connections open.
-    if control > 0 {
-        libc::close_range(0, control as libc::c_uint - 1, 0);
+    // close_range needs Linux 5.9; without it, fail rather than keep copies.
+    if (control > 0 && libc::close_range(0, control as libc::c_uint - 1, 0) != 0)
+        || libc::close_range(control as libc::c_uint + 1, libc::c_uint::MAX, 0) != 0
+    {
+        libc::_exit(126);
     }
-    libc::close_range(control as libc::c_uint + 1, libc::c_uint::MAX, 0);
     let mut name = [0u8; 16];
     name[..HOLDER_NAME.len()].copy_from_slice(HOLDER_NAME.as_bytes());
     libc::prctl(libc::PR_SET_NAME, name.as_ptr());
@@ -505,6 +507,10 @@ fn accept_loop(
             .lock()
             .map_or(true, |list| list.len() >= limits.connections)
         {
+            eprintln!(
+                "sandbox Wayland relay refused a client: {} connections already open",
+                limits.connections
+            );
             continue;
         }
         let Ok((server, holder)) = connect_through_holder(upstream, peer_pid(&client)) else {
@@ -696,7 +702,7 @@ fn filter_requests(buffer: &mut Vec<u8>, state: &Mutex<State>) -> io::Result<Vec
         let mut state = state.lock().map_err(|_| invalid("filter state poisoned"))?;
         if object == 1 && opcode == 1 {
             // wl_display.get_registry(new_id)
-            state.registries.entry(name(body)?).or_default();
+            state.registries.insert(name(body)?, HashMap::new());
         } else if opcode == 0 {
             if let Some(shown) = state.registries.get(&object) {
                 // wl_registry.bind(name, interface, version, new_id): only
@@ -714,6 +720,13 @@ fn filter_requests(buffer: &mut Vec<u8>, state: &Mutex<State>) -> io::Result<Vec
 fn filter_events(buffer: &mut Vec<u8>, state: &Mutex<State>) -> io::Result<Vec<u8>> {
     messages(buffer, |object, opcode, body| {
         let mut state = state.lock().map_err(|_| invalid("filter state poisoned"))?;
+        if object == 1 && opcode == 1 {
+            // wl_display.delete_id(id): a registry destroyed with
+            // wl_fixes.destroy_registry frees its id, and the client reuses
+            // it only after this event, so it stops being a registry here.
+            state.registries.remove(&name(body)?);
+            return Ok(true);
+        }
         let Some(shown) = state.registries.get_mut(&object) else {
             return Ok(true);
         };
@@ -1015,6 +1028,19 @@ mod tests {
         filter_events(&mut events, &state).unwrap();
         assert!(filter_requests(&mut bind(3, 5, "wl_seat", 5), &state).is_err());
         assert!(filter_requests(&mut bind(2, 5, "wl_seat", 5), &state).is_ok());
+    }
+
+    #[test]
+    fn reused_registry_ids_stop_being_registries_after_delete_id() {
+        let state = Mutex::new(State::default());
+        filter_requests(&mut message(1, 1, &4u32.to_ne_bytes()), &state).unwrap();
+        // wl_fixes.destroy_registry, then the compositor frees the id.
+        filter_events(&mut message(1, 1, &4u32.to_ne_bytes()), &state).unwrap();
+        // The id now names a wl_callback: done(serial) is opcode 0.
+        let mut done = message(4, 0, &7u32.to_ne_bytes());
+        assert_eq!(filter_events(&mut done.clone(), &state).unwrap(), done);
+        // Requests on the reused id pass untouched as well.
+        assert!(filter_requests(&mut done, &state).is_ok());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${BIN:-$ROOT_DIR/target/debug/agent-workspace-linux}"
+BIN="${BIN:-${AGENT_WORKSPACE_BIN:-$ROOT_DIR/target/debug/agent-workspace-linux}}"
 
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then
