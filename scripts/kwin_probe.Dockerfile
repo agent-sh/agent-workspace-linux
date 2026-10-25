@@ -46,7 +46,7 @@ RUN apt-get update \
 
 RUN apt-get update && apt-get install -y --no-install-recommends xterm tmux libkscreen-bin && rm -rf /var/lib/apt/lists/*
 
-COPY kwin_probe_guest.sh kwin_smoke.py kwin_mcp.py /opt/kwin-probe/
+COPY kwin_probe_guest.sh kwin_smoke.py kwin_mcp.py sandbox_wayland_globals_smoke.py wayland_globals_probe.py /opt/kwin-probe/
 RUN chmod 0755 /opt/kwin-probe/kwin_probe_guest.sh
 
 ENTRYPOINT ["/opt/kwin-probe/kwin_probe_guest.sh"]

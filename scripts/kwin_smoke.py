@@ -259,4 +259,8 @@ try:
     print("KWin restricted XWayland terminal passed",flush=True)
 finally:
     workspace(id,"stop")
+# Sandboxed apps must reach only the filtered Wayland socket.
+(Path.home()/".cache").mkdir(exist_ok=True)
+subprocess.run(["python3","/opt/kwin-probe/sandbox_wayland_globals_smoke.py","kwin"],
+               env=dict(os.environ,AGENT_WORKSPACE_BIN=BIN,SANDBOX_GLOBALS_ARTIFACTS=str(ARTIFACTS)),check=True,timeout=300)
 print("KWin native acceptance passed", flush=True)

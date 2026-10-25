@@ -354,4 +354,8 @@ while True:
 os.kill(status['daemon_pid'], signal.SIGKILL)
 wait(lambda: all(process_stopped(pid) for pid in children), 'crash-owned process cleanup')
 command('workspace', 'cleanup', '--id', id)
+# Sandboxed apps must reach only the filtered Wayland socket.
+(Path.home()/".cache").mkdir(exist_ok=True)
+subprocess.run(["python3","/opt/gnome-probe/sandbox_wayland_globals_smoke.py","gnome"],
+               env=dict(os.environ,AGENT_WORKSPACE_BIN=BIN,SANDBOX_GLOBALS_ARTIFACTS=str(ARTIFACTS)),check=True,timeout=300)
 print('GNOME native acceptance passed', flush=True)
