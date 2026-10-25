@@ -15,7 +15,7 @@
 //! back to the sandboxed client, so no window reports the daemon's pid.
 use anyhow::{bail, Context, Result};
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     fs, io,
     mem::{size_of, zeroed},
     os::{
@@ -560,6 +560,13 @@ struct State {
     /// stays bindable: a bind can race global_remove, and the compositor
     /// gives such a bind an inert object.
     registries: HashMap<u32, HashMap<u32, String>>,
+    /// A registry only ends through wl_fixes.destroy_registry; no delete_id
+    /// can unfilter a live one, since the compositor frees and reuses ids of
+    /// any destroyed object at once. Ids of destroyed registries drop all
+    /// events until their own delete_id, counted per destroyed incarnation.
+    destroyed_registries: HashMap<u32, u32>,
+    /// Bound wl_fixes objects, the only way to destroy a registry.
+    fixes: HashSet<u32>,
 }
 
 /// Relays one client in two threads. Either direction ending closes both.
@@ -703,14 +710,36 @@ fn filter_requests(buffer: &mut Vec<u8>, state: &Mutex<State>) -> io::Result<Vec
         if object == 1 && opcode == 1 {
             // wl_display.get_registry(new_id)
             state.registries.insert(name(body)?, HashMap::new());
-        } else if opcode == 0 {
-            if let Some(shown) = state.registries.get(&object) {
-                // wl_registry.bind(name, interface, version, new_id): only
-                // names this registry was shown, under that interface.
-                let interface = string(body, 4).ok_or_else(|| invalid("bad bind"))?;
-                if shown.get(&name(body)?).map(String::as_str) != Some(interface) {
-                    return Err(invalid("sandboxed client bound a hidden global"));
+        } else if let Some(shown) = state.registries.get(&object) {
+            // wl_registry.bind(name, interface, version, new_id): only names
+            // this registry was shown, under that interface.
+            let interface = string(body, 4).ok_or_else(|| invalid("bad bind"))?;
+            if opcode != 0 || shown.get(&name(body)?).map(String::as_str) != Some(interface) {
+                return Err(invalid("sandboxed client bound a hidden global"));
+            }
+            if interface == "wl_fixes" {
+                let id_offset = 4 + 4 + (interface.len() + 1).next_multiple_of(4) + 4;
+                let id = body
+                    .get(id_offset..id_offset + 4)
+                    .ok_or_else(|| invalid("bad bind"))?;
+                state
+                    .fixes
+                    .insert(u32::from_ne_bytes(id.try_into().unwrap()));
+            }
+        } else if state.fixes.contains(&object) {
+            match opcode {
+                // wl_fixes.destroy: the id may name anything afterwards.
+                0 => {
+                    state.fixes.remove(&object);
                 }
+                // wl_fixes.destroy_registry(registry)
+                1 => {
+                    let registry = name(body)?;
+                    if state.registries.remove(&registry).is_some() {
+                        *state.destroyed_registries.entry(registry).or_default() += 1;
+                    }
+                }
+                _ => {}
             }
         }
         Ok(true)
@@ -721,14 +750,20 @@ fn filter_events(buffer: &mut Vec<u8>, state: &Mutex<State>) -> io::Result<Vec<u
     messages(buffer, |object, opcode, body| {
         let mut state = state.lock().map_err(|_| invalid("filter state poisoned"))?;
         if object == 1 && opcode == 1 {
-            // wl_display.delete_id(id): a registry destroyed with
-            // wl_fixes.destroy_registry frees its id, and the client reuses
-            // it only after this event, so it stops being a registry here.
-            state.registries.remove(&name(body)?);
+            // wl_display.delete_id(id): ends a destroyed registry's sink,
+            // never a live registry.
+            let id = name(body)?;
+            if let Some(pending) = state.destroyed_registries.get_mut(&id) {
+                *pending -= 1;
+                if *pending == 0 {
+                    state.destroyed_registries.remove(&id);
+                }
+            }
             return Ok(true);
         }
         let Some(shown) = state.registries.get_mut(&object) else {
-            return Ok(true);
+            // Events still in flight to a destroyed registry carry globals.
+            return Ok(!state.destroyed_registries.contains_key(&object));
         };
         match opcode {
             0 => {
@@ -1031,16 +1066,45 @@ mod tests {
     }
 
     #[test]
-    fn reused_registry_ids_stop_being_registries_after_delete_id() {
+    fn no_delete_id_unfilters_a_live_registry() {
         let state = Mutex::new(State::default());
+        // wl_display.sync(new_id 4), then get_registry(new_id 4) at once:
+        // the callback's delete_id(4) arrives while registry 4 is live.
+        filter_requests(&mut message(1, 0, &4u32.to_ne_bytes()), &state).unwrap();
         filter_requests(&mut message(1, 1, &4u32.to_ne_bytes()), &state).unwrap();
-        // wl_fixes.destroy_registry, then the compositor frees the id.
         filter_events(&mut message(1, 1, &4u32.to_ne_bytes()), &state).unwrap();
-        // The id now names a wl_callback: done(serial) is opcode 0.
-        let mut done = message(4, 0, &7u32.to_ne_bytes());
+        let mut hidden = global(4, 9, "zwlr_virtual_pointer_manager_v1");
+        assert!(filter_events(&mut hidden, &state).unwrap().is_empty());
+        assert!(filter_requests(
+            &mut bind(4, 9, "zwlr_virtual_pointer_manager_v1", 5),
+            &state
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn destroyed_registries_end_only_through_wl_fixes() {
+        let state = Mutex::new(State::default());
+        filter_requests(&mut message(1, 1, &2u32.to_ne_bytes()), &state).unwrap();
+        filter_events(&mut global(2, 1, "wl_fixes"), &state).unwrap();
+        filter_requests(&mut bind(2, 1, "wl_fixes", 3), &state).unwrap();
+        // A temporary registry 4, destroyed with wl_fixes.destroy_registry.
+        filter_requests(&mut message(1, 1, &4u32.to_ne_bytes()), &state).unwrap();
+        filter_requests(&mut message(3, 1, &4u32.to_ne_bytes()), &state).unwrap();
+        // Globals still in flight to it are dropped, not leaked.
+        let mut late = global(4, 9, "zwlr_virtual_pointer_manager_v1");
+        assert!(filter_events(&mut late, &state).unwrap().is_empty());
+        // Its delete_id frees the id; a wl_callback reusing it works.
+        filter_events(&mut message(1, 1, &4u32.to_ne_bytes()), &state).unwrap();
+        let done = message(4, 0, &7u32.to_ne_bytes());
         assert_eq!(filter_events(&mut done.clone(), &state).unwrap(), done);
-        // Requests on the reused id pass untouched as well.
-        assert!(filter_requests(&mut done, &state).is_ok());
+        assert!(filter_requests(&mut done.clone(), &state).is_ok());
+        // After wl_fixes.destroy, its id names something else: opcode 1 on
+        // it no longer destroys registries.
+        filter_requests(&mut message(3, 0, &[]), &state).unwrap();
+        filter_requests(&mut message(3, 1, &2u32.to_ne_bytes()), &state).unwrap();
+        let mut hidden = global(2, 9, "zwlr_virtual_pointer_manager_v1");
+        assert!(filter_events(&mut hidden, &state).unwrap().is_empty());
     }
 
     #[test]
