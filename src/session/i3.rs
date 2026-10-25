@@ -51,8 +51,10 @@ pub(crate) fn spawn(options: &DaemonOptions) -> Result<Child> {
         )?));
     super::private::prepare_child(&mut command);
     let mut child = command.spawn().context("start private i3 window manager")?;
+    // Same startup budget as the other private compositors: a loaded host can
+    // stall i3's font setup, and one IPC probe alone may block for 5 seconds.
     let ready = super::private::wait_for(
-        Duration::from_secs(5),
+        Duration::from_secs(15),
         || Ok(super::super::desktop::i3::request(&options.runtime_dir, child.id(), 7, "").is_ok()),
         "i3 IPC",
     );
