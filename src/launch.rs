@@ -663,19 +663,31 @@ mod tests {
                 NetworkMode::InheritHost,
             ),
         ];
-        let client = client_bus.display().to_string();
-        let control = runtime.join("session-bus").display().to_string();
+        // Bind targets use the canonical runtime, which differs from the
+        // source path under a symlinked TMPDIR, so compare resolved paths.
+        let client = fs::canonicalize(&client_bus).expect("canonical client bus");
+        let resolves_to_client =
+            |path: &str| fs::canonicalize(path).is_ok_and(|path| path == client);
+        let controls = [
+            runtime.join("session-bus"),
+            fs::canonicalize(&runtime)
+                .expect("canonical runtime")
+                .join("session-bus"),
+        ]
+        .map(|path| path.display().to_string());
 
         for policy in &policies {
             let sandbox = bubblewrap_sandbox_for_launch(&status, Some(policy), None)
                 .expect("working client bus sandbox")
                 .expect("sandbox");
             assert!(sandbox.args.windows(3).any(|window| {
-                window[0] == "--bind" && window[1] == client && window[2] == client
+                window[0] == "--bind"
+                    && resolves_to_client(&window[1])
+                    && resolves_to_client(&window[2])
             }));
             assert!(!sandbox.args.windows(3).any(|window| {
                 matches!(window[0].as_str(), "--bind" | "--ro-bind")
-                    && (window[1] == control || window[2] == control)
+                    && (controls.contains(&window[1]) || controls.contains(&window[2]))
             }));
         }
 
@@ -714,7 +726,11 @@ mod tests {
         let sandbox = bubblewrap_sandbox_for_launch(&x11, Some(&policy), None)
             .expect("X11 sandbox after native crash")
             .expect("network sandbox");
-        let client_bus = client_bus.display().to_string();
+        let client_bus = fs::canonicalize(&runtime)
+            .expect("canonical runtime")
+            .join("client-bus")
+            .display()
+            .to_string();
         assert!(!sandbox.args.windows(3).any(|window| {
             matches!(window[0].as_str(), "--bind" | "--ro-bind")
                 && (window[1] == client_bus || window[2] == client_bus)
