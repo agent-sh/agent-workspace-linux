@@ -34,12 +34,31 @@ pub(crate) struct X11Session {
 }
 
 impl X11Session {
-    pub(crate) fn start(options: &DaemonOptions) -> Result<Self> {
+    pub(crate) fn start(options: &mut DaemonOptions) -> Result<Self> {
         let mut session = Self {
-            x_server: Some(spawn_xvfb(options)?),
+            x_server: None,
             window_manager: None,
         };
-        wait_for_display(&options.display, &options.xauthority_path)?;
+        // The display is picked before the daemon starts, so a concurrent start
+        // can take it first. Our Xvfb then exits; move to the next free display
+        // with a fresh cookie. The display range bounds the retries.
+        loop {
+            let mut x_server = spawn_xvfb(options)?;
+            match wait_for_display(&mut x_server, &options.display, &options.xauthority_path)? {
+                DisplayWait::Ready => {
+                    session.x_server = Some(x_server);
+                    break;
+                }
+                DisplayWait::TakenByAnotherServer => {
+                    let _ = x_server.wait();
+                    options.display = crate::workspace::pick_display()?;
+                    crate::workspace::create_xauthority(
+                        &options.display,
+                        &options.xauthority_path,
+                    )?;
+                }
+            }
+        }
         session.window_manager = if options.session.backend == crate::session::SessionBackend::I3 {
             Some(super::i3::spawn(options)?)
         } else {
@@ -166,9 +185,20 @@ fn spawn_window_manager(options: &DaemonOptions) -> Result<Option<Child>> {
     Ok(Some(child))
 }
 
-fn wait_for_display(display: &str, xauthority: &Path) -> Result<()> {
+enum DisplayWait {
+    Ready,
+    TakenByAnotherServer,
+}
+
+fn wait_for_display(x_server: &mut Child, display: &str, xauthority: &Path) -> Result<DisplayWait> {
     let deadline = Instant::now() + Duration::from_secs(5);
     while Instant::now() < deadline {
+        if let Some(status) = x_server.try_wait()? {
+            if display_held_by_other_server(display, x_server.id()) {
+                return Ok(DisplayWait::TakenByAnotherServer);
+            }
+            bail!("Xvfb exited on display {display} with {status}");
+        }
         let ok = Command::new("xdpyinfo")
             .arg("-display")
             .arg(display)
@@ -179,11 +209,25 @@ fn wait_for_display(display: &str, xauthority: &Path) -> Result<()> {
             .map(|status| status.success())
             .unwrap_or(false);
         if ok {
-            return Ok(());
+            return Ok(DisplayWait::Ready);
         }
         thread::sleep(Duration::from_millis(100));
     }
     bail!("timed out waiting for X display {display}")
+}
+
+/// True when the display's X lock names a live server other than ours.
+fn display_held_by_other_server(display: &str, ours: u32) -> bool {
+    let Some(number) = display
+        .strip_prefix(':')
+        .and_then(|n| n.parse::<u32>().ok())
+    else {
+        return false;
+    };
+    std::fs::read_to_string(format!("/tmp/.X{number}-lock"))
+        .ok()
+        .and_then(|text| text.trim().parse::<u32>().ok())
+        .is_some_and(|pid| pid != ours && Path::new(&format!("/proc/{pid}")).exists())
 }
 
 #[cfg(test)]

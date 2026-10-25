@@ -8804,7 +8804,7 @@ fn wait_for_socket_removed(socket_path: &Path, timeout: Duration) -> Result<()> 
     );
 }
 
-fn pick_display() -> Result<String> {
+pub(crate) fn pick_display() -> Result<String> {
     for number in DISPLAY_RANGE {
         let display = format!(":{number}");
         let socket = PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
