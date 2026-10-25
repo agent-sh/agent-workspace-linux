@@ -1748,14 +1748,18 @@ fn cleanup_stale_workspace_processes(
 /// within the same grace period they get to exit.
 fn remove_stale_runtime(runtime_dir: &Path) -> io::Result<()> {
     let deadline = Instant::now() + Duration::from_millis(APP_TERMINATE_GRACE_MS);
+    let mut retried = false;
     loop {
         match fs::remove_dir_all(runtime_dir) {
             Err(error)
                 if error.kind() == io::ErrorKind::DirectoryNotEmpty
                     && Instant::now() < deadline =>
             {
+                retried = true;
                 thread::sleep(Duration::from_millis(50));
             }
+            // Gone between retries: removed is what was asked for.
+            Err(error) if retried && error.kind() == io::ErrorKind::NotFound => return Ok(()),
             result => return result,
         }
     }
