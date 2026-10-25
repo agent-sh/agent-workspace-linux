@@ -1,3 +1,5 @@
+#[path = "gnome_text.rs"]
+mod text_input;
 use super::{resolve_screenshot_path, resolve_window_screenshot_path, DesktopControl};
 use crate::workspace::{
     validate_click_options, validate_clipboard_text, validate_scroll_options,
@@ -297,9 +299,19 @@ impl DesktopControl for GnomeDesktopControl<'_> {
     fn type_text(&self, text: &str) -> Result<()> {
         let result = self.call(json!({"op":"text","text":text}))?;
         if result["x11"] == true {
-            // XWayland clients lack Wayland text-input focus. Xdotool remaps
-            // Unicode keysyms on this compositor's private X server only.
-            super::x11::X11DesktopControl::new(self.status).type_text(text)?;
+            let window: WorkspaceWindow = serde_json::from_value(result["window"].clone())?;
+            if window.wm_class.as_deref().is_some_and(|name| {
+                name.eq_ignore_ascii_case("xterm") || name.eq_ignore_ascii_case("uxterm")
+            }) {
+                // Xterm's defined Shift+Insert binding reads PRIMARY. Keep the
+                // ordinary CLIPBOARD untouched; PRIMARY retains the typed text
+                // so asynchronous selection reads cannot race restoration.
+                self.call(json!({"op":"primary-set","text":text}))?;
+                self.key("shift+Insert")?;
+            } else {
+                let pid = window.pid.context("legacy client PID missing")?;
+                text_input::insert(self.status, &window.id, pid, text)?;
+            }
         }
         Ok(())
     }

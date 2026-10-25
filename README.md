@@ -152,7 +152,7 @@ an error instead of signaling an unrelated process.
 ### Native GNOME sessions
 
 `--session gnome` starts GNOME Shell and Mutter with a private headless output.
-GNOME Shell 50 or 51, matching Mutter libraries, `Xwayland`, `xdotool`, `dbus-daemon`,
+GNOME Shell 50 or 51, matching Mutter libraries, `Xwayland`, `dbus-daemon`,
 `gsettings`, `bubblewrap`, and `timeout` are required. `doctor` reports GNOME readiness
 separately. Software rendering works without a GPU or parent compositor.
 
@@ -166,6 +166,12 @@ Mutter validates scale against the chosen physical output mode. For example,
 1200x900 supports 150%; 960x720 does not. Unsupported combinations fail at
 startup. Geometry, input and screenshots use physical pixels throughout.
 GTK clients may use a larger integer buffer scale on fractional outputs.
+Native Unicode text requires a focused Wayland text-input field. Legacy GTK
+and Qt editable fields use the private accessibility bus, with client PID,
+focus, caret, selection and text readback checks. Xterm uses its PRIMARY
+selection and Shift+Insert binding. That replaces the workspace PRIMARY
+selection but preserves the ordinary CLIPBOARD. Unsupported legacy fields
+return an error instead of reporting dropped Unicode characters as typed.
 
 The session has a private session bus, accessibility bus and empty system bus.
 A bundled Shell extension exposes fixed native controls only to the workspace

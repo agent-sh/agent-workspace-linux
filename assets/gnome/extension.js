@@ -88,7 +88,7 @@ export default class Workspace extends Extension {
             const window = global.display.focus_window;
             if (!window) throw new Error('No focused window for text input');
             if (window.get_client_type() === Meta.WindowClientType.X11)
-                return {x11: true};
+                return {x11: true, window: this._describe(window)};
             for (const part of q.text.split(/([\n\r\t])/)) {
                 if (!part) continue;
                 if (/^[\n\r\t]$/.test(part)) {
@@ -105,6 +105,7 @@ export default class Workspace extends Extension {
             await delay();
             return {x11: false};
         }
+        case 'primary-set': St.Clipboard.get_default().set_text(St.ClipboardType.PRIMARY,q.text); break;
         case 'clipboard-set': St.Clipboard.get_default().set_text(St.ClipboardType.CLIPBOARD,q.text); break;
         case 'clipboard-get': return await new Promise(resolve => St.Clipboard.get_default().get_text(St.ClipboardType.CLIPBOARD, (_c,text) => resolve(text ?? '')));
         case 'screenshot': {

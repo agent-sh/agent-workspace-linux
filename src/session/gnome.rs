@@ -15,7 +15,6 @@ pub(crate) fn blockers() -> Vec<String> {
     let mut blockers: Vec<String> = [
         "gnome-shell",
         "Xwayland",
-        "xdotool",
         "bwrap",
         "dbus-daemon",
         "gsettings",
