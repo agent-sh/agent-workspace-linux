@@ -8947,13 +8947,18 @@ fn remove_dead_x11_display_artifacts(number: u32, socket: &Path, lock: &Path) ->
     if process_exists(pid) {
         return Ok(false);
     }
-    if socket.exists() {
-        fs::remove_file(socket)
-            .with_context(|| format!("failed to remove stale X11 socket {}", socket.display()))?;
-    }
-    if lock.exists() {
-        fs::remove_file(lock)
-            .with_context(|| format!("failed to remove stale X11 lock {}", lock.display()))?;
+    // Concurrent starts may find the same stale artifacts; already gone is
+    // the result we want.
+    for (path, what) in [(socket, "socket"), (lock, "lock")] {
+        match fs::remove_file(path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!("failed to remove stale X11 {what} {}", path.display())
+                })
+            }
+        }
     }
     eprintln!("removed stale X11 display artifacts for :{number} with dead pid {pid}");
     Ok(true)

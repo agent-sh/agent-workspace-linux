@@ -203,6 +203,11 @@ fn wait_for_display(x_server: &mut Child, display: &str, xauthority: &Path) -> R
             }
             bail!("Xvfb exited on display {display} with {status}");
         }
+        // Xvfb may keep retrying a contested lock instead of exiting.
+        if display_held_by_other_server(display, x_server.id()) {
+            let _ = x_server.kill();
+            return Ok(DisplayWait::TakenByAnotherServer);
+        }
         let ok = Command::new("xdpyinfo")
             .arg("-display")
             .arg(display)
