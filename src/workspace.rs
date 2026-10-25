@@ -136,6 +136,8 @@ pub struct DoctorReport {
     pub ready_for_hyprland_workspace: bool,
     pub hyprland_blockers: Vec<String>,
     pub kwin_blockers: Vec<String>,
+    pub ready_for_cosmic_workspace: bool,
+    pub cosmic_blockers: Vec<String>,
     pub ready_for_host_viewer: bool,
     pub blockers: Vec<String>,
     pub viewer_blockers: Vec<String>,
@@ -1194,6 +1196,7 @@ pub fn doctor_report() -> DoctorReport {
     let kwin_blockers = crate::session::kwin::blockers();
     let i3_blockers = crate::session::i3::blockers();
     let hyprland_blockers = crate::session::hyprland::blockers();
+    let cosmic_blockers = crate::session::cosmic::blockers();
     DoctorReport {
         ready_for_i3_workspace: i3_blockers.is_empty(),
         i3_blockers,
@@ -1201,6 +1204,8 @@ pub fn doctor_report() -> DoctorReport {
         gnome_blockers,
         ready_for_hyprland_workspace: hyprland_blockers.is_empty(),
         hyprland_blockers,
+        ready_for_cosmic_workspace: cosmic_blockers.is_empty(),
+        cosmic_blockers,
         ready_for_kwin_workspace: kwin_blockers.is_empty(),
         kwin_blockers,
         runtime,

@@ -15,6 +15,7 @@ ROOT=Path(tempfile.mkdtemp(prefix="ari-",dir=Path.home()/".cache"))
 ENV=dict(os.environ,XDG_RUNTIME_DIR=str(ROOT/"r"),XDG_CONFIG_HOME=str(ROOT/"c"))
 (ROOT/"r").mkdir(mode=0o700)
 (ROOT/"project").mkdir()
+BACKEND=os.environ.get("AWL_TEST_SESSION","x11")
 sequence=0
 
 def cmd(*args):
@@ -31,13 +32,15 @@ mcp=Mcp(BIN,ROOT/"mcp.log",env=ENV,headless=True)
 try:
     for mounted in (False,True):
         id="mounts" if mounted else "network"
-        p={"id":id,"session":{"backend":os.environ.get("AWL_TEST_SESSION","x11")},"network":{"mode":"disabled"},"require_enforced_policy":True}
+        p={"id":id,"session":{"backend":BACKEND},"network":{"mode":"disabled"},"require_enforced_policy":True}
         if mounted:
             p.update(cwd="/workspace/project",mounts=[{"host_path":str(ROOT/"project"),"workspace_path":"/workspace/project","mode":"read_write"}])
         profile=ROOT/f"{id}.profile.json";profile.write_text(json.dumps(p))
         cmd("profile","import","--json",profile)
         status=cmd("workspace","start","--id",id,"--profile",id,"--ack-hidden-workspace")["status"]
-        sibling=cmd("workspace","start","--id",f"{id}-sibling","--ack-hidden-workspace")["status"]
+        # The sibling uses the same backend, so hosts and probe containers that
+        # provide only that backend can run this check.
+        sibling=cmd("workspace","start","--id",f"{id}-sibling","--session",BACKEND,"--ack-hidden-workspace")["status"]
         try:
             probe="""import os,sys,json,socket
 from pathlib import Path

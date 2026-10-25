@@ -1,3 +1,4 @@
+pub(crate) mod cosmic;
 pub(crate) mod gnome;
 pub(crate) mod hyprland;
 pub(crate) mod i3;
@@ -27,6 +28,10 @@ impl SessionSpec {
 
     pub fn describe_policy(self, policy: &mut crate::policy::AppliedWorkspacePolicy) {
         let (backend, detail) = match self.backend {
+            SessionBackend::Cosmic => (
+                "cosmic_wayland_runtime",
+                "workspace apps use a private native COSMIC display and session bus",
+            ),
             SessionBackend::Gnome => (
                 "gnome_wayland_runtime",
                 "workspace apps use a private GNOME Wayland display and session bus",
@@ -55,7 +60,9 @@ impl SessionSpec {
         self.backend == other.backend
             && (self.scale - other.scale).abs()
                 <= match self.backend {
-                    SessionBackend::Kwin | SessionBackend::Hyprland => 0.5 / 256.0,
+                    SessionBackend::Kwin | SessionBackend::Hyprland | SessionBackend::Cosmic => {
+                        0.5 / 256.0
+                    }
                     // Mutter exposes monitor scale as a single-precision float.
                     SessionBackend::Gnome => 1e-6,
                     SessionBackend::X11 | SessionBackend::I3 => 0.0,
@@ -78,6 +85,7 @@ impl SessionSpec {
             SessionBackend::Gnome => gnome::blockers(),
             SessionBackend::Hyprland => hyprland::blockers(),
             SessionBackend::I3 => i3::blockers(),
+            SessionBackend::Cosmic => cosmic::blockers(),
         }
     }
 
@@ -91,6 +99,7 @@ impl SessionSpec {
                 hyprland::HyprlandSession::start(options).map(Session::Hyprland)
             }
             SessionBackend::I3 => x11::X11Session::start(options).map(Session::X11),
+            SessionBackend::Cosmic => cosmic::CosmicSession::start(options).map(Session::Cosmic),
         }
     }
 
@@ -109,6 +118,9 @@ impl SessionSpec {
             SessionBackend::Hyprland => Box::new(
                 crate::desktop::hyprland::HyprlandDesktopControl::new(status),
             ),
+            SessionBackend::Cosmic => {
+                Box::new(crate::desktop::cosmic::CosmicDesktopControl::new(status))
+            }
         }
     }
 
@@ -132,6 +144,9 @@ impl SessionSpec {
             SessionBackend::Kwin => {
                 kwin::configure_process_environment(command, runtime_dir, display, xauthority)
             }
+            SessionBackend::Cosmic => {
+                cosmic::configure_process_environment(command, runtime_dir, display, xauthority)
+            }
         }
     }
 
@@ -152,13 +167,19 @@ impl SessionSpec {
             SessionBackend::Hyprland => {
                 hyprland::sandbox_resources(runtime_dir, xauthority_path, display)
             }
+            SessionBackend::Cosmic => {
+                cosmic::sandbox_resources(runtime_dir, xauthority_path, display)
+            }
         }
     }
 
     pub(crate) fn chrome_ozone_platform(self) -> &'static str {
         match self.backend {
             SessionBackend::X11 | SessionBackend::I3 => x11::CHROME_OZONE_PLATFORM,
-            SessionBackend::Kwin | SessionBackend::Gnome | SessionBackend::Hyprland => "wayland",
+            SessionBackend::Kwin
+            | SessionBackend::Gnome
+            | SessionBackend::Hyprland
+            | SessionBackend::Cosmic => "wayland",
         }
     }
 
@@ -184,6 +205,9 @@ impl SessionSpec {
             }
             SessionBackend::Kwin => {
                 kwin::cleanup_stale_processes(window_manager_pid, dry_run, actions)
+            }
+            SessionBackend::Cosmic => {
+                cosmic::cleanup_stale_processes(window_manager_pid, dry_run, actions)
             }
         }
     }
@@ -224,11 +248,15 @@ pub enum SessionBackend {
     Gnome,
     Hyprland,
     I3,
+    Cosmic,
 }
 
 impl SessionBackend {
     pub(crate) fn requires_client_application_bus(self) -> bool {
-        matches!(self, Self::Kwin | Self::Gnome | Self::Hyprland)
+        matches!(
+            self,
+            Self::Kwin | Self::Gnome | Self::Hyprland | Self::Cosmic
+        )
     }
 
     fn as_str(self) -> &'static str {
@@ -238,6 +266,7 @@ impl SessionBackend {
             Self::Gnome => "gnome",
             Self::Hyprland => "hyprland",
             Self::I3 => "i3",
+            Self::Cosmic => "cosmic",
         }
     }
 }
@@ -252,8 +281,9 @@ impl FromStr for SessionBackend {
             "gnome" => Ok(Self::Gnome),
             "hyprland" => Ok(Self::Hyprland),
             "i3" => Ok(Self::I3),
+            "cosmic" => Ok(Self::Cosmic),
             _ => bail!(
-                "session backend must be x11 (Xvfb with Openbox), i3 (Xvfb with i3), kwin, gnome or hyprland (native Wayland)"
+                "session backend must be x11 (Xvfb with Openbox), i3 (Xvfb with i3), kwin, gnome, hyprland or cosmic (native Wayland)"
             ),
         }
     }
@@ -268,12 +298,13 @@ pub(crate) enum Session {
     Kwin(kwin::KwinSession),
     Gnome(gnome::GnomeSession),
     Hyprland(hyprland::HyprlandSession),
+    Cosmic(cosmic::CosmicSession),
 }
 impl Session {
     pub fn x_server_pid(&self) -> u32 {
         match self {
             Self::X11(s) => s.x_server_pid(),
-            Self::Kwin(_) | Self::Gnome(_) | Self::Hyprland(_) => 0,
+            Self::Kwin(_) | Self::Gnome(_) | Self::Hyprland(_) | Self::Cosmic(_) => 0,
         }
     }
     pub fn window_manager_pid(&self) -> Option<u32> {
@@ -282,6 +313,7 @@ impl Session {
             Self::Kwin(s) => s.pid(),
             Self::Gnome(s) => s.pid(),
             Self::Hyprland(s) => s.pid(),
+            Self::Cosmic(s) => s.pid(),
         }
     }
     pub fn shutdown(&mut self) {
@@ -290,6 +322,7 @@ impl Session {
             Self::Kwin(s) => s.shutdown(),
             Self::Gnome(s) => s.shutdown(),
             Self::Hyprland(s) => s.shutdown(),
+            Self::Cosmic(s) => s.shutdown(),
         }
     }
 }

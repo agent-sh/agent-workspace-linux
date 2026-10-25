@@ -869,6 +869,11 @@ mod tests {
     }
 
     #[test]
+    fn cosmic_environment_uses_client_bus_even_when_socket_is_missing() {
+        assert_environment_uses_client_bus(crate::session::SessionBackend::Cosmic);
+    }
+
+    #[test]
     fn kwin_sandboxes_reject_missing_client_bus() {
         assert_sandboxes_reject_missing_client_bus(crate::session::SessionBackend::Kwin);
     }
@@ -884,6 +889,11 @@ mod tests {
     }
 
     #[test]
+    fn cosmic_sandboxes_reject_missing_client_bus() {
+        assert_sandboxes_reject_missing_client_bus(crate::session::SessionBackend::Cosmic);
+    }
+
+    #[test]
     fn kwin_sandboxes_bind_client_bus_not_control_bus() {
         assert_sandboxes_bind_client_bus(crate::session::SessionBackend::Kwin);
     }
@@ -896,6 +906,11 @@ mod tests {
     #[test]
     fn hyprland_sandboxes_bind_client_bus_not_control_bus() {
         assert_sandboxes_bind_client_bus(crate::session::SessionBackend::Hyprland);
+    }
+
+    #[test]
+    fn cosmic_sandboxes_bind_client_bus_not_control_bus() {
+        assert_sandboxes_bind_client_bus(crate::session::SessionBackend::Cosmic);
     }
 
     #[test]

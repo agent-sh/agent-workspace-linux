@@ -102,23 +102,27 @@ schemas for later phases until the plan reaches them.
 6. Stop: use `workspace_stop` when finished; use `workspace_cleanup_stale` for
    orphaned runtimes.
 
-Session selection supports X11 (`Xvfb` + Openbox), i3 on private Xvfb, native
-KWin Wayland, and Hyprland. MCP callers can pass
-`session: {"backend":"kwin", "scale":1.5}` or
-`session: {"backend":"hyprland", "scale":1.5}` for native 150% output scaling.
-Explicit MCP input overrides the profile session; omitting both keeps the
-pinned X11 default. CLI start/open-profile accepts `--session kwin --scale 1.5`
-or `--session hyprland --scale 1.5`. KWin needs version 6.6 or newer,
-kwin-common, kscreen-doctor, wl-clipboard, and an accessible DRM render node.
-It runs directly, without a parent Xvfb, and is not a full Plasma shell.
-Hyprland uses a private KWin renderer and supports fractional output scales;
-see [the Hyprland backend guide](../../docs/hyprland.md) for dependencies and
-its acceptance probe. Pointer and window coordinates use screenshot pixels on
-every backend.
+Session selection supports X11 (`Xvfb` + Openbox), i3 on private Xvfb, and
+native Wayland sessions on KWin, GNOME, Hyprland and COSMIC. MCP callers pass
+`session: {"backend":"<name>"}` with one of `x11`, `kwin`, `gnome`, `i3`,
+`hyprland` or `cosmic`, and may add `"scale":1.5` on the native Wayland
+backends for 150% output scaling. CLI start/open-profile accepts the same
+names with `--session NAME --scale 1.5`. Explicit MCP input overrides the
+profile session; omitting both keeps the pinned X11 default.
+KWin needs version 6.6 or newer, kwin-common, kscreen-doctor, wl-clipboard,
+and an accessible DRM render node. It runs directly, without a parent Xvfb, and
+is not a full Plasma shell. GNOME runs GNOME Shell 50 or 51 with a private
+headless output and software rendering; Mutter accepts only scales the chosen
+output mode supports. Hyprland uses a private KWin renderer and supports
+fractional output scales; see [the Hyprland backend guide](../../docs/hyprland.md).
+COSMIC runs `cosmic-comp` under a software-only private Weston parent; see
+[COSMIC setup and isolation](../../docs/native-cosmic.md) for its compositor and
+XWayland dependencies.
 Select i3 with `session: {"backend":"i3"}` or `--session i3`. It uses scale 1,
 needs `i3-wm` and the X11 dependencies including ImageMagick `import`, and has
 no launcher bindings or startup commands. Move and resize float the target window.
 Minimize uses the scratchpad; show restores the window to the current workspace.
+Pointer and window coordinates use screenshot pixels on every backend.
 Unsupported session names are rejected.
 
 Skip unless: each step's precondition is visible in the previous tool result

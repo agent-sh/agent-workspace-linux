@@ -12,6 +12,7 @@ pub struct AgentModeSummary {
     pub ready_for_gnome_workspace: bool,
     pub ready_for_i3_workspace: bool,
     pub ready_for_hyprland_workspace: bool,
+    pub ready_for_cosmic_workspace: bool,
     pub ready_for_host_viewer: bool,
     pub viewer_available: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -55,17 +56,23 @@ mod tests {
     fn agent_mode_summary_exposes_native_backend_readiness() {
         let schema = serde_json::to_value(schemars::schema_for!(AgentModeSummary))
             .expect("agent mode schema should serialize");
-        for field in ["ready_for_i3_workspace", "ready_for_hyprland_workspace"] {
+        for field in [
+            "ready_for_i3_workspace",
+            "ready_for_hyprland_workspace",
+            "ready_for_cosmic_workspace",
+        ] {
             assert!(schema["properties"].get(field).is_some(), "{field}");
         }
 
         let response = serde_json::to_value(AgentModeSummary {
             ready_for_i3_workspace: true,
             ready_for_hyprland_workspace: true,
+            ready_for_cosmic_workspace: true,
             ..AgentModeSummary::default()
         })
         .expect("agent mode response should serialize");
         assert_eq!(response["ready_for_i3_workspace"], true);
         assert_eq!(response["ready_for_hyprland_workspace"], true);
+        assert_eq!(response["ready_for_cosmic_workspace"], true);
     }
 }

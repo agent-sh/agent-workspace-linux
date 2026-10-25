@@ -100,7 +100,8 @@ agent-workspace-linux workspace stop
 ```
 
 `workspace start` and `workspace open-profile` accept `--session x11`,
-`--session kwin`, `--session gnome`, `--session i3`, or `--session hyprland`.
+`--session kwin`, `--session gnome`, `--session i3`, `--session hyprland`, or
+`--session cosmic`.
 MCP and saved profiles use the same backend names, for example
 `"session": {"backend":"hyprland"}`. Explicit CLI/MCP input overrides the
 profile. Omitting both keeps the pinned Xvfb + Openbox default
@@ -118,13 +119,19 @@ with native toplevel capture and authenticated XWayland. See
 [the Hyprland backend guide](docs/hyprland.md) for dependencies and its isolated
 acceptance probe.
 
-Use `--session kwin --scale 1.5` or `--session hyprland --scale 1.5` for a 150%
-output, or set `"scale":1.5` in the corresponding profile or MCP `session`
-object. On KWin and Hyprland, width, height, window geometry and pointer
-coordinates stay in screenshot pixels. The KWin adapter converts between these
+COSMIC sessions run a private native `cosmic-comp` under a software-only Weston
+headless parent. No host display, input device or GPU is used. COSMIC supports
+fractional output scaling and authenticated XWayland clients. See
+[COSMIC setup and isolation](docs/native-cosmic.md) for dependencies, its private
+launcher restrictions and its isolated acceptance probe.
+
+Use `--scale 1.5` with `--session kwin`, `gnome`, `hyprland` or `cosmic` for a
+150% output, or set `"scale":1.5` in the corresponding profile or MCP `session`
+object. On the native Wayland backends, width, height, window geometry and
+pointer coordinates stay in screenshot pixels. The KWin adapter converts between these
 pixels and KWin's logical coordinates. KWin aligns output sizes to logical
-pixels; status reports the effective size. Hyprland uses physical pixels,
-including at fractional output scales. Apps use native Wayland by default;
+pixels; status reports the effective size. GNOME, Hyprland and COSMIC use physical
+pixels, including at fractional output scales. Apps use native Wayland by default;
 rootless XWayland remains available for legacy clients. The existing viewer,
 IPC, permission ceiling and explicit Chrome profile import rules apply to every
 backend.
