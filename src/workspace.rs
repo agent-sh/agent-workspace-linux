@@ -8584,15 +8584,27 @@ fn daemon_socket_ready(socket_path: &Path) -> Result<bool> {
         return Ok(true);
     }
     if let Some(parent) = socket_path.parent() {
-        if let Ok(error) = fs::read_to_string(parent.join("daemon.err.log")) {
-            // `Error:` is a reported failure; a panic can happen before the
-            // daemon records its pid, so catch it here instead of at the guard.
-            if error.starts_with("Error:") || error.contains("panicked at") {
+        if let Ok(log) = fs::read_to_string(parent.join("daemon.err.log")) {
+            if let Some(error) = startup_failure(&log) {
                 bail!("workspace startup failed: {}", error.trim());
             }
         }
     }
     Ok(false)
+}
+
+/// The startup failure a daemon log reports, from its first `Error:` line.
+/// A panic can happen before the daemon records its pid, so it counts too.
+/// Lines before them are the daemon's notes, such as a service it skipped.
+fn startup_failure(log: &str) -> Option<&str> {
+    let mut offset = 0;
+    for line in log.split_inclusive('\n') {
+        if line.starts_with("Error:") || line.contains("panicked at") {
+            return Some(&log[offset..]);
+        }
+        offset += line.len();
+    }
+    None
 }
 
 fn wait_for_socket_removed(socket_path: &Path, timeout: Duration) -> Result<()> {
@@ -9250,6 +9262,18 @@ fn unix_now_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 2026-10-26: a note before the error hid GNOME's scale message.
+    #[test]
+    fn a_startup_failure_after_daemon_notes_is_reported() {
+        let log = "agent workspace: no user session bus found; the keyring is not relayed\nError: GNOME monitor does not support scale 1.5\n";
+        assert_eq!(
+            startup_failure(log).map(str::trim),
+            Some("Error: GNOME monitor does not support scale 1.5")
+        );
+        assert_eq!(startup_failure("agent workspace: note\n"), None);
+        assert!(startup_failure("thread 'main' panicked at src/x.rs:1\n").is_some());
+    }
 
     #[test]
     fn observe_screenshot_reuses_stable_default_frame() {
