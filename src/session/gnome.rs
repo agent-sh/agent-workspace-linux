@@ -11,9 +11,8 @@ use std::{
 
 pub(crate) const WAYLAND_SOCKET: &str = "workspace-wayland";
 
-/// Apps get the client bus; only the daemon and compositor use this control
-/// bus. Same-user code that reaches its socket must still not get capture,
-/// remote input, privileged Wayland or Shell control. The daemon itself uses
+/// The workspace session bus. Apps on it do not get capture, remote input,
+/// privileged Wayland or Shell control; those stay with the daemon. The daemon itself uses
 /// only org.gnome.Mutter.DisplayConfig and org.agent_sh.Workspace.Gnome.
 const CONTROL_BUS_POLICY: &str = r#"<deny send_interface="org.gnome.Shell"/>
 <deny send_interface="org.gnome.Shell.Extensions"/>
@@ -128,14 +127,6 @@ pub(crate) fn configure_process_environment(
     if let Ok(address) = fs::read_to_string(runtime.join("atspi-address")) {
         command.env("AT_SPI_BUS_ADDRESS", address.trim());
     }
-}
-
-pub(crate) fn sandbox_resources(
-    runtime: &Path,
-    xauthority: &Path,
-    display: &str,
-) -> crate::launch::SessionSandboxResources {
-    super::kwin::sandbox_resources(runtime, xauthority, display)
 }
 
 pub(crate) struct GnomeSession {

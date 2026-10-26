@@ -1,7 +1,5 @@
-use crate::approval::{unenforced_policy_acknowledgement, ApprovalBundle};
+use crate::approval::ApprovalBundle;
 use crate::launch::merged_env;
-use crate::policy::{AppliedWorkspacePolicy, NetworkMode};
-pub use crate::policy::{MountMode, NetworkPolicy, ProfileMount};
 use crate::session::SessionSpec;
 use crate::workspace::{self, EnvVar, IpcResponse, LaunchSpec, WorkspaceStartOptions};
 use anyhow::{bail, Context, Result};
@@ -12,13 +10,6 @@ use std::{
     env, fs,
     path::{Component, Path, PathBuf},
 };
-
-const WORKSPACE_MOUNT_ROOT: &str = "/workspace";
-const PROJECT_WORKSPACE_PATH: &str = "/workspace/project";
-const WORKSPACE_CARGO_BIN_PATH: &str = "/workspace/rust/cargo-bin";
-const WORKSPACE_RUSTUP_HOME: &str = "/workspace/rust/rustup";
-const WORKSPACE_CARGO_HOME: &str = "/tmp/agent-workspace-cargo";
-const DEFAULT_WORKSPACE_PATH: &str = "/usr/local/bin:/usr/bin:/bin";
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct WorkspaceProfile {
@@ -36,15 +27,41 @@ pub struct WorkspaceProfile {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub env: Vec<EnvVar>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub mounts: Vec<ProfileMount>,
-    #[serde(default)]
-    pub network: NetworkPolicy,
-    #[serde(default)]
-    pub require_enforced_policy: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub setup_commands: Vec<ProfileSetupCommand>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub startup_apps: Vec<ProfileStartupApp>,
+    /// Sandbox fields of profiles written before 0.6.0, read so they can be
+    /// reported and dropped on the next save. Apps run as the user.
+    #[serde(flatten, skip_serializing)]
+    #[schemars(skip)]
+    pub legacy: LegacyProfileFields,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct LegacyProfileFields {
+    #[serde(default)]
+    mounts: Option<serde_json::Value>,
+    #[serde(default)]
+    network: Option<serde_json::Value>,
+    #[serde(default)]
+    require_enforced_policy: Option<serde_json::Value>,
+}
+
+impl LegacyProfileFields {
+    /// One warning per sandbox field the profile still carries.
+    pub fn warnings(&self) -> Vec<String> {
+        [
+            ("mounts", &self.mounts),
+            ("network", &self.network),
+            ("require_enforced_policy", &self.require_enforced_policy),
+        ]
+        .into_iter()
+        .filter(|(_, value)| value.is_some())
+        .map(|(field, _)| {
+            format!("profile field {field} is ignored: workspaces are not sandboxes, apps run as you with your files and network")
+        })
+        .collect()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -186,11 +203,7 @@ impl ProfilePutResult {
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct ProfileCheck {
     pub profile: WorkspaceProfile,
-    pub applied_policy: AppliedWorkspacePolicy,
     pub requires_hidden_workspace_ack: bool,
-    pub requires_unenforced_policy_ack: bool,
-    pub can_acknowledge_unenforced_policy: bool,
-    pub blocks_unenforced_policy: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
 }
@@ -270,7 +283,6 @@ pub struct ProfileSetupPreview {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout_ms: Option<u64>,
     pub command_count: usize,
-    pub all_launches_allowed_by_policy: bool,
     pub requires_running_daemon_for_launch_preview: bool,
     pub commands: Vec<ProfileLaunchPlan>,
     #[serde(default)]
@@ -287,7 +299,6 @@ pub struct ProfileStartupPreview {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_timeout_ms: Option<u64>,
     pub app_count: usize,
-    pub all_launches_allowed_by_policy: bool,
     pub requires_running_daemon_for_launch_preview: bool,
     pub apps: Vec<ProfileLaunchPlan>,
     #[serde(default)]
@@ -305,12 +316,6 @@ pub struct ProfileLaunchPlan {
     pub env: Vec<EnvVar>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
-    pub user_acknowledged_unenforced_policy: bool,
-    pub requires_unenforced_policy_ack: bool,
-    pub missing_unenforced_policy_ack: bool,
-    pub can_acknowledge_unenforced_policy: bool,
-    pub blocks_unenforced_policy: bool,
-    pub would_launch_after_start: bool,
     #[serde(default)]
     pub approval: ApprovalBundle,
 }
@@ -328,13 +333,11 @@ pub struct ProfileSetupOptions {
     pub wait: bool,
     pub timeout_ms: Option<u64>,
     pub kill_on_timeout: bool,
-    pub acknowledge_unenforced_policy: bool,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ProfileStartupOptions {
     pub dry_run: bool,
-    pub acknowledge_unenforced_policy: bool,
     pub wait_window: bool,
     pub window_timeout_ms: Option<u64>,
     pub screenshot_window: bool,
@@ -430,82 +433,56 @@ pub fn template_profile(
                 Some(path) => path,
                 None => env::current_dir().context("failed to resolve template host path")?,
             };
-            let rust_toolchain = project_dev_rust_toolchain();
-            let mut mounts = vec![ProfileMount {
-                host_path,
-                workspace_path: PathBuf::from(PROJECT_WORKSPACE_PATH),
-                mode: MountMode::ReadWrite,
-            }];
-            mounts.extend(rust_toolchain.mounts);
-            let mut description =
-                "Project QA profile with the selected project mounted read-write.".to_string();
-            if rust_toolchain.detected {
-                description.push_str(
-                    " Local Rust toolchain shims are mounted read-only without mounting Cargo credentials.",
-                );
-            }
             WorkspaceProfile {
                 id,
-                description: Some(description),
+                description: Some(format!(
+                    "Project QA profile: apps start in {}.",
+                    host_path.display()
+                )),
                 session: SessionSpec::default(),
                 width: None,
                 height: None,
-                cwd: Some(PathBuf::from(PROJECT_WORKSPACE_PATH)),
-                env: rust_toolchain.env,
-                mounts,
-                network: NetworkPolicy::default(),
-                require_enforced_policy: false,
+                cwd: Some(host_path),
+                env: Vec::new(),
                 setup_commands: Vec::new(),
                 startup_apps: Vec::new(),
+                legacy: LegacyProfileFields::default(),
             }
         }
-        "restricted-chrome"
+        // restricted-chrome and chrome-disabled-network are the names this
+        // template had before 0.6.0; Codex Desktop still asks for them.
+        "chrome"
+        | "restricted-chrome"
         | "restricted_chrome"
         | "chrome-disabled-network"
         | "chrome_disabled_network" => {
-            let id = id.unwrap_or_else(|| "restricted-chrome".to_string());
+            let id = id.unwrap_or_else(|| "chrome".to_string());
             let browser = browser_path
                 .map(|path| path.display().to_string())
                 .unwrap_or_else(|| "google-chrome".to_string());
             WorkspaceProfile {
                 id,
                 description: Some(
-                    "Chrome with workspace networking disabled. Uses --no-sandbox because Chrome's SUID sandbox may abort inside the bubblewrap network namespace; use an isolated browser profile and edit the browser path if needed. Exposes Chrome DevTools on an ephemeral loopback port for workspace-owned browser control.".to_string(),
+                    "Chrome with a fresh profile in /tmp/agent-workspace-chrome. Exposes Chrome DevTools on an ephemeral loopback port for workspace-owned browser control.".to_string(),
                 ),
                 session: SessionSpec::default(),
                 width: Some(1280),
                 height: Some(800),
                 cwd: Some(PathBuf::from("/tmp")),
                 env: Vec::new(),
-                mounts: Vec::new(),
-                network: NetworkPolicy {
-                    mode: NetworkMode::Disabled,
-                    allow_hosts: Vec::new(),
-                },
-                require_enforced_policy: true,
                 setup_commands: Vec::new(),
                 startup_apps: vec![ProfileStartupApp {
-                    name: Some("restricted-chrome-no-sandbox".to_string()),
-                    command: vec![
-                        browser,
-                        "--user-data-dir=/tmp/agent-workspace-chrome-restricted".to_string(),
-                        "--no-sandbox".to_string(),
-                        "--disable-dev-shm-usage".to_string(),
-                        "--remote-debugging-address=127.0.0.1".to_string(),
-                        "--remote-debugging-port=0".to_string(),
-                        "--no-first-run".to_string(),
-                        "--no-default-browser-check".to_string(),
-                        "--new-window".to_string(),
-                        "about:blank".to_string(),
-                    ],
+                    name: Some("chrome".to_string()),
+                    command: chrome_command(browser, "/tmp/agent-workspace-chrome"),
                     cwd: Some(PathBuf::from("/tmp")),
                     env: Vec::new(),
                 }],
+                legacy: LegacyProfileFields::default(),
             }
         }
         "browser-session" | "browser_session" | "authenticated-chrome" | "authenticated_chrome" => {
             let id = id.unwrap_or_else(|| "browser-session".to_string());
-            let host_path = user_data_dir
+            let user_data_dir = user_data_dir
                 .or(host_path)
                 .context("browser-session template requires --user-data-dir PATH")?;
             let browser = browser_path
@@ -513,114 +490,44 @@ pub fn template_profile(
                 .unwrap_or_else(|| "google-chrome".to_string());
             WorkspaceProfile {
                 id,
-                description: Some(
-                    "Browser session profile with the selected user-data directory mounted read-write. Use only with explicit user approval; close the host browser or point to a copied profile to avoid profile lock/corruption. Uses --no-sandbox because Chrome can abort inside the enforced bubblewrap mount namespace. Exposes Chrome DevTools on an ephemeral loopback port for workspace-owned browser control.".to_string(),
-                ),
+                description: Some(format!(
+                    "Chrome on the user-data directory {}, with its logins. Close the host browser or point to a copied profile first: Chrome opens one profile in one process. Exposes Chrome DevTools on an ephemeral loopback port for workspace-owned browser control.",
+                    user_data_dir.display()
+                )),
                 session: SessionSpec::default(),
                 width: Some(1280),
                 height: Some(800),
                 cwd: Some(PathBuf::from("/tmp")),
                 env: Vec::new(),
-                mounts: vec![ProfileMount {
-                    host_path,
-                    workspace_path: PathBuf::from("/workspace/browser-user-data"),
-                    mode: MountMode::ReadWrite,
-                }],
-                network: NetworkPolicy::default(),
-                require_enforced_policy: true,
                 setup_commands: Vec::new(),
                 startup_apps: vec![ProfileStartupApp {
-                    name: Some("browser-session-no-sandbox".to_string()),
-                    command: vec![
-                        browser,
-                        "--user-data-dir=/workspace/browser-user-data".to_string(),
-                        "--no-sandbox".to_string(),
-                        "--disable-dev-shm-usage".to_string(),
-                        "--remote-debugging-address=127.0.0.1".to_string(),
-                        "--remote-debugging-port=0".to_string(),
-                        "--no-first-run".to_string(),
-                        "--no-default-browser-check".to_string(),
-                        "--new-window".to_string(),
-                        "about:blank".to_string(),
-                    ],
+                    name: Some("browser-session".to_string()),
+                    command: chrome_command(browser, &user_data_dir.display().to_string()),
                     cwd: Some(PathBuf::from("/tmp")),
                     env: Vec::new(),
                 }],
+                legacy: LegacyProfileFields::default(),
             }
         }
         _ => bail!(
-            "unknown profile template {kind:?}. Expected: project-dev, restricted-chrome, or browser-session"
+            "unknown profile template {kind:?}. Expected: project-dev, chrome, or browser-session"
         ),
     };
     validate_profile(&profile)?;
     Ok(profile)
 }
 
-struct ProjectDevRustToolchain {
-    mounts: Vec<ProfileMount>,
-    env: Vec<EnvVar>,
-    detected: bool,
-}
-
-fn project_dev_rust_toolchain() -> ProjectDevRustToolchain {
-    let home = env::var_os("HOME").map(PathBuf::from);
-    let cargo_home = env::var_os("CARGO_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|path| path.join(".cargo")));
-    let rustup_home = env::var_os("RUSTUP_HOME")
-        .map(PathBuf::from)
-        .or_else(|| home.as_ref().map(|path| path.join(".rustup")));
-    project_dev_rust_toolchain_from_paths(
-        cargo_home.as_deref(),
-        rustup_home.as_deref(),
-        DEFAULT_WORKSPACE_PATH,
-    )
-}
-
-fn project_dev_rust_toolchain_from_paths(
-    cargo_home: Option<&Path>,
-    rustup_home: Option<&Path>,
-    base_path: &str,
-) -> ProjectDevRustToolchain {
-    let mut mounts = Vec::new();
-    let mut env = Vec::new();
-
-    if let Some(cargo_bin) = cargo_home
-        .map(|path| path.join("bin"))
-        .filter(|path| path.is_dir())
-    {
-        mounts.push(ProfileMount {
-            host_path: cargo_bin,
-            workspace_path: PathBuf::from(WORKSPACE_CARGO_BIN_PATH),
-            mode: MountMode::ReadOnly,
-        });
-        env.push(EnvVar {
-            name: "CARGO_HOME".to_string(),
-            value: WORKSPACE_CARGO_HOME.to_string(),
-        });
-        env.push(EnvVar {
-            name: "PATH".to_string(),
-            value: format!("{WORKSPACE_CARGO_BIN_PATH}:{base_path}"),
-        });
-    }
-
-    if let Some(rustup_home) = rustup_home.filter(|path| path.is_dir()) {
-        mounts.push(ProfileMount {
-            host_path: rustup_home.to_path_buf(),
-            workspace_path: PathBuf::from(WORKSPACE_RUSTUP_HOME),
-            mode: MountMode::ReadOnly,
-        });
-        env.push(EnvVar {
-            name: "RUSTUP_HOME".to_string(),
-            value: WORKSPACE_RUSTUP_HOME.to_string(),
-        });
-    }
-
-    ProjectDevRustToolchain {
-        detected: !mounts.is_empty(),
-        mounts,
-        env,
-    }
+fn chrome_command(browser: String, user_data_dir: &str) -> Vec<String> {
+    vec![
+        browser,
+        format!("--user-data-dir={user_data_dir}"),
+        "--remote-debugging-address=127.0.0.1".to_string(),
+        "--remote-debugging-port=0".to_string(),
+        "--no-first-run".to_string(),
+        "--no-default-browser-check".to_string(),
+        "--new-window".to_string(),
+        "about:blank".to_string(),
+    ]
 }
 
 pub fn check_profile(id: &str) -> Result<ProfileCheck> {
@@ -629,18 +536,10 @@ pub fn check_profile(id: &str) -> Result<ProfileCheck> {
 }
 
 fn check_workspace_profile(profile: WorkspaceProfile) -> ProfileCheck {
-    let applied_policy = applied_policy(&profile);
-    let can_acknowledge_unenforced_policy = applied_policy.can_acknowledge_unenforced_policy();
-    let blocks_unenforced_policy = applied_policy.blocks_requested_unenforced_policy();
-    let requires_unenforced_policy_ack = can_acknowledge_unenforced_policy;
-    let warnings = policy_warnings(&applied_policy);
+    let warnings = profile.legacy.warnings();
     ProfileCheck {
         profile,
-        applied_policy,
         requires_hidden_workspace_ack: true,
-        requires_unenforced_policy_ack,
-        can_acknowledge_unenforced_policy,
-        blocks_unenforced_policy,
         warnings,
     }
 }
@@ -765,8 +664,6 @@ pub fn validate_profile(profile: &WorkspaceProfile) -> Result<()> {
     }
     validate_optional_profile_cwd(&profile.cwd, "profile cwd")?;
     validate_env_vars(&profile.env, "profile env")?;
-    validate_mounts(&profile.mounts)?;
-    validate_network_policy(&profile.network)?;
     for setup in &profile.setup_commands {
         workspace::validate_optional_app_name(&setup.name)?;
         workspace::validate_command(&setup.command, "profile setup")?;
@@ -778,111 +675,6 @@ pub fn validate_profile(profile: &WorkspaceProfile) -> Result<()> {
         workspace::validate_command(&app.command, "profile startup app")?;
         validate_optional_profile_cwd(&app.cwd, "profile startup app cwd")?;
         validate_env_vars(&app.env, "profile startup app env")?;
-    }
-    Ok(())
-}
-
-fn validate_network_policy(network: &NetworkPolicy) -> Result<()> {
-    if matches!(network.mode, NetworkMode::LocalOnly) {
-        for host in &network.allow_hosts {
-            if !is_local_network_target(host) {
-                bail!(
-                    "local_only network profiles may only allow localhost or loopback targets, got {host:?}"
-                );
-            }
-        }
-    }
-    Ok(())
-}
-
-fn is_local_network_target(target: &str) -> bool {
-    let Some(host) = network_target_host(target) else {
-        return false;
-    };
-    host == "localhost" || host == "::1" || host.starts_with("127.")
-}
-
-fn network_target_host(target: &str) -> Option<String> {
-    let trimmed = target.trim();
-    if trimmed.is_empty() || trimmed.contains('\0') {
-        return None;
-    }
-    let without_scheme = trimmed
-        .split_once("://")
-        .map(|(_, rest)| rest)
-        .unwrap_or(trimmed);
-    let authority = without_scheme
-        .split(['/', '?', '#'])
-        .next()
-        .unwrap_or(without_scheme)
-        .trim();
-    if authority.is_empty() {
-        return None;
-    }
-    let host = if let Some(rest) = authority.strip_prefix('[') {
-        rest.split_once(']').map(|(host, _)| host).unwrap_or(rest)
-    } else if authority.matches(':').count() == 1 {
-        authority
-            .split_once(':')
-            .map(|(host, _)| host)
-            .unwrap_or(authority)
-    } else {
-        authority
-    };
-    let host = host.trim().trim_end_matches('.').to_ascii_lowercase();
-    (!host.is_empty()).then_some(host)
-}
-
-fn validate_mounts(mounts: &[ProfileMount]) -> Result<()> {
-    let mut workspace_paths: BTreeSet<PathBuf> = BTreeSet::new();
-    for mount in mounts {
-        validate_mount_path(&mount.host_path, "host_path")?;
-        validate_mount_path(&mount.workspace_path, "workspace_path")?;
-        if !mount.host_path.is_absolute() {
-            bail!(
-                "profile mount host_path {} must be absolute",
-                mount.host_path.display()
-            );
-        }
-        if !mount.workspace_path.starts_with(WORKSPACE_MOUNT_ROOT)
-            || mount.workspace_path == Path::new(WORKSPACE_MOUNT_ROOT)
-        {
-            bail!(
-                "profile mount workspace_path {} must be under {WORKSPACE_MOUNT_ROOT}/",
-                mount.workspace_path.display()
-            );
-        }
-        for existing in &workspace_paths {
-            if mount.workspace_path.starts_with(existing)
-                || existing.starts_with(&mount.workspace_path)
-            {
-                bail!(
-                    "profile mount workspace_path {} overlaps {}",
-                    mount.workspace_path.display(),
-                    existing.display()
-                );
-            }
-        }
-        workspace_paths.insert(mount.workspace_path.clone());
-    }
-    Ok(())
-}
-
-fn validate_mount_path(path: &Path, field: &str) -> Result<()> {
-    if path.as_os_str().is_empty() {
-        bail!("profile mount {field} cannot be empty");
-    }
-    if std::os::unix::ffi::OsStrExt::as_bytes(path.as_os_str()).contains(&0) {
-        bail!("profile mount {field} cannot contain a NUL byte");
-    }
-    if path
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        bail!(
-            "profile mount {field} {} cannot contain '..'",
-            path.display()
-        );
     }
     Ok(())
 }
@@ -915,7 +707,6 @@ pub fn apply_profile_to_start_options(
     let profile = get_profile(profile_id)?;
     options.profile_id = Some(profile.id.clone());
     options.session = profile.session;
-    options.applied_policy = Some(applied_policy(&profile));
     options.profile_cwd = profile.cwd.clone();
     options.profile_env = profile.env.clone();
     if !width_explicit {
@@ -931,30 +722,6 @@ pub fn apply_profile_to_start_options(
     Ok(profile)
 }
 
-pub fn applied_policy(profile: &WorkspaceProfile) -> AppliedWorkspacePolicy {
-    let mut policy = AppliedWorkspacePolicy::new_with_capabilities(
-        profile.id.clone(),
-        profile.mounts.clone(),
-        profile.network.clone(),
-        profile.require_enforced_policy,
-        profile.setup_commands.len(),
-        workspace::policy_runtime_capabilities(),
-    );
-    profile.session.describe_policy(&mut policy);
-    policy
-}
-
-fn policy_warnings(policy: &AppliedWorkspacePolicy) -> Vec<String> {
-    let mut warnings = Vec::new();
-    if policy.enforcement.mounts.requested && !policy.enforcement.mounts.enforced {
-        warnings.push(policy.enforcement.mounts.detail.clone());
-    }
-    if policy.enforcement.network.requested && !policy.enforcement.network.enforced {
-        warnings.push(policy.enforcement.network.detail.clone());
-    }
-    warnings
-}
-
 pub fn apply_profile_to_launch_spec(
     profile_id: &str,
     spec: &mut LaunchSpec,
@@ -962,7 +729,6 @@ pub fn apply_profile_to_launch_spec(
 ) -> Result<WorkspaceProfile> {
     let profile = get_profile(profile_id)?;
     spec.profile_id = Some(profile.id.clone());
-    spec.applied_policy = Some(applied_policy(&profile));
     if !cwd_explicit {
         if let Some(cwd) = profile.cwd.clone() {
             spec.cwd = Some(cwd);
@@ -986,8 +752,6 @@ pub fn setup_launch_specs(profile_id: &str) -> Result<Vec<LaunchSpec>> {
                 command: setup.command.clone(),
                 name: setup.name.clone(),
                 profile_id: Some(profile.id.clone()),
-                applied_policy: Some(applied_policy(&profile)),
-                user_acknowledged_unenforced_policy: false,
                 cwd: setup.cwd.clone().or_else(|| profile.cwd.clone()),
                 env: merged_env(profile.env.clone(), setup.env.clone()),
             })
@@ -1008,8 +772,6 @@ pub fn startup_app_launch_specs(profile_id: &str) -> Result<Vec<LaunchSpec>> {
                 command: app.command.clone(),
                 name: app.name.clone(),
                 profile_id: Some(profile.id.clone()),
-                applied_policy: Some(applied_policy(&profile)),
-                user_acknowledged_unenforced_policy: false,
                 cwd: app.cwd.clone().or_else(|| profile.cwd.clone()),
                 env: merged_env(profile.env.clone(), app.env.clone()),
             })
@@ -1043,21 +805,14 @@ pub fn preview_open_profile_workspace(
         &open_options.startup,
         open_options.run_setup,
     )?;
-    let launch_plan_allowed = setup
-        .as_ref()
-        .is_none_or(|setup| setup.all_launches_allowed_by_policy)
-        && startup.all_launches_allowed_by_policy;
-    let would_open = start_preview.ok_to_start && launch_plan_allowed;
+    let would_open = start_preview.ok_to_start;
     let message = if would_open {
         "profile workspace open dry run returned".to_string()
-    } else if !start_preview.ok_to_start {
+    } else {
         format!(
             "profile workspace open dry run blocked: {}",
             start_preview.message
         )
-    } else {
-        "profile workspace open dry run blocked: setup or startup declarations require acknowledgement or policy support"
-            .to_string()
     };
     let mut approval = ApprovalBundle::new(
         "workspace_open_profile",
@@ -1088,21 +843,13 @@ fn preview_profile_setup(
     options: &ProfileSetupOptions,
 ) -> Result<ProfileSetupPreview> {
     let wait = options.wait || options.timeout_ms.is_some() || options.kill_on_timeout;
-    let mut specs = setup_launch_specs(profile_id)?;
-    for spec in &mut specs {
-        spec.user_acknowledged_unenforced_policy = options.acknowledge_unenforced_policy;
-    }
-    let commands = specs
+    let commands = setup_launch_specs(profile_id)?
         .into_iter()
         .map(profile_launch_plan)
         .collect::<Vec<_>>();
-    let all_launches_allowed_by_policy = commands
-        .iter()
-        .all(|command| command.would_launch_after_start);
     let approval = profile_plan_approval_bundle(
         "profile_setup",
         format!("profile {profile_id} setup"),
-        all_launches_allowed_by_policy,
         &commands,
     );
 
@@ -1114,7 +861,6 @@ fn preview_profile_setup(
         kill_on_timeout: options.kill_on_timeout,
         timeout_ms: options.timeout_ms,
         command_count: commands.len(),
-        all_launches_allowed_by_policy,
         requires_running_daemon_for_launch_preview: true,
         commands,
         approval,
@@ -1127,19 +873,13 @@ fn preview_profile_startup(
     options: &ProfileStartupOptions,
     conditional_on_setup_success: bool,
 ) -> Result<ProfileStartupPreview> {
-    let mut specs = startup_app_launch_specs(profile_id)?;
-    for spec in &mut specs {
-        spec.user_acknowledged_unenforced_policy = options.acknowledge_unenforced_policy;
-    }
-    let apps = specs
+    let apps = startup_app_launch_specs(profile_id)?
         .into_iter()
         .map(profile_launch_plan)
         .collect::<Vec<_>>();
-    let all_launches_allowed_by_policy = apps.iter().all(|app| app.would_launch_after_start);
     let approval = profile_plan_approval_bundle(
         "profile_startup",
         format!("profile {profile_id} startup apps"),
-        all_launches_allowed_by_policy,
         &apps,
     );
 
@@ -1151,7 +891,6 @@ fn preview_profile_startup(
         screenshot_window: options.screenshot_window,
         window_timeout_ms: options.window_timeout_ms,
         app_count: apps.len(),
-        all_launches_allowed_by_policy,
         requires_running_daemon_for_launch_preview: true,
         apps,
         approval,
@@ -1159,58 +898,24 @@ fn preview_profile_startup(
 }
 
 fn profile_launch_plan(spec: LaunchSpec) -> ProfileLaunchPlan {
-    let blocks_unenforced_policy = spec
-        .applied_policy
-        .as_ref()
-        .is_some_and(AppliedWorkspacePolicy::blocks_requested_unenforced_policy);
-    let can_acknowledge_unenforced_policy = spec
-        .applied_policy
-        .as_ref()
-        .is_some_and(AppliedWorkspacePolicy::can_acknowledge_unenforced_policy);
-    let requires_unenforced_policy_ack = can_acknowledge_unenforced_policy;
-    let missing_unenforced_policy_ack =
-        requires_unenforced_policy_ack && !spec.user_acknowledged_unenforced_policy;
-    let would_launch_after_start = !blocks_unenforced_policy && !missing_unenforced_policy_ack;
     let subject = spec.name.clone().unwrap_or_else(|| spec.command.join(" "));
-    let mut approval = ApprovalBundle::new(
-        "profile_launch_declaration",
-        subject,
-        would_launch_after_start,
-    )
-    .require_acknowledgement(
-        requires_unenforced_policy_ack,
-        unenforced_policy_acknowledgement(spec.user_acknowledged_unenforced_policy),
-    );
-    if blocks_unenforced_policy {
-        approval = approval.add_blocker(
-            "launch profile requires full policy enforcement, but this runtime cannot enforce all requested policy",
-        );
-    }
-
     ProfileLaunchPlan {
         command: spec.command,
         name: spec.name,
         cwd: spec.cwd,
         env: spec.env,
         profile_id: spec.profile_id,
-        user_acknowledged_unenforced_policy: spec.user_acknowledged_unenforced_policy,
-        requires_unenforced_policy_ack,
-        missing_unenforced_policy_ack,
-        can_acknowledge_unenforced_policy,
-        blocks_unenforced_policy,
-        would_launch_after_start,
-        approval,
+        approval: ApprovalBundle::new("profile_launch_declaration", subject, true),
     }
 }
 
 fn profile_plan_approval_bundle(
     action: &str,
     subject: String,
-    would_execute: bool,
     plans: &[ProfileLaunchPlan],
 ) -> ApprovalBundle {
     plans.iter().fold(
-        ApprovalBundle::new(action, subject, would_execute),
+        ApprovalBundle::new(action, subject, true),
         |bundle, plan| bundle.merge_child(&plan.approval),
     )
 }
@@ -1221,14 +926,11 @@ pub fn launch_profile_setup(
     options: ProfileSetupOptions,
 ) -> Result<ProfileSetupRun> {
     let wait = options.wait || options.timeout_ms.is_some() || options.kill_on_timeout;
-    let mut specs = setup_launch_specs(profile_id)?;
+    let specs = setup_launch_specs(profile_id)?;
     let mut launched = Vec::new();
     let mut waited = Vec::new();
     let mut killed = Vec::new();
     let mut app_ids = Vec::new();
-    for spec in &mut specs {
-        spec.user_acknowledged_unenforced_policy = options.acknowledge_unenforced_policy;
-    }
     for spec in specs {
         let launch = if options.dry_run {
             workspace::preview_launch_app(workspace_id, spec, false, None, false)?
@@ -1299,11 +1001,8 @@ pub fn launch_profile_startup_apps(
     profile_id: &str,
     options: ProfileStartupOptions,
 ) -> Result<ProfileStartupRun> {
-    let mut specs = startup_app_launch_specs(profile_id)?;
+    let specs = startup_app_launch_specs(profile_id)?;
     let mut launched = Vec::new();
-    for spec in &mut specs {
-        spec.user_acknowledged_unenforced_policy = options.acknowledge_unenforced_policy;
-    }
     for spec in specs {
         let response = if options.dry_run {
             workspace::preview_launch_app(
@@ -1524,7 +1223,7 @@ fn validate_env_vars(env: &[EnvVar], subject: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn profile_with_network(network: NetworkPolicy) -> WorkspaceProfile {
+    fn test_profile() -> WorkspaceProfile {
         WorkspaceProfile {
             id: "qa-local".to_string(),
             description: None,
@@ -1533,11 +1232,9 @@ mod tests {
             height: None,
             cwd: None,
             env: Vec::new(),
-            mounts: Vec::new(),
-            network,
-            require_enforced_policy: false,
             setup_commands: Vec::new(),
             startup_apps: Vec::new(),
+            legacy: LegacyProfileFields::default(),
         }
     }
 
@@ -1550,45 +1247,8 @@ mod tests {
     }
 
     #[test]
-    fn local_only_network_accepts_empty_allow_hosts() {
-        let profile = profile_with_network(NetworkPolicy {
-            mode: NetworkMode::LocalOnly,
-            allow_hosts: Vec::new(),
-        });
-
-        validate_profile(&profile).expect("local_only should not require host labels");
-    }
-
-    #[test]
-    fn local_only_network_accepts_loopback_targets() {
-        let profile = profile_with_network(NetworkPolicy {
-            mode: NetworkMode::LocalOnly,
-            allow_hosts: vec![
-                "localhost:3000".to_string(),
-                "http://127.0.0.1:5173/path".to_string(),
-                "[::1]:9000".to_string(),
-            ],
-        });
-
-        validate_profile(&profile).expect("local_only loopback targets should validate");
-    }
-
-    #[test]
-    fn local_only_network_rejects_remote_targets() {
-        let profile = profile_with_network(NetworkPolicy {
-            mode: NetworkMode::LocalOnly,
-            allow_hosts: vec!["example.com".to_string()],
-        });
-
-        let error = validate_profile(&profile).expect_err("remote local_only target should fail");
-        assert!(error
-            .to_string()
-            .contains("may only allow localhost or loopback"));
-    }
-
-    #[test]
     fn profile_validation_rejects_duplicate_env_names() {
-        let mut profile = profile_with_network(NetworkPolicy::default());
+        let mut profile = test_profile();
         profile.env = vec![
             EnvVar {
                 name: "DUP".to_string(),
@@ -1608,7 +1268,7 @@ mod tests {
 
     #[test]
     fn profile_validation_rejects_relative_cwd() {
-        let mut profile = profile_with_network(NetworkPolicy::default());
+        let mut profile = test_profile();
         profile.cwd = Some(PathBuf::from("relative"));
 
         let error = validate_profile(&profile).expect_err("relative cwd should fail");
@@ -1617,7 +1277,7 @@ mod tests {
 
     #[test]
     fn profile_validation_rejects_empty_startup_program() {
-        let mut profile = profile_with_network(NetworkPolicy::default());
+        let mut profile = test_profile();
         profile.startup_apps.push(ProfileStartupApp {
             name: Some("bad".to_string()),
             command: vec!["".to_string()],
@@ -1632,7 +1292,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_validate_file_returns_policy_preflight_without_saving() {
+    fn profile_validate_file_returns_its_check_without_saving() {
         let path = env::temp_dir().join(format!(
             "agent-workspace-profile-validate-{}.json",
             std::process::id()
@@ -1655,145 +1315,8 @@ mod tests {
         assert_eq!(validation.profile.id, "validate-smoke");
         assert_eq!(validation.check.profile.id, "validate-smoke");
         assert!(validation.check.requires_hidden_workspace_ack);
-        assert!(matches!(
-            validation.check.applied_policy.network.mode,
-            NetworkMode::Disabled
-        ));
+        assert_eq!(validation.check.warnings.len(), 2);
         let _ = fs::remove_file(validation.json_path);
-    }
-
-    #[test]
-    fn project_dev_rust_toolchain_mounts_only_shims_and_toolchains() {
-        let temp_root = env::temp_dir().join(format!(
-            "agent-workspace-project-rust-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("clock should be after epoch")
-                .as_nanos()
-        ));
-        let cargo_home = temp_root.join("cargo-home");
-        let cargo_bin = cargo_home.join("bin");
-        let rustup_home = temp_root.join("rustup-home");
-        fs::create_dir_all(&cargo_bin).expect("cargo bin dir");
-        fs::create_dir_all(&rustup_home).expect("rustup dir");
-        fs::write(cargo_home.join("credentials.toml"), "token = 'secret'\n")
-            .expect("cargo credentials marker");
-
-        let toolchain = project_dev_rust_toolchain_from_paths(
-            Some(&cargo_home),
-            Some(&rustup_home),
-            "/usr/bin:/bin",
-        );
-
-        assert!(toolchain.detected);
-        assert_eq!(toolchain.mounts.len(), 2);
-        assert!(toolchain.mounts.iter().any(|mount| {
-            mount.host_path == cargo_bin
-                && mount.workspace_path.as_path() == std::path::Path::new(WORKSPACE_CARGO_BIN_PATH)
-                && matches!(mount.mode, MountMode::ReadOnly)
-        }));
-        assert!(toolchain.mounts.iter().any(|mount| {
-            mount.host_path == rustup_home
-                && mount.workspace_path.as_path() == std::path::Path::new(WORKSPACE_RUSTUP_HOME)
-                && matches!(mount.mode, MountMode::ReadOnly)
-        }));
-        assert!(!toolchain
-            .mounts
-            .iter()
-            .any(|mount| mount.host_path == cargo_home));
-
-        let env_value = |name: &str| {
-            toolchain
-                .env
-                .iter()
-                .find(|env_var| env_var.name == name)
-                .map(|env_var| env_var.value.as_str())
-        };
-        assert_eq!(env_value("CARGO_HOME"), Some(WORKSPACE_CARGO_HOME));
-        assert_eq!(env_value("RUSTUP_HOME"), Some(WORKSPACE_RUSTUP_HOME));
-        assert_eq!(
-            env_value("PATH"),
-            Some(format!("{WORKSPACE_CARGO_BIN_PATH}:/usr/bin:/bin").as_str())
-        );
-
-        fs::remove_dir_all(temp_root).expect("remove temp project rust dirs");
-    }
-
-    #[test]
-    fn restricted_chrome_template_is_explicit_about_network_and_sandbox() {
-        let profile = template_profile(
-            "restricted-chrome",
-            Some("chrome-smoke".to_string()),
-            None,
-            Some(PathBuf::from("/usr/bin/google-chrome")),
-            None,
-        )
-        .expect("restricted chrome template");
-
-        assert_eq!(profile.id, "chrome-smoke");
-        assert!(matches!(profile.network.mode, NetworkMode::Disabled));
-        assert!(profile.require_enforced_policy);
-        let description = profile.description.as_deref().unwrap_or_default();
-        assert!(description.contains("networking disabled"));
-        assert!(description.contains("--no-sandbox"));
-        assert!(description.contains("DevTools"));
-        assert_eq!(profile.startup_apps.len(), 1);
-        let app = &profile.startup_apps[0];
-        assert_eq!(app.name.as_deref(), Some("restricted-chrome-no-sandbox"));
-        assert_eq!(app.command[0], "/usr/bin/google-chrome");
-        assert!(app.command.iter().any(|arg| arg == "--no-sandbox"));
-        assert!(app
-            .command
-            .iter()
-            .any(|arg| arg == "--remote-debugging-address=127.0.0.1"));
-        assert!(app
-            .command
-            .iter()
-            .any(|arg| arg == "--remote-debugging-port=0"));
-        assert!(app.command.iter().any(|arg| arg == "about:blank"));
-    }
-
-    #[test]
-    fn browser_session_template_mounts_user_data_with_explicit_caveat() {
-        let profile = template_profile(
-            "browser-session",
-            Some("session-smoke".to_string()),
-            None,
-            Some(PathBuf::from("/usr/bin/google-chrome")),
-            Some(PathBuf::from("/home/me/.config/google-chrome")),
-        )
-        .expect("browser session template");
-
-        assert_eq!(profile.id, "session-smoke");
-        assert!(matches!(profile.network.mode, NetworkMode::InheritHost));
-        assert!(profile.require_enforced_policy);
-        let description = profile.description.as_deref().unwrap_or_default();
-        assert!(description.contains("explicit user approval"));
-        assert!(description.contains("--no-sandbox"));
-        assert!(description.contains("DevTools"));
-        assert_eq!(profile.mounts.len(), 1);
-        assert_eq!(
-            profile.mounts[0].workspace_path,
-            PathBuf::from("/workspace/browser-user-data")
-        );
-        assert!(matches!(profile.mounts[0].mode, MountMode::ReadWrite));
-        let app = &profile.startup_apps[0];
-        assert_eq!(app.name.as_deref(), Some("browser-session-no-sandbox"));
-        assert_eq!(app.command[0], "/usr/bin/google-chrome");
-        assert!(app
-            .command
-            .iter()
-            .any(|arg| arg == "--user-data-dir=/workspace/browser-user-data"));
-        assert!(app.command.iter().any(|arg| arg == "--no-sandbox"));
-        assert!(app
-            .command
-            .iter()
-            .any(|arg| arg == "--remote-debugging-address=127.0.0.1"));
-        assert!(app
-            .command
-            .iter()
-            .any(|arg| arg == "--remote-debugging-port=0"));
     }
 
     #[test]
@@ -1808,5 +1331,58 @@ mod tests {
         .expect_err("browser session template should require user-data dir");
 
         assert!(error.to_string().contains("--user-data-dir"));
+    }
+
+    #[test]
+    fn a_pre_0_6_profile_with_sandbox_fields_loads_warns_and_saves_without_them() {
+        let profile: WorkspaceProfile = serde_json::from_str(
+            r#"{"id":"old","mounts":[{"host_path":"/srv","workspace_path":"/workspace/srv"}],"network":{"mode":"disabled"},"require_enforced_policy":true}"#,
+        )
+        .expect("a pre-0.6 profile should still parse");
+
+        let warnings = check_workspace_profile(profile.clone()).warnings;
+        assert_eq!(warnings.len(), 3, "{warnings:?}");
+        assert!(warnings.iter().all(|w| w.contains("ignored")));
+        let saved = serde_json::to_value(&profile).expect("serialize profile");
+        for field in ["mounts", "network", "require_enforced_policy"] {
+            assert!(
+                saved.get(field).is_none(),
+                "{field} survived a save: {saved}"
+            );
+        }
+    }
+
+    #[test]
+    fn templates_start_apps_on_the_users_own_paths() {
+        let project = template_profile(
+            "project-dev",
+            None,
+            Some(PathBuf::from("/home/me/src/app")),
+            None,
+            None,
+        )
+        .expect("project template");
+        assert_eq!(project.cwd, Some(PathBuf::from("/home/me/src/app")));
+
+        // Codex Desktop asks for the pre-0.6 name.
+        let chrome = template_profile("restricted-chrome", Some("c".to_string()), None, None, None)
+            .expect("chrome template");
+        let command = &chrome.startup_apps[0].command;
+        assert!(command.iter().any(|arg| arg == "--remote-debugging-port=0"));
+        assert!(!command.iter().any(|arg| arg == "--no-sandbox"));
+
+        let session = template_profile(
+            "browser-session",
+            None,
+            None,
+            Some(PathBuf::from("/usr/bin/google-chrome")),
+            Some(PathBuf::from("/home/me/.config/google-chrome")),
+        )
+        .expect("browser session template");
+        let command = &session.startup_apps[0].command;
+        assert_eq!(command[0], "/usr/bin/google-chrome");
+        assert!(command
+            .iter()
+            .any(|arg| arg == "--user-data-dir=/home/me/.config/google-chrome"));
     }
 }

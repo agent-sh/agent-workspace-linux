@@ -1,4 +1,3 @@
-use crate::launch::SessionSandboxResources;
 use crate::workspace::{cleanup_stale_process_pid, first_available_command_name, DaemonOptions};
 use anyhow::{bail, Context, Result};
 use std::{
@@ -9,24 +8,6 @@ use std::{
 };
 
 pub(crate) const CHROME_OZONE_PLATFORM: &str = "x11";
-
-pub(crate) fn sandbox_resources(xauthority_path: &Path, display: &str) -> SessionSandboxResources {
-    let mut read_only_binds = vec![xauthority_path.to_path_buf()];
-    if let Some(number) = display
-        .strip_prefix(':')
-        .and_then(|value| value.split('.').next())
-        .filter(|number| !number.is_empty() && number.bytes().all(|c| c.is_ascii_digit()))
-    {
-        let socket = std::path::PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
-        if socket.exists() {
-            read_only_binds.push(socket);
-        }
-    }
-    SessionSandboxResources {
-        read_only_binds,
-        read_write_binds: Vec::new(),
-    }
-}
 
 pub(crate) struct X11Session {
     x_server: Option<Child>,
@@ -245,7 +226,7 @@ fn display_lock_pid(display: &str) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::BTreeMap, path::PathBuf};
+    use std::collections::BTreeMap;
 
     fn environment(command: &Command) -> BTreeMap<String, Option<String>> {
         command
@@ -290,16 +271,6 @@ mod tests {
             environment(&command).get("XDG_RUNTIME_DIR"),
             Some(None)
         ));
-    }
-
-    #[test]
-    fn x11_sandbox_resources_do_not_request_read_write_runtime_binds() {
-        let resources = sandbox_resources(Path::new("/tmp/workspace/Xauthority"), ":90");
-
-        assert!(resources
-            .read_only_binds
-            .contains(&PathBuf::from("/tmp/workspace/Xauthority")));
-        assert!(resources.read_write_binds.is_empty());
     }
 
     #[test]

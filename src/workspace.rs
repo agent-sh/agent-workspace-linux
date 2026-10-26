@@ -1,24 +1,11 @@
 #[path = "terminal_cleanup.rs"]
 mod terminal_cleanup;
 
-use crate::approval::{
-    hidden_workspace_acknowledgement, unenforced_policy_acknowledgement, ApprovalBundle,
-};
+use crate::approval::{hidden_workspace_acknowledgement, ApprovalBundle};
 use crate::control::{self, McpControlMode};
 use crate::desktop::{sanitize_window_id, DesktopControl};
-use crate::launch::{
-    bubblewrap_sandbox_for_launch, launch_isolation_labels_for_policy,
-    launch_isolation_labels_from_sandbox, resolve_executable_path, uses_bubblewrap_mount_isolation,
-};
-#[cfg(test)]
-use crate::launch::{
-    external_symlink_target_parent, launch_network_plan, restricted_mount_namespace_args,
-    LaunchNetworkPlan,
-};
+use crate::launch::resolve_executable_path;
 use crate::permissions::{load_mcp_permission_state, McpPermissionState};
-#[cfg(test)]
-use crate::policy::NetworkMode;
-use crate::policy::{AppliedWorkspacePolicy, PolicyRuntimeCapabilities, PolicyToolCheck};
 use crate::session::SessionSpec;
 use anyhow::{anyhow, bail, Context, Result};
 use schemars::JsonSchema;
@@ -70,7 +57,6 @@ const PRIVATE_SOCKET_MODE: u32 = 0o600;
 const DAEMON_PID_FILE: &str = "daemon.pid";
 const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 pub(crate) const MAX_CLIPBOARD_TEXT_BYTES: usize = 64 * 1024;
-const APPLIED_POLICY_FILE: &str = "applied_policy.json";
 const EVENT_LOG_FILE: &str = "events.jsonl";
 const WORKSPACE_MANIFEST_FILE: &str = "workspace.json";
 const OBSERVE_SCREENSHOT_FILE: &str = "observe-frame.png";
@@ -155,10 +141,6 @@ pub struct RuntimeReport {
     pub xdotool: Check,
     pub screenshot: Check,
     pub clipboard: Check,
-    pub policy: PolicyRuntimeCapabilities,
-    /// Whether sandboxed launches drop the owner's supplementary groups; when
-    /// they cannot, sandboxed apps keep them as before.
-    pub sandbox_group_drop: Check,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -180,11 +162,9 @@ pub struct WorkspaceStartOptions {
     pub session: SessionSpec,
     pub purpose: Option<String>,
     pub profile_id: Option<String>,
-    pub applied_policy: Option<AppliedWorkspacePolicy>,
     pub profile_cwd: Option<PathBuf>,
     pub profile_env: Vec<EnvVar>,
     pub user_acknowledged_hidden_workspace: bool,
-    pub user_acknowledged_unenforced_policy: bool,
     pub width: u32,
     pub height: u32,
     /// Path to the active spawn-time MCP permission ceiling JSON, forwarded to
@@ -199,11 +179,9 @@ impl Default for WorkspaceStartOptions {
             session: SessionSpec::default(),
             purpose: None,
             profile_id: None,
-            applied_policy: None,
             profile_cwd: None,
             profile_env: Vec::new(),
             user_acknowledged_hidden_workspace: false,
-            user_acknowledged_unenforced_policy: false,
             width: DEFAULT_WIDTH,
             height: DEFAULT_HEIGHT,
             permissions_source: None,
@@ -218,11 +196,9 @@ pub struct DaemonOptions {
     pub session_id: String,
     pub purpose: Option<String>,
     pub profile_id: Option<String>,
-    pub applied_policy: Option<AppliedWorkspacePolicy>,
     pub profile_cwd: Option<PathBuf>,
     pub profile_env: Vec<EnvVar>,
     pub user_acknowledged_hidden_workspace: bool,
-    pub user_acknowledged_unenforced_policy: bool,
     pub display: String,
     pub width: u32,
     pub height: u32,
@@ -247,13 +223,10 @@ pub struct WorkspaceStatus {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub applied_policy: Option<AppliedWorkspacePolicy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profile_env: Vec<EnvVar>,
     pub user_acknowledged_hidden_workspace: bool,
-    pub user_acknowledged_unenforced_policy: bool,
     pub ready: bool,
     pub started_at_unix: u64,
     pub display: String,
@@ -334,13 +307,10 @@ pub struct WorkspaceManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub applied_policy: Option<AppliedWorkspacePolicy>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub profile_env: Vec<EnvVar>,
     pub user_acknowledged_hidden_workspace: bool,
-    pub user_acknowledged_unenforced_policy: bool,
     pub ready: bool,
     pub started_at_unix: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -425,16 +395,9 @@ pub struct WorkspaceStartPreview {
     pub runtime_blockers: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub applied_policy: Option<AppliedWorkspacePolicy>,
     pub user_acknowledged_hidden_workspace: bool,
     pub requires_hidden_workspace_ack: bool,
     pub missing_hidden_workspace_ack: bool,
-    pub user_acknowledged_unenforced_policy: bool,
-    pub requires_unenforced_policy_ack: bool,
-    pub missing_unenforced_policy_ack: bool,
-    pub can_acknowledge_unenforced_policy: bool,
-    pub blocks_unenforced_policy: bool,
     pub message: String,
     #[serde(default)]
     pub approval: ApprovalBundle,
@@ -456,18 +419,9 @@ pub struct WorkspaceLaunchPreview {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_timeout_ms: Option<u64>,
     pub screenshot_window: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub applied_policy: Option<AppliedWorkspacePolicy>,
-    pub user_acknowledged_unenforced_policy: bool,
-    pub requires_unenforced_policy_ack: bool,
-    pub missing_unenforced_policy_ack: bool,
-    pub can_acknowledge_unenforced_policy: bool,
-    pub blocks_unenforced_policy: bool,
     pub workspace_running: bool,
     pub ok_to_launch: bool,
     pub would_launch: bool,
-    pub mount_isolation: String,
-    pub network_isolation: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub blockers: Vec<String>,
     pub message: String,
@@ -485,8 +439,6 @@ pub struct WorkspaceApp {
     pub process_group_id: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
-    pub mount_isolation: String,
-    pub network_isolation: String,
     pub command: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
@@ -522,10 +474,6 @@ pub struct LaunchSpec {
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub profile_id: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub applied_policy: Option<AppliedWorkspacePolicy>,
-    #[serde(default)]
-    pub user_acknowledged_unenforced_policy: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cwd: Option<PathBuf>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -664,22 +612,6 @@ pub struct WorkspaceTerminal {
     pub width: u32,
     #[serde(default)]
     pub height: u32,
-    /// Where host-side tmux clients for this terminal must run.
-    #[serde(skip)]
-    #[schemars(skip)]
-    pub(crate) client_sandbox: TmuxClientSandbox,
-}
-
-/// The tmux server of a sandboxed terminal is code the sandbox controls, and a
-/// tmux client obeys server messages that run commands and open files. Host
-/// clients for such a terminal therefore run inside the same sandbox.
-#[derive(Debug, Clone, Default, PartialEq)]
-pub(crate) enum TmuxClientSandbox {
-    /// Not resolved from the workspace; refuse to run a client.
-    #[default]
-    Unknown,
-    Host,
-    Bubblewrap(Vec<String>),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -772,10 +704,6 @@ pub enum IpcRequest {
         name: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         profile_id: Option<String>,
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        applied_policy: Option<AppliedWorkspacePolicy>,
-        #[serde(default)]
-        user_acknowledged_unenforced_policy: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cwd: Option<PathBuf>,
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1153,22 +1081,6 @@ pub fn doctor_report() -> DoctorReport {
         // ffmpeg-only host can take screenshots, so it must read as ready here.
         screenshot: first_available_command(&["ffmpeg", "import", "scrot"]),
         clipboard: first_available_command(&["xclip", "xsel"]),
-        policy: policy_runtime_capabilities(),
-        sandbox_group_drop: match crate::launch::group_drop_status() {
-            Ok(false) => Check {
-                ok: true,
-                detail: "no supplementary groups to drop".to_string(),
-            },
-            Ok(true) => Check {
-                ok: true,
-                detail: "sandboxed launches drop supplementary groups via newuidmap/newgidmap"
-                    .to_string(),
-            },
-            Err(reason) => Check {
-                ok: false,
-                detail: reason,
-            },
-        },
     };
     let viewer = ViewerRuntimeReport {
         host_display: host_display_check(),
@@ -1178,7 +1090,7 @@ pub fn doctor_report() -> DoctorReport {
 
     let mut blockers = Vec::new();
     if !runtime.xvfb.ok && !runtime.xephyr.ok {
-        blockers.push("Install Xvfb or Xephyr to create the isolated X11 display.".to_string());
+        blockers.push("Install Xvfb or Xephyr to create the workspace's X11 display.".to_string());
     }
     if !runtime.xauth.ok {
         blockers.push(
@@ -1253,15 +1165,6 @@ pub fn doctor_report() -> DoctorReport {
         viewer_blockers,
         recommended_next_step,
     }
-}
-
-pub fn policy_runtime_capabilities() -> PolicyRuntimeCapabilities {
-    PolicyRuntimeCapabilities::from_tools(
-        policy_tool_check("bwrap"),
-        policy_tool_check("firejail"),
-        policy_tool_check("unshare"),
-        policy_tool_check("slirp4netns"),
-    )
 }
 
 pub fn start_workspace(options: WorkspaceStartOptions) -> Result<IpcResponse> {
@@ -1447,13 +1350,6 @@ pub fn artifacts(id: &str, existing_only: bool) -> WorkspaceArtifacts {
         "xauthority",
         "workspace Xauthority",
         xauthority_path,
-    );
-    push_workspace_artifact(
-        &mut files,
-        &mut seen,
-        "policy",
-        "applied policy snapshot",
-        runtime_dir.join(APPLIED_POLICY_FILE),
     );
     let event_log_path = manifest
         .as_ref()
@@ -2004,15 +1900,12 @@ pub fn launch_app_with_options(
 ) -> Result<IpcResponse> {
     let id = sanitize_workspace_id(id)?;
     validate_launch_spec(&spec)?;
-    validate_launch_policy_ack(&spec)?;
     request(
         &workspace_socket_path(&id),
         IpcRequest::LaunchApp {
             command: spec.command,
             name: spec.name,
             profile_id: spec.profile_id,
-            applied_policy: spec.applied_policy,
-            user_acknowledged_unenforced_policy: spec.user_acknowledged_unenforced_policy,
             cwd: spec.cwd,
             env: spec.env,
             wait_window,
@@ -2035,63 +1928,11 @@ pub fn preview_launch_app(
     let spec = launch_spec_with_workspace_defaults(&running_status, spec);
     validate_launch_spec(&spec)?;
 
-    let launch_policy = spec.applied_policy.clone();
-    let blocks_unenforced_policy = launch_policy
-        .as_ref()
-        .is_some_and(AppliedWorkspacePolicy::blocks_requested_unenforced_policy);
-    let can_acknowledge_unenforced_policy = launch_policy
-        .as_ref()
-        .is_some_and(AppliedWorkspacePolicy::can_acknowledge_unenforced_policy);
-    let requires_unenforced_policy_ack = can_acknowledge_unenforced_policy;
-    let missing_unenforced_policy_ack =
-        requires_unenforced_policy_ack && !spec.user_acknowledged_unenforced_policy;
-
-    let mut blockers = Vec::new();
-    if blocks_unenforced_policy {
-        blockers.push(
-            "launch profile requires full policy enforcement, but this runtime cannot enforce all requested policy"
-                .to_string(),
-        );
-    }
-    if missing_unenforced_policy_ack {
-        blockers.push(
-            "launch profile requests unenforced policy and requires acknowledgement".to_string(),
-        );
-    }
-
     let workspace_running = true;
-    let applied_policy = spec
-        .applied_policy
-        .clone()
-        .or_else(|| running_status.applied_policy.clone());
-    let (mut mount_isolation, mut network_isolation) =
-        launch_isolation_labels_for_policy(applied_policy.as_ref());
-    if !blocks_unenforced_policy && !missing_unenforced_policy_ack {
-        match bubblewrap_sandbox_for_launch(
-            &running_status,
-            applied_policy.as_ref(),
-            spec.cwd.as_deref(),
-            None,
-        ) {
-            Ok(sandbox) => {
-                (mount_isolation, network_isolation) =
-                    launch_isolation_labels_from_sandbox(sandbox.as_ref());
-            }
-            Err(error) => {
-                blockers.push(format!("launch isolation validation failed: {error}"));
-            }
-        }
-    }
-
-    let ok_to_launch = workspace_running && blockers.is_empty();
+    let blockers = Vec::new();
+    let ok_to_launch = workspace_running;
     let would_launch = ok_to_launch;
-    let message = if would_launch {
-        "workspace launch would spawn app".to_string()
-    } else if let Some(blocker) = blockers.first() {
-        format!("workspace launch dry run blocked: {blocker}")
-    } else {
-        "workspace launch dry run blocked".to_string()
-    };
+    let message = "workspace launch would spawn app".to_string();
 
     let mut preview = WorkspaceLaunchPreview {
         id,
@@ -2103,17 +1944,9 @@ pub fn preview_launch_app(
         wait_window,
         window_timeout_ms,
         screenshot_window,
-        applied_policy,
-        user_acknowledged_unenforced_policy: spec.user_acknowledged_unenforced_policy,
-        requires_unenforced_policy_ack,
-        missing_unenforced_policy_ack,
-        can_acknowledge_unenforced_policy,
-        blocks_unenforced_policy,
         workspace_running,
         ok_to_launch,
         would_launch,
-        mount_isolation,
-        network_isolation,
         blockers,
         message,
         approval: ApprovalBundle::default(),
@@ -2155,18 +1988,8 @@ fn launch_approval_bundle(preview: &WorkspaceLaunchPreview) -> ApprovalBundle {
         "workspace_launch",
         format!("workspace {} app {}", preview.id, subject),
         preview.would_launch,
-    )
-    .require_acknowledgement(
-        preview.requires_unenforced_policy_ack,
-        unenforced_policy_acknowledgement(preview.user_acknowledged_unenforced_policy),
     );
-
-    let acknowledgement_blocker =
-        "launch profile requests unenforced policy and requires acknowledgement";
     for blocker in &preview.blockers {
-        if preview.missing_unenforced_policy_ack && blocker == acknowledgement_blocker {
-            continue;
-        }
         bundle = bundle.add_blocker(blocker.clone());
     }
 
@@ -2177,8 +2000,7 @@ fn validate_launch_spec(spec: &LaunchSpec) -> Result<()> {
     validate_command(&spec.command, "launch")?;
     validate_optional_app_name(&spec.name)?;
     if let Some(cwd) = &spec.cwd {
-        if !cwd_is_provided_by_bubblewrap_mount(cwd, spec.applied_policy.as_ref()) && !cwd.is_dir()
-        {
+        if !cwd.is_dir() {
             bail!("launch cwd {} is not a directory", cwd.display());
         }
     }
@@ -2199,49 +2021,6 @@ pub fn validate_command(command: &[String], subject: &str) -> Result<()> {
         if arg.contains('\0') {
             bail!("{subject} command cannot contain NUL bytes");
         }
-    }
-    Ok(())
-}
-
-fn cwd_is_provided_by_bubblewrap_mount(
-    cwd: &Path,
-    policy: Option<&AppliedWorkspacePolicy>,
-) -> bool {
-    let Some(policy) = policy else {
-        return false;
-    };
-    uses_bubblewrap_mount_isolation(Some(policy))
-        && policy
-            .mounts
-            .iter()
-            .any(|mount| cwd == mount.workspace_path || cwd.starts_with(&mount.workspace_path))
-}
-
-fn validate_launch_policy_ack(spec: &LaunchSpec) -> Result<()> {
-    if let Some(policy) = &spec.applied_policy {
-        validate_policy_acknowledgement(
-            policy,
-            spec.user_acknowledged_unenforced_policy,
-            "launch profile",
-        )?;
-    }
-    Ok(())
-}
-
-fn validate_policy_acknowledgement(
-    policy: &AppliedWorkspacePolicy,
-    acknowledged_unenforced_policy: bool,
-    subject: &str,
-) -> Result<()> {
-    if policy.blocks_requested_unenforced_policy() {
-        bail!(
-            "{subject} requires full mount/network policy enforcement, but this runtime cannot enforce all requested policy"
-        );
-    }
-    if policy.has_requested_unenforced_policy() && !acknowledged_unenforced_policy {
-        bail!(
-            "{subject} requests mount or network policy that is not enforced by this runtime; pass --ack-unenforced-policy or set acknowledge_unenforced_policy=true"
-        );
     }
     Ok(())
 }
@@ -3241,8 +3020,6 @@ pub fn terminal_launch_plan(
             command: launch_command,
             name: Some(title),
             profile_id: None,
-            applied_policy: None,
-            user_acknowledged_unenforced_policy: false,
             cwd: None,
             env: Vec::new(),
         },
@@ -3430,9 +3207,6 @@ pub fn stop_workspace(id: &str, timeout_ms: Option<u64>, dry_run: bool) -> Resul
 }
 
 pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
-    if let Some(policy) = options.applied_policy.as_mut() {
-        options.session.describe_policy(policy);
-    }
     let id = sanitize_workspace_id(&options.id)?;
     let session_id = normalize_session_id(&options.session_id)?;
     options.purpose = normalize_workspace_purpose(options.purpose)?;
@@ -3480,11 +3254,9 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
             session_id,
             purpose: options.purpose,
             profile_id: options.profile_id,
-            applied_policy: options.applied_policy,
             profile_cwd: options.profile_cwd,
             profile_env: options.profile_env,
             user_acknowledged_hidden_workspace: options.user_acknowledged_hidden_workspace,
-            user_acknowledged_unenforced_policy: options.user_acknowledged_unenforced_policy,
             ready: true,
             started_at_unix,
             display: options.display,
@@ -3516,7 +3288,6 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
         "profile_id": state.status.profile_id.as_deref(),
         "started_at_unix": state.status.started_at_unix,
         "user_acknowledged_hidden_workspace": state.status.user_acknowledged_hidden_workspace,
-        "user_acknowledged_unenforced_policy": state.status.user_acknowledged_unenforced_policy,
     });
     record_event(&mut state, "workspace_start", start_detail)?;
 
@@ -3554,10 +3325,7 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
     Ok(())
 }
 
-fn workspace_start_preview(mut options: WorkspaceStartOptions) -> Result<WorkspaceStartPreview> {
-    if let Some(policy) = options.applied_policy.as_mut() {
-        options.session.describe_policy(policy);
-    }
+fn workspace_start_preview(options: WorkspaceStartOptions) -> Result<WorkspaceStartPreview> {
     let id = sanitize_workspace_id(&options.id)?;
     let purpose = normalize_workspace_purpose(options.purpose)?;
     let running_status = status_workspace(&id).ok();
@@ -3575,25 +3343,11 @@ fn workspace_start_preview(mut options: WorkspaceStartOptions) -> Result<Workspa
         runtime_blockers.push(error.clone());
     }
     let runtime_ready = runtime_blockers.is_empty();
-    let applied_policy = options.applied_policy.clone();
-    let blocks_unenforced_policy = applied_policy
-        .as_ref()
-        .is_some_and(AppliedWorkspacePolicy::blocks_requested_unenforced_policy);
-    let can_acknowledge_unenforced_policy = applied_policy
-        .as_ref()
-        .is_some_and(AppliedWorkspacePolicy::can_acknowledge_unenforced_policy);
     let requires_hidden_workspace_ack = !already_running;
     let missing_hidden_workspace_ack =
         requires_hidden_workspace_ack && !options.user_acknowledged_hidden_workspace;
-    let requires_unenforced_policy_ack = can_acknowledge_unenforced_policy;
-    let missing_unenforced_policy_ack =
-        requires_unenforced_policy_ack && !options.user_acknowledged_unenforced_policy;
-    let ok_to_start = !session_mismatch
-        && (already_running
-            || (runtime_ready
-                && !missing_hidden_workspace_ack
-                && !missing_unenforced_policy_ack
-                && !blocks_unenforced_policy));
+    let ok_to_start =
+        !session_mismatch && (already_running || (runtime_ready && !missing_hidden_workspace_ack));
     let would_start = !already_running && ok_to_start;
     let message = if session_mismatch {
         session_mismatch_message(
@@ -3605,11 +3359,6 @@ fn workspace_start_preview(mut options: WorkspaceStartOptions) -> Result<Workspa
         format!("workspace {id:?} is already running")
     } else if missing_hidden_workspace_ack {
         "workspace start would require hidden-workspace acknowledgement".to_string()
-    } else if blocks_unenforced_policy {
-        "workspace start would be blocked because the profile requires full policy enforcement"
-            .to_string()
-    } else if missing_unenforced_policy_ack {
-        "workspace start would require unenforced-policy acknowledgement".to_string()
     } else if !runtime_ready {
         format!(
             "workspace runtime is not ready: {}",
@@ -3630,15 +3379,9 @@ fn workspace_start_preview(mut options: WorkspaceStartOptions) -> Result<Workspa
         runtime_ready,
         runtime_blockers,
         profile_id: options.profile_id,
-        applied_policy,
         user_acknowledged_hidden_workspace: options.user_acknowledged_hidden_workspace,
         requires_hidden_workspace_ack,
         missing_hidden_workspace_ack,
-        user_acknowledged_unenforced_policy: options.user_acknowledged_unenforced_policy,
-        requires_unenforced_policy_ack,
-        missing_unenforced_policy_ack,
-        can_acknowledge_unenforced_policy,
-        blocks_unenforced_policy,
         message,
         approval: ApprovalBundle::default(),
     };
@@ -3655,17 +3398,8 @@ fn start_approval_bundle(preview: &WorkspaceStartPreview) -> ApprovalBundle {
     .require_acknowledgement(
         preview.requires_hidden_workspace_ack,
         hidden_workspace_acknowledgement(preview.user_acknowledged_hidden_workspace),
-    )
-    .require_acknowledgement(
-        preview.requires_unenforced_policy_ack,
-        unenforced_policy_acknowledgement(preview.user_acknowledged_unenforced_policy),
     );
 
-    if preview.blocks_unenforced_policy {
-        bundle = bundle.add_blocker(
-            "profile requires full policy enforcement, but this runtime cannot enforce all requested policy",
-        );
-    }
     if preview.session_mismatch {
         bundle = bundle.add_blocker(preview.message.clone());
     }
@@ -3694,10 +3428,7 @@ enum WorkspaceStartPlan {
     Start(DaemonOptions),
 }
 
-fn prepare_workspace_start(mut options: WorkspaceStartOptions) -> Result<WorkspaceStartPlan> {
-    if let Some(policy) = options.applied_policy.as_mut() {
-        options.session.describe_policy(policy);
-    }
+fn prepare_workspace_start(options: WorkspaceStartOptions) -> Result<WorkspaceStartPlan> {
     let id = sanitize_workspace_id(&options.id)?;
     let purpose = normalize_workspace_purpose(options.purpose)?;
     if let Ok(status) = status_workspace(&id) {
@@ -3709,14 +3440,6 @@ fn prepare_workspace_start(mut options: WorkspaceStartOptions) -> Result<Workspa
             "starting a hidden agent workspace requires explicit acknowledgement; pass --ack-hidden-workspace or set acknowledge_hidden_workspace=true"
         );
     }
-    if let Some(policy) = &options.applied_policy {
-        validate_policy_acknowledgement(
-            policy,
-            options.user_acknowledged_unenforced_policy,
-            "profile",
-        )?;
-    }
-
     options.session.validate()?;
     let blockers = options.session.blockers();
     if !blockers.is_empty() {
@@ -3728,7 +3451,10 @@ fn prepare_workspace_start(mut options: WorkspaceStartOptions) -> Result<Workspa
     validate_unix_socket_path(&socket_path)?;
     // Native compositors bind the Wayland display socket, the longest fixed
     // socket name in the runtime; reject paths they cannot bind up front.
-    if options.session.backend.requires_client_application_bus() {
+    if !matches!(
+        options.session.backend,
+        crate::session::SessionBackend::X11 | crate::session::SessionBackend::I3
+    ) {
         validate_unix_socket_path(&runtime_dir.join(crate::session::kwin::WAYLAND_SOCKET))?;
     }
     create_private_runtime_dir(&runtime_dir)?;
@@ -3754,11 +3480,9 @@ fn prepare_workspace_start(mut options: WorkspaceStartOptions) -> Result<Workspa
         session_id,
         purpose,
         profile_id: options.profile_id,
-        applied_policy: options.applied_policy,
         profile_cwd: options.profile_cwd,
         profile_env: options.profile_env,
         user_acknowledged_hidden_workspace: options.user_acknowledged_hidden_workspace,
-        user_acknowledged_unenforced_policy: options.user_acknowledged_unenforced_policy,
         display,
         width: options.width,
         height: options.height,
@@ -3797,18 +3521,11 @@ fn spawn_detached_daemon(options: &DaemonOptions) -> Result<()> {
             .arg("--profile-env")
             .arg(format!("{}={}", env_var.name, env_var.value));
     }
-    if let Some(policy) = &options.applied_policy {
-        let policy_path = write_applied_policy_file(&options.runtime_dir, policy)?;
-        daemon.arg("--policy").arg(policy_path);
-    }
     if let Some(permissions_source) = &options.permissions_source {
         daemon.arg("--permissions").arg(permissions_source);
     }
     if options.user_acknowledged_hidden_workspace {
         daemon.arg("--ack-hidden-workspace");
-    }
-    if options.user_acknowledged_unenforced_policy {
-        daemon.arg("--ack-unenforced-policy");
     }
     daemon
         .arg("--display")
@@ -3859,42 +3576,6 @@ fn strip_linux_deleted_exe_suffix(path: &Path) -> Option<PathBuf> {
     let path = path.as_os_str().to_string_lossy();
     path.strip_suffix(LINUX_DELETED_EXE_SUFFIX)
         .map(PathBuf::from)
-}
-
-fn write_applied_policy_file(
-    runtime_dir: &Path,
-    policy: &AppliedWorkspacePolicy,
-) -> Result<PathBuf> {
-    let policy_path = runtime_dir.join(APPLIED_POLICY_FILE);
-    let content =
-        serde_json::to_string_pretty(policy).context("failed to serialize applied policy")?;
-    fs::write(&policy_path, format!("{content}\n"))
-        .with_context(|| format!("failed to write {}", policy_path.display()))?;
-    Ok(policy_path)
-}
-
-/// The environment a sandboxed app gets: the daemon's own environment with
-/// the launch rules applied (scrubbed host session variables, workspace
-/// variables, the caller's launch variables, the client bus). Bubblewrap
-/// receives it through `--setenv` instead of inheriting it.
-fn sandboxed_app_environment(
-    status: &WorkspaceStatus,
-    launch_env: &[EnvVar],
-) -> Vec<(std::ffi::OsString, std::ffi::OsString)> {
-    let mut rules = Command::new("true");
-    crate::launch::configure_launch_environment(&mut rules, status, launch_env, true);
-    let mut env = env::vars_os().collect::<BTreeMap<_, _>>();
-    for (name, value) in rules.get_envs() {
-        match value {
-            Some(value) => {
-                env.insert(name.to_os_string(), value.to_os_string());
-            }
-            None => {
-                env.remove(name);
-            }
-        }
-    }
-    env.into_iter().collect()
 }
 
 fn create_client_runtime(runtime: &Path) -> Result<()> {
@@ -3994,11 +3675,9 @@ fn workspace_manifest(status: &WorkspaceStatus, stopped_at_unix: Option<u64>) ->
         session_id: status.session_id.clone(),
         purpose: status.purpose.clone(),
         profile_id: status.profile_id.clone(),
-        applied_policy: status.applied_policy.clone(),
         profile_cwd: status.profile_cwd.clone(),
         profile_env: status.profile_env.clone(),
         user_acknowledged_hidden_workspace: status.user_acknowledged_hidden_workspace,
-        user_acknowledged_unenforced_policy: status.user_acknowledged_unenforced_policy,
         ready: status.ready,
         started_at_unix: status.started_at_unix,
         stopped_at_unix,
@@ -4682,8 +4361,6 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
             command,
             name,
             profile_id,
-            applied_policy,
-            user_acknowledged_unenforced_policy,
             cwd,
             env,
             wait_window,
@@ -4705,8 +4382,6 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                     command,
                     name,
                     profile_id,
-                    applied_policy,
-                    user_acknowledged_unenforced_policy,
                     cwd,
                     env,
                 },
@@ -4725,8 +4400,6 @@ fn handle_stream(stream: UnixStream, state: &mut DaemonState) -> Result<bool> {
                             "profile_id": app.profile_id.as_deref(),
                             "cwd": app.cwd.as_ref().map(|path| path.display().to_string()),
                             "env_count": app.env.len(),
-                            "network_isolation": &app.network_isolation,
-                            "mount_isolation": &app.mount_isolation,
                             "stdout_path": app.stdout_path.as_ref().map(|path| path.display().to_string()),
                             "stderr_path": app.stderr_path.as_ref().map(|path| path.display().to_string()),
                             "started_at_unix": app.started_at_unix,
@@ -7121,16 +6794,14 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
     let spec = launch_spec_with_workspace_defaults(&state.status, spec);
     validate_launch_spec(&spec)?;
     // Enforce the spawn-time MCP permission ceiling inside the daemon, after
-    // workspace defaults are applied. This holds regardless of IPC origin: any
-    // same-uid process or workspace-launched app that crafts a permissive
-    // `applied_policy` directly to the control socket is still capped here, not
-    // only in the MCP front-end. Covers direct launches, `workspace run`,
+    // workspace defaults are applied. This holds regardless of IPC origin: a
+    // same-uid process that writes to the control socket directly is still
+    // capped here, not only in the MCP front-end. Covers direct launches, `workspace run`,
     // profile setup commands, and startup apps, which all funnel through here.
     state
         .permissions
         .validate_launch_spec(&spec)
         .context("workspace launch exceeds the MCP permission ceiling")?;
-    validate_launch_policy_ack(&spec)?;
     create_client_runtime(&state.status.runtime_dir)?;
     let terminal_dir =
         terminal_cleanup::managed_terminal_client_dir(&state.status.runtime_dir, &spec.command);
@@ -7138,37 +6809,9 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
         create_owned_private_dir(dir, "managed terminal client directory")?;
     }
     let log_paths = prepare_app_log_paths(&state.status.runtime_dir)?;
-    let effective_policy = spec
-        .applied_policy
-        .as_ref()
-        .or(state.status.applied_policy.as_ref());
-    let sandbox = bubblewrap_sandbox_for_launch(
-        &state.status,
-        effective_policy,
-        spec.cwd.as_deref(),
-        terminal_dir.as_deref(),
-    )?;
-    let (mount_isolation, network_isolation) =
-        launch_isolation_labels_from_sandbox(sandbox.as_ref());
-    // Held until spawn: the descriptor that carries a sandboxed launch's
-    // arguments and environment to bubblewrap.
-    let mut sandbox_args_fd = None;
-    let mut child_command = if let Some(sandbox) = &sandbox {
-        let env = sandboxed_app_environment(&state.status, &spec.env);
-        let built = crate::launch::sandboxed_command(
-            &sandbox.args,
-            &spec.command[0],
-            &spec.command[1..],
-            &env,
-        )?;
-        sandbox_args_fd = Some(built.args_fd);
-        built.command
-    } else {
-        let mut command = Command::new(&spec.command[0]);
-        command.args(&spec.command[1..]);
-        command
-    };
+    let mut child_command = Command::new(&spec.command[0]);
     child_command
+        .args(&spec.command[1..])
         .stdin(Stdio::null())
         .stdout(Stdio::from(
             fs::File::create(&log_paths.stdout)
@@ -7178,24 +6821,14 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
             fs::File::create(&log_paths.stderr)
                 .with_context(|| format!("failed to create {}", log_paths.stderr.display()))?,
         ));
-    if sandbox.is_none() {
-        if let Some(cwd) = &spec.cwd {
-            child_command.current_dir(cwd);
-        }
+    if let Some(cwd) = &spec.cwd {
+        child_command.current_dir(cwd);
     }
-    if sandbox.is_none() {
-        crate::launch::configure_launch_environment(
-            &mut child_command,
-            &state.status,
-            &spec.env,
-            false,
-        );
-    }
+    crate::launch::configure_launch_environment(&mut child_command, &state.status, &spec.env);
     child_command.process_group(0);
     let child = child_command
         .spawn()
         .with_context(|| format!("failed to launch {}", launch_description(&spec.command)))?;
-    drop(sandbox_args_fd);
     let pid = child.id();
     let stdout_path = rename_app_log(&log_paths.stdout, pid, "stdout")?;
     let stderr_path = rename_app_log(&log_paths.stderr, pid, "stderr")?;
@@ -7205,8 +6838,6 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
         pid,
         process_group_id: Some(pid),
         profile_id: spec.profile_id,
-        mount_isolation,
-        network_isolation,
         command: spec.command,
         cwd: spec.cwd,
         env: spec.env,
@@ -7232,13 +6863,11 @@ fn launch_spec_with_workspace_defaults(
     status: &WorkspaceStatus,
     mut spec: LaunchSpec,
 ) -> LaunchSpec {
-    if spec.profile_id.is_some() || spec.applied_policy.is_some() {
+    if spec.profile_id.is_some() {
         return spec;
     }
 
     spec.profile_id = status.profile_id.clone();
-    spec.applied_policy = status.applied_policy.clone();
-    spec.user_acknowledged_unenforced_policy |= status.user_acknowledged_unenforced_policy;
     if spec.cwd.is_none() {
         spec.cwd = status.profile_cwd.clone();
     }
@@ -7267,12 +6896,10 @@ fn terminal_info(id: &str, terminal_id: &str, app_id: Option<String>) -> Result<
     let status = status_workspace(&id)?;
     let terminal_id = sanitize_terminal_id(terminal_id)?;
     let tmux_socket_path = terminal_socket_path(&status.runtime_dir, &terminal_id);
-    let client_sandbox = terminal_client_sandbox(&status, &tmux_socket_path)?;
     let session_name = terminal_id.clone();
     let target = session_name.clone();
     let output = tmux_output(
         &tmux_socket_path,
-        &client_sandbox,
         &[
             "display-message",
             "-p",
@@ -7303,85 +6930,7 @@ fn terminal_info(id: &str, terminal_id: &str, app_id: Option<String>) -> Result<
         current_path: non_empty_field(fields.get(5).copied()),
         width,
         height,
-        client_sandbox,
     })
-}
-
-/// Every per-terminal socket gets the same minimal client sandbox, whatever
-/// policy launched the terminal: read-only system directories, the terminal's
-/// own directory, no network and no home. A tmux client needs nothing else,
-/// and this is never weaker than the terminal's own sandbox. Legacy sockets
-/// at the runtime root only exist for terminals launched by older daemons.
-fn terminal_client_sandbox(status: &WorkspaceStatus, socket: &Path) -> Result<TmuxClientSandbox> {
-    let terminal_dir = socket
-        .parent()
-        .filter(|dir| dir.parent() == Some(status.runtime_dir.join("client").as_path()));
-    match terminal_dir {
-        Some(dir) => Ok(TmuxClientSandbox::Bubblewrap(tmux_client_sandbox_args(
-            dir,
-        )?)),
-        None if bubblewrap_sandbox_for_launch(
-            status,
-            status.applied_policy.as_ref(),
-            None,
-            None,
-        )?
-        .is_none() =>
-        {
-            Ok(TmuxClientSandbox::Host)
-        }
-        None => bail!(
-            "terminal socket {} predates per-terminal sandboxes; restart the workspace to use it",
-            socket.display()
-        ),
-    }
-}
-
-fn tmux_client_sandbox_args(terminal_dir: &Path) -> Result<Vec<String>> {
-    let source = fs::canonicalize(terminal_dir)
-        .with_context(|| format!("managed terminal directory {}", terminal_dir.display()))?;
-    let mut args = [
-        "--unshare-net",
-        "--unshare-pid",
-        "--unshare-ipc",
-        "--unshare-uts",
-        "--ro-bind",
-        "/usr",
-        "/usr",
-        "--ro-bind",
-        "/etc",
-        "/etc",
-        "--proc",
-        "/proc",
-        "--dev",
-        "/dev",
-        "--tmpfs",
-        "/tmp",
-    ]
-    .map(str::to_string)
-    .to_vec();
-    // Merged-/usr systems link these into /usr; older layouts have real dirs.
-    for path in ["/bin", "/sbin", "/lib", "/lib64"] {
-        match fs::read_link(path) {
-            Ok(target) => args.extend([
-                "--symlink".to_string(),
-                target.display().to_string(),
-                path.to_string(),
-            ]),
-            Err(_) if Path::new(path).is_dir() => {
-                args.extend(["--ro-bind".to_string(), path.to_string(), path.to_string()])
-            }
-            Err(_) => {}
-        }
-    }
-    args.extend([
-        "--bind".to_string(),
-        source.display().to_string(),
-        terminal_dir.display().to_string(),
-        "--chdir".to_string(),
-        "/".to_string(),
-    ]);
-    Ok(args)
 }
 
 fn tmux_capture_pane(
@@ -7392,12 +6941,11 @@ fn tmux_capture_pane(
     if preserve_trailing_spaces {
         args.insert(2, "-N");
     }
-    match tmux_output(&terminal.tmux_socket_path, &terminal.client_sandbox, &args) {
+    match tmux_output(&terminal.tmux_socket_path, &args) {
         Ok(output) => Ok(output),
         Err(error) if preserve_trailing_spaces => {
             let fallback = tmux_output(
                 &terminal.tmux_socket_path,
-                &terminal.client_sandbox,
                 &["capture-pane", "-p", "-t", terminal.target.as_str()],
             )?;
             Ok(format!(
@@ -7411,7 +6959,6 @@ fn tmux_capture_pane(
 fn tmux_send_literal_text(terminal: &WorkspaceTerminal, text: &str) -> Result<()> {
     tmux_status(
         &terminal.tmux_socket_path,
-        &terminal.client_sandbox,
         &[
             "send-keys",
             "-t",
@@ -7426,11 +6973,11 @@ fn tmux_send_literal_text(terminal: &WorkspaceTerminal, text: &str) -> Result<()
 fn tmux_send_keys(terminal: &WorkspaceTerminal, keys: &[String]) -> Result<()> {
     let mut args = vec!["send-keys", "-t", terminal.target.as_str()];
     args.extend(keys.iter().map(String::as_str));
-    tmux_status(&terminal.tmux_socket_path, &terminal.client_sandbox, &args)
+    tmux_status(&terminal.tmux_socket_path, &args)
 }
 
-fn tmux_output(socket_path: &Path, sandbox: &TmuxClientSandbox, args: &[&str]) -> Result<String> {
-    let output = tmux_command(socket_path, sandbox, args)?
+fn tmux_output(socket_path: &Path, args: &[&str]) -> Result<String> {
+    let output = tmux_command(socket_path, args)
         .output()
         .with_context(|| format!("failed to run tmux {}", args.join(" ")))?;
     if !output.status.success() {
@@ -7443,8 +6990,8 @@ fn tmux_output(socket_path: &Path, sandbox: &TmuxClientSandbox, args: &[&str]) -
     String::from_utf8(output.stdout).context("tmux output was not UTF-8")
 }
 
-fn tmux_status(socket_path: &Path, sandbox: &TmuxClientSandbox, args: &[&str]) -> Result<()> {
-    let output = tmux_command(socket_path, sandbox, args)?
+fn tmux_status(socket_path: &Path, args: &[&str]) -> Result<()> {
+    let output = tmux_command(socket_path, args)
         .output()
         .with_context(|| format!("failed to run tmux {}", args.join(" ")))?;
     if !output.status.success() {
@@ -7457,31 +7004,10 @@ fn tmux_status(socket_path: &Path, sandbox: &TmuxClientSandbox, args: &[&str]) -
     Ok(())
 }
 
-fn tmux_command(socket_path: &Path, sandbox: &TmuxClientSandbox, args: &[&str]) -> Result<Command> {
+fn tmux_command(socket_path: &Path, args: &[&str]) -> Command {
     let tmux = resolve_executable_path(DEFAULT_TMUX_PROGRAM)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_TMUX_PROGRAM));
-    let mut command = match sandbox {
-        TmuxClientSandbox::Unknown => bail!("terminal client sandbox was not resolved"),
-        TmuxClientSandbox::Host => Command::new(tmux),
-        TmuxClientSandbox::Bubblewrap(sandbox_args) => {
-            let bwrap = resolve_executable_path("bwrap").context("bwrap not found")?;
-            let prefix = crate::launch::sandbox_launcher_prefix();
-            let mut command = match prefix.split_first() {
-                Some((launcher, launcher_args)) => {
-                    let mut command = Command::new(launcher);
-                    command.args(launcher_args).arg(bwrap);
-                    command
-                }
-                None => Command::new(bwrap),
-            };
-            command
-                .args(sandbox_args)
-                .arg("--die-with-parent")
-                .arg("--")
-                .arg(tmux);
-            command
-        }
-    };
+    let mut command = Command::new(tmux);
     // The client sends its environment to the server; send nothing private.
     command.env_clear();
     for name in ["PATH", "LANG", "LC_ALL", "LC_CTYPE"] {
@@ -7490,7 +7016,7 @@ fn tmux_command(socket_path: &Path, sandbox: &TmuxClientSandbox, args: &[&str]) 
         }
     }
     command.arg("-S").arg(socket_path).args(args);
-    Ok(command)
+    command
 }
 
 fn non_empty_field(value: Option<&str>) -> Option<String> {
@@ -9634,14 +9160,6 @@ fn pkg_config_package_check(package: &str) -> Check {
     }
 }
 
-fn policy_tool_check(command: &str) -> PolicyToolCheck {
-    let check = command_path_check(command);
-    PolicyToolCheck {
-        ok: check.ok,
-        detail: check.detail,
-    }
-}
-
 pub(crate) fn first_available_command_name<'a>(commands: &'a [&str]) -> Option<&'a str> {
     commands
         .iter()
@@ -9701,47 +9219,6 @@ fn unix_now_millis() -> u128 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::policy::NetworkPolicy;
-
-    fn tool(ok: bool, name: &str) -> PolicyToolCheck {
-        PolicyToolCheck {
-            ok,
-            detail: if ok {
-                format!("{name} available")
-            } else {
-                format!("{name} missing")
-            },
-        }
-    }
-
-    fn capabilities(
-        bubblewrap: bool,
-        firejail: bool,
-        unshare: bool,
-        slirp4netns: bool,
-    ) -> PolicyRuntimeCapabilities {
-        PolicyRuntimeCapabilities::from_tools(
-            tool(bubblewrap, "bubblewrap"),
-            tool(firejail, "firejail"),
-            tool(unshare, "unshare"),
-            tool(slirp4netns, "slirp4netns"),
-        )
-    }
-
-    fn policy(
-        network: NetworkPolicy,
-        bubblewrap: bool,
-        slirp4netns: bool,
-    ) -> AppliedWorkspacePolicy {
-        AppliedWorkspacePolicy::new_with_capabilities(
-            "qa".to_string(),
-            Vec::new(),
-            network,
-            false,
-            0,
-            capabilities(bubblewrap, false, false, slirp4netns),
-        )
-    }
 
     #[test]
     fn observe_screenshot_reuses_stable_default_frame() {
@@ -9814,14 +9291,13 @@ mod tests {
         assert_eq!(screenshot.target, WorkspaceScreenshotTarget::Root);
     }
 
-    fn status_with_profile_defaults(policy: AppliedWorkspacePolicy) -> WorkspaceStatus {
+    fn status_with_profile_defaults() -> WorkspaceStatus {
         WorkspaceStatus {
             id: "qa-ws".to_string(),
             session: SessionSpec::default(),
             session_id: "session-qa".to_string(),
             purpose: Some("QA".to_string()),
-            profile_id: Some(policy.profile_id.clone()),
-            applied_policy: Some(policy),
+            profile_id: Some("qa".to_string()),
             profile_cwd: Some(PathBuf::from("/workspace/project")),
             profile_env: vec![
                 EnvVar {
@@ -9834,7 +9310,6 @@ mod tests {
                 },
             ],
             user_acknowledged_hidden_workspace: true,
-            user_acknowledged_unenforced_policy: true,
             ready: true,
             started_at_unix: 1,
             display: ":90".to_string(),
@@ -9853,7 +9328,7 @@ mod tests {
 
     #[test]
     fn legacy_status_and_manifest_without_session_default_to_x11() {
-        let status = status_with_profile_defaults(policy(NetworkPolicy::default(), true, true));
+        let status = status_with_profile_defaults();
         let manifest = workspace_manifest(&status, None);
 
         let mut status_json = serde_json::to_value(&status).expect("serialize status");
@@ -9878,7 +9353,7 @@ mod tests {
 
     #[test]
     fn launch_environment_reserves_session_identity_and_allows_regular_env() {
-        let status = status_with_profile_defaults(policy(NetworkPolicy::default(), true, true));
+        let status = status_with_profile_defaults();
         let mut command = Command::new("true");
         command.env("DBUS_SESSION_BUS_ADDRESS", "host-dbus");
         let launch_env = [
@@ -9902,7 +9377,7 @@ mod tests {
         }])
         .collect::<Vec<_>>();
 
-        crate::launch::configure_launch_environment(&mut command, &status, &launch_env, true);
+        crate::launch::configure_launch_environment(&mut command, &status, &launch_env);
         let envs = command
             .get_envs()
             .map(|(name, value)| {
@@ -10059,72 +9534,6 @@ mod tests {
         assert!(create_private_runtime_dir(&runtime(&base_link)).is_err());
 
         fs::remove_dir_all(scratch).expect("remove scratch");
-    }
-
-    #[test]
-    fn sandboxed_terminals_get_sandboxed_tmux_clients() {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        let mut status = status_with_profile_defaults(policy(
-            NetworkPolicy {
-                mode: NetworkMode::Disabled,
-                allow_hosts: Vec::new(),
-            },
-            true,
-            false,
-        ));
-        status.runtime_dir =
-            std::env::temp_dir().join(format!("awl-tclient-{}-{unique}", std::process::id()));
-        let socket = client_terminal_socket_path(&status.runtime_dir, "t");
-        let terminal_dir = socket.parent().expect("terminal dir").to_path_buf();
-        fs::create_dir_all(&terminal_dir).expect("terminal dir");
-
-        let TmuxClientSandbox::Bubblewrap(args) =
-            terminal_client_sandbox(&status, &socket).expect("sandboxed client")
-        else {
-            panic!("sandboxed terminal must get a sandboxed tmux client");
-        };
-        let canonical_dir = fs::canonicalize(&terminal_dir).expect("canonical dir");
-        assert!(args.windows(3).any(|window| window[0] == "--bind"
-            && Path::new(&window[1]) == canonical_dir
-            && Path::new(&window[2]) == terminal_dir));
-        // Nothing of the host beyond system directories and this terminal.
-        assert!(args.iter().any(|arg| arg == "--unshare-net"));
-        assert!(!args.windows(2).any(|pair| {
-            matches!(pair[0].as_str(), "--bind" | "--ro-bind")
-                && matches!(pair[1].as_str(), "/" | "/home")
-        }));
-        let command = tmux_command(&socket, &TmuxClientSandbox::Bubblewrap(args), &["ls"])
-            .expect("client command");
-        // bwrap, or unshare in front of it where supplementary groups are dropped.
-        let program = Path::new(command.get_program());
-        assert!(
-            program.ends_with("bwrap") || program.ends_with("unshare"),
-            "{program:?}"
-        );
-        assert!(command.get_args().any(|arg| arg == "--die-with-parent"));
-        assert!(command
-            .get_envs()
-            .all(|(name, _)| ["PATH", "LANG", "LC_ALL", "LC_CTYPE"]
-                .contains(&name.to_str().unwrap_or_default())));
-
-        let legacy = status.runtime_dir.join("terminal-t.tmux.sock");
-        assert!(terminal_client_sandbox(&status, &legacy).is_err());
-
-        status.applied_policy = None;
-        // Even a terminal launched without a policy gets the minimal sandbox.
-        assert!(matches!(
-            terminal_client_sandbox(&status, &socket).expect("client"),
-            TmuxClientSandbox::Bubblewrap(_)
-        ));
-        assert_eq!(
-            terminal_client_sandbox(&status, &legacy).expect("legacy host client"),
-            TmuxClientSandbox::Host
-        );
-        assert!(tmux_command(&socket, &TmuxClientSandbox::Unknown, &["ls"]).is_err());
-        fs::remove_dir_all(&status.runtime_dir).expect("remove test runtime");
     }
 
     #[test]
@@ -10310,7 +9719,7 @@ mod tests {
         name: &str,
         permissions: McpPermissionState,
     ) -> DaemonState {
-        let mut status = status_with_profile_defaults(policy(NetworkPolicy::default(), true, true));
+        let mut status = status_with_profile_defaults();
         status.id = name.to_string();
         let runtime_dir = env::temp_dir().join(format!("{name}-{}", std::process::id()));
         status.runtime_dir = runtime_dir.clone();
@@ -10331,8 +9740,6 @@ mod tests {
             command: command.iter().map(|part| part.to_string()).collect(),
             name: None,
             profile_id: None,
-            applied_policy: None,
-            user_acknowledged_unenforced_policy: false,
             cwd: None,
             env: Vec::new(),
             wait_window: false,
@@ -10349,11 +9756,10 @@ mod tests {
     #[test]
     fn daemon_launch_exceeding_ceiling_is_rejected_in_spawn_app() {
         let ceiling = crate::permissions::McpPermissionCeiling {
-            network: None,
-            mounts: Vec::new(),
             apps: crate::permissions::AppPermissionCeiling {
                 allow: vec![PathBuf::from("xterm")],
             },
+            ..Default::default()
         };
         let permissions = McpPermissionState::from_ceiling(
             Some(PathBuf::from("/tmp/daemon-ceiling-test.json")),
@@ -10367,7 +9773,6 @@ mod tests {
         // inherited profile_cwd (a non-existent path) so the shape-only launch
         // validation passes and the ceiling check is what rejects the launch.
         state.status.profile_id = None;
-        state.status.applied_policy = None;
         state.status.profile_cwd = None;
 
         let error = spawn_app(
@@ -10376,8 +9781,6 @@ mod tests {
                 command: vec!["curl".to_string(), "https://example.com".to_string()],
                 name: None,
                 profile_id: None,
-                applied_policy: None,
-                user_acknowledged_unenforced_policy: false,
                 cwd: None,
                 env: Vec::new(),
             },
@@ -10409,8 +9812,6 @@ mod tests {
                         command: vec!["xterm".to_string()],
                         name: None,
                         profile_id: None,
-                        applied_policy: None,
-                        user_acknowledged_unenforced_policy: false,
                         cwd: None,
                         env: Vec::new(),
                     },
@@ -10590,8 +9991,6 @@ mod tests {
             pid: 4242,
             process_group_id: Some(4242),
             profile_id: Some("qa".to_string()),
-            mount_isolation: "host".to_string(),
-            network_isolation: "host".to_string(),
             command: vec!["/bin/true".to_string()],
             cwd: None,
             env: Vec::new(),
@@ -10666,7 +10065,7 @@ mod tests {
 
     #[test]
     fn action_responses_use_compact_status_without_app_history() {
-        let mut status = status_with_profile_defaults(policy(NetworkPolicy::default(), true, true));
+        let mut status = status_with_profile_defaults();
         status.apps = vec![
             workspace_app_for_test("app-old-1"),
             workspace_app_for_test("app-old-2"),
@@ -10680,7 +10079,7 @@ mod tests {
 
     #[test]
     fn explicit_status_response_preserves_full_app_history() {
-        let mut status = status_with_profile_defaults(policy(NetworkPolicy::default(), true, true));
+        let mut status = status_with_profile_defaults();
         status.apps = vec![
             workspace_app_for_test("app-old-1"),
             workspace_app_for_test("app-old-2"),
@@ -10712,265 +10111,14 @@ mod tests {
     }
 
     #[test]
-    fn disabled_network_launch_plan_uses_bubblewrap_when_enforced() {
-        let policy = policy(
-            NetworkPolicy {
-                mode: NetworkMode::Disabled,
-                allow_hosts: Vec::new(),
-            },
-            true,
-            false,
-        );
-
-        assert_eq!(
-            launch_network_plan(Some(&policy)),
-            LaunchNetworkPlan::BubblewrapUnshareNet
-        );
-    }
-
-    #[test]
-    fn local_only_network_launch_plan_uses_loopback_only_namespace() {
-        let policy = policy(
-            NetworkPolicy {
-                mode: NetworkMode::LocalOnly,
-                allow_hosts: vec!["localhost:3000".to_string()],
-            },
-            true,
-            true,
-        );
-
-        assert_eq!(
-            launch_network_plan(Some(&policy)),
-            LaunchNetworkPlan::BubblewrapLoopbackOnly
-        );
-    }
-
-    #[test]
-    fn inherit_host_network_launch_plan_stays_host() {
-        let policy = policy(NetworkPolicy::default(), true, true);
-
-        assert_eq!(launch_network_plan(Some(&policy)), LaunchNetworkPlan::Host);
-    }
-
-    fn index_of(args: &[String], value: &str) -> Option<usize> {
-        args.iter().position(|arg| arg == value)
-    }
-
-    #[test]
-    fn net_only_sandbox_uses_fresh_dev_and_proc_not_host_dev_bind() {
-        let policy = policy(
-            NetworkPolicy {
-                mode: NetworkMode::Disabled,
-                allow_hosts: Vec::new(),
-            },
-            true,
-            false,
-        );
-        let status = status_with_profile_defaults(policy.clone());
-        let sandbox = bubblewrap_sandbox_for_launch(
-            &status,
-            Some(status.applied_policy.as_ref().expect("policy")),
-            Some(Path::new("/workspace/project")),
-            None,
-        )
-        .expect("sandbox build")
-        .expect("net-only sandbox should exist");
-        let args = &sandbox.args;
-
-        // Host filesystem stays visible, but devices and proc are fresh.
-        let bind_idx = index_of(args, "--bind").expect("--bind present");
-        let dev_idx = index_of(args, "--dev").expect("--dev present");
-        let proc_idx = index_of(args, "--proc").expect("--proc present");
-        assert!(args.contains(&"--unshare-net".to_string()));
-
-        // Ordering: bwrap applies mounts in argv order, so the fresh /dev and
-        // /proc must come after `--bind / /` to shadow the host's.
-        assert!(bind_idx < dev_idx, "--bind must precede --dev");
-        assert!(dev_idx < proc_idx, "--dev must precede --proc");
-
-        // The raw host device passthrough must be gone.
-        assert!(
-            !args
-                .windows(3)
-                .any(|w| w == ["--dev-bind".to_string(), "/".to_string(), "/".to_string()]),
-            "net-only sandbox must not bind host root with --dev-bind / /: {args:?}"
-        );
-        assert!(!args.contains(&"--dev-bind".to_string()));
-
-        assert_eq!(sandbox.mount_isolation, "host");
-    }
-
-    #[test]
-    fn restricted_mount_namespace_uses_fresh_devtmpfs() {
-        let host_dir = env::temp_dir().join(format!(
-            "agent-workspace-mount-dev-test-{}",
-            std::process::id()
-        ));
-        fs::create_dir_all(&host_dir).expect("host mount dir");
-
-        let policy = AppliedWorkspacePolicy::new_with_capabilities(
-            "qa".to_string(),
-            vec![crate::policy::ProfileMount {
-                host_path: host_dir.clone(),
-                workspace_path: PathBuf::from("/workspace/data"),
-                mode: crate::policy::MountMode::ReadWrite,
-            }],
-            NetworkPolicy::default(),
-            false,
-            0,
-            capabilities(true, false, false, true),
-        );
-        let status = status_with_profile_defaults(policy.clone());
-
-        let args = restricted_mount_namespace_args(
-            &status,
-            Some(&policy),
-            Some(Path::new("/workspace/project")),
-            LaunchNetworkPlan::Host,
-            None,
-        )
-        .expect("mount namespace args");
-
-        // Fresh devtmpfs instead of host device passthrough.
-        let dev_idx = index_of(&args, "--dev").expect("--dev present");
-        assert_eq!(args.get(dev_idx + 1), Some(&"/dev".to_string()));
-        assert!(
-            !args.windows(3).any(|w| w
-                == [
-                    "--dev-bind".to_string(),
-                    "/dev".to_string(),
-                    "/dev".to_string()
-                ]),
-            "mount namespace must not bind host /dev with --dev-bind /dev /dev: {args:?}"
-        );
-
-        // The existing fresh procfs is preserved.
-        let proc_idx = index_of(&args, "--proc").expect("--proc present");
-        assert_eq!(args.get(proc_idx + 1), Some(&"/proc".to_string()));
-
-        let xauthority = status.xauthority_path.display().to_string();
-        assert!(args
-            .windows(3)
-            .any(|window| window == ["--ro-bind", xauthority.as_str(), xauthority.as_str()]));
-        let runtime_dir = status.runtime_dir.display().to_string();
-        assert!(
-            !args
-                .windows(3)
-                .any(|window| window[1] == runtime_dir && window[2] == runtime_dir),
-            "sandbox must bind the Xauthority resource rather than the whole runtime directory"
-        );
-
-        fs::remove_dir_all(host_dir).expect("cleanup");
-    }
-
-    #[test]
-    fn restricted_mount_namespace_binds_canonical_host_path_for_symlink() {
-        let root = env::temp_dir().join(format!(
-            "agent-workspace-mount-symlink-test-{}",
-            std::process::id()
-        ));
-        let real_dir = root.join("real-data");
-        let link = root.join("link-data");
-        fs::create_dir_all(&real_dir).expect("real mount dir");
-        std::os::unix::fs::symlink(&real_dir, &link).expect("mount symlink");
-        let canonical_target = fs::canonicalize(&real_dir).expect("canonical real dir");
-
-        let policy = AppliedWorkspacePolicy::new_with_capabilities(
-            "qa".to_string(),
-            vec![crate::policy::ProfileMount {
-                host_path: link.clone(),
-                workspace_path: PathBuf::from("/workspace/data"),
-                mode: crate::policy::MountMode::ReadWrite,
-            }],
-            NetworkPolicy::default(),
-            false,
-            0,
-            capabilities(true, false, false, true),
-        );
-        let status = status_with_profile_defaults(policy.clone());
-
-        let args = restricted_mount_namespace_args(
-            &status,
-            Some(&policy),
-            Some(Path::new("/workspace/project")),
-            LaunchNetworkPlan::Host,
-            None,
-        )
-        .expect("mount namespace args");
-
-        // The canonical real path must be bound, not the symlink path.
-        let bind_idx = index_of(&args, "--bind").expect("read-write mount emits a --bind entry");
-        assert_eq!(
-            args.get(bind_idx + 1),
-            Some(&canonical_target.display().to_string()),
-            "symlinked host_path must be bound by its canonical real path: {args:?}"
-        );
-        assert_eq!(args.get(bind_idx + 2), Some(&"/workspace/data".to_string()));
-        assert!(
-            !args.contains(&link.display().to_string()),
-            "symlink path must not appear as a bind source: {args:?}"
-        );
-
-        fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    #[test]
-    fn external_symlink_target_parent_returns_target_directory_outside_covered_root() {
-        let root = env::temp_dir().join(format!(
-            "agent-workspace-resolv-test-{}",
-            std::process::id()
-        ));
-        let etc = root.join("etc");
-        let resolver = root.join("run/systemd/resolve");
-        fs::create_dir_all(&etc).expect("etc dir");
-        fs::create_dir_all(&resolver).expect("resolver dir");
-        fs::write(resolver.join("stub-resolv.conf"), "nameserver 127.0.0.53\n")
-            .expect("resolver file");
-        std::os::unix::fs::symlink(
-            "../run/systemd/resolve/stub-resolv.conf",
-            etc.join("resolv.conf"),
-        )
-        .expect("resolv symlink");
-
-        // The helper returns the canonical target; TMPDIR may be a symlink.
-        assert_eq!(
-            external_symlink_target_parent(&etc.join("resolv.conf"), &etc),
-            Some(fs::canonicalize(&resolver).expect("canonical resolver dir"))
-        );
-
-        fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    #[test]
-    fn external_symlink_target_parent_ignores_target_inside_covered_root() {
-        let root = env::temp_dir().join(format!(
-            "agent-workspace-etc-symlink-test-{}",
-            std::process::id()
-        ));
-        let etc = root.join("etc");
-        fs::create_dir_all(&etc).expect("etc dir");
-        fs::write(etc.join("real.conf"), "ok\n").expect("real file");
-        std::os::unix::fs::symlink("real.conf", etc.join("alias.conf")).expect("etc symlink");
-
-        assert_eq!(
-            external_symlink_target_parent(&etc.join("alias.conf"), &etc),
-            None
-        );
-
-        fs::remove_dir_all(root).expect("cleanup");
-    }
-
-    #[test]
     fn unprofiled_launch_inherits_started_profile_defaults() {
-        let status = status_with_profile_defaults(policy(NetworkPolicy::default(), true, true));
+        let status = status_with_profile_defaults();
         let spec = launch_spec_with_workspace_defaults(
             &status,
             LaunchSpec {
                 command: vec!["/bin/true".to_string()],
                 name: Some("probe".to_string()),
                 profile_id: None,
-                applied_policy: None,
-                user_acknowledged_unenforced_policy: false,
                 cwd: None,
                 env: vec![EnvVar {
                     name: "OVERRIDE".to_string(),
@@ -10981,8 +10129,6 @@ mod tests {
 
         assert_eq!(spec.profile_id.as_deref(), Some("qa"));
         assert_eq!(spec.cwd.as_deref(), Some(Path::new("/workspace/project")));
-        assert!(spec.applied_policy.is_some());
-        assert!(spec.user_acknowledged_unenforced_policy);
         assert_eq!(
             spec.env
                 .iter()
@@ -11001,23 +10147,13 @@ mod tests {
 
     #[test]
     fn explicit_launch_profile_skips_started_profile_defaults() {
-        let status = status_with_profile_defaults(policy(NetworkPolicy::default(), true, true));
-        let explicit_policy = AppliedWorkspacePolicy::new_with_capabilities(
-            "other".to_string(),
-            Vec::new(),
-            NetworkPolicy::default(),
-            false,
-            0,
-            capabilities(true, false, false, true),
-        );
+        let status = status_with_profile_defaults();
         let spec = launch_spec_with_workspace_defaults(
             &status,
             LaunchSpec {
                 command: vec!["/bin/true".to_string()],
                 name: Some("probe".to_string()),
                 profile_id: Some("other".to_string()),
-                applied_policy: Some(explicit_policy),
-                user_acknowledged_unenforced_policy: false,
                 cwd: None,
                 env: Vec::new(),
             },
@@ -11037,8 +10173,6 @@ mod tests {
                 command: vec!["/bin/true".to_string()],
                 name: Some("probe".to_string()),
                 profile_id: None,
-                applied_policy: None,
-                user_acknowledged_unenforced_policy: false,
                 cwd: None,
                 env: vec![EnvVar {
                     name: "AGENT_WORKSPACE_TEST".to_string(),
@@ -11063,8 +10197,6 @@ mod tests {
                 command: vec!["/bin/true".to_string()],
                 name: Some("run-probe".to_string()),
                 profile_id: None,
-                applied_policy: None,
-                user_acknowledged_unenforced_policy: false,
                 cwd: None,
                 env: Vec::new(),
             },
@@ -11139,21 +10271,5 @@ mod tests {
             .expect_err("session ids with spaces should be rejected");
 
         assert!(error.to_string().contains("workspace session id"));
-    }
-
-    #[test]
-    fn local_only_launch_policy_requires_acknowledgement_without_bubblewrap() {
-        let launch_policy = policy(
-            NetworkPolicy {
-                mode: NetworkMode::LocalOnly,
-                allow_hosts: vec!["localhost:3000".to_string()],
-            },
-            false,
-            false,
-        );
-
-        assert!(launch_policy.can_acknowledge_unenforced_policy());
-        assert!(launch_policy.has_requested_unenforced_policy());
-        assert!(!launch_policy.blocks_requested_unenforced_policy());
     }
 }
