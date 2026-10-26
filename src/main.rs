@@ -13,7 +13,6 @@ mod desktop;
 mod guardrails;
 mod launch;
 mod permissions;
-mod policy;
 mod profile;
 mod server;
 mod session;
@@ -22,10 +21,9 @@ mod workspace;
 mod xtest_input;
 
 use anyhow::{bail, Context, Result};
-use policy::{AppliedWorkspacePolicy, MountMode, ProfileMount};
 use profile::WorkspaceProfile;
 use session::SessionSpec;
-use std::{fs, path::PathBuf};
+use std::path::PathBuf;
 use workspace::{DaemonOptions, EnvVar, LaunchSpec, WorkspaceStartOptions};
 
 #[derive(Debug, PartialEq, Eq)]
@@ -282,13 +280,8 @@ fn handle_permissions(args: Vec<String>) -> Result<()> {
             print_json(&permissions::load_mcp_permission_state(json_path)?)
         }
         "template" => {
-            let (kind, allow_hosts, mounts, apps) = parse_permissions_template_options(&args[1..])?;
-            print_json(&permissions::template_permission_ceiling(
-                &kind,
-                allow_hosts,
-                mounts,
-                apps,
-            )?)
+            let (kind, apps) = parse_permissions_template_options(&args[1..])?;
+            print_json(&permissions::template_permission_ceiling(&kind, apps)?)
         }
         unknown => bail!("unknown permissions command '{unknown}'. Expected: validate, template"),
     }
@@ -1129,10 +1122,6 @@ fn parse_start_options(args: &[String]) -> Result<ParsedStartOptions> {
                 options.user_acknowledged_hidden_workspace = true;
                 index += 1;
             }
-            "--ack-unenforced-policy" => {
-                options.user_acknowledged_unenforced_policy = true;
-                index += 1;
-            }
             "--profile" => {
                 profile_id = Some(value_after(args, index, "--profile")?.to_string());
                 index += 2;
@@ -1214,12 +1203,6 @@ fn parse_open_profile_options(
         match args[index].as_str() {
             "--ack-hidden-workspace" => {
                 options.user_acknowledged_hidden_workspace = true;
-                index += 1;
-            }
-            "--ack-unenforced-policy" => {
-                options.user_acknowledged_unenforced_policy = true;
-                open_options.setup.acknowledge_unenforced_policy = true;
-                open_options.startup.acknowledge_unenforced_policy = true;
                 index += 1;
             }
             "--dry-run" => {
@@ -1970,59 +1953,25 @@ fn parse_permissions_validate_options(args: &[String]) -> Result<PathBuf> {
 }
 
 #[allow(clippy::type_complexity)]
-fn parse_permissions_template_options(
-    args: &[String],
-) -> Result<(String, Vec<String>, Vec<ProfileMount>, Vec<PathBuf>)> {
+fn parse_permissions_template_options(args: &[String]) -> Result<(String, Vec<PathBuf>)> {
     let kind = args
         .first()
-        .context("permissions template requires a kind: open, closed, or local")?
+        .context("permissions template requires a kind: open")?
         .to_string();
-    let mut allow_hosts = Vec::new();
-    let mut mounts = Vec::new();
     let mut apps = Vec::new();
     let mut index = 1;
     while index < args.len() {
         match args[index].as_str() {
-            "--allow-host" => {
-                allow_hosts.push(value_after(args, index, "--allow-host")?.to_string());
-                index += 2;
-            }
-            "--mount" => {
-                mounts.push(parse_permission_mount_spec(value_after(args, index, "--mount")?)?);
-                index += 2;
-            }
             "--app" => {
                 apps.push(PathBuf::from(value_after(args, index, "--app")?));
                 index += 2;
             }
-            flag => bail!(
-                "unknown permissions template option '{flag}'. Expected: [--allow-host HOST] [--mount HOST:WORKSPACE[:read_only|read_write]] [--app PROGRAM]"
-            ),
+            flag => {
+                bail!("unknown permissions template option '{flag}'. Expected: [--app PROGRAM]")
+            }
         }
     }
-    Ok((kind, allow_hosts, mounts, apps))
-}
-
-fn parse_permission_mount_spec(spec: &str) -> Result<ProfileMount> {
-    let mut parts = spec.splitn(3, ':');
-    let host_path = parts
-        .next()
-        .filter(|part| !part.is_empty())
-        .context("--mount requires HOST:WORKSPACE[:read_only|read_write]")?;
-    let workspace_path = parts
-        .next()
-        .filter(|part| !part.is_empty())
-        .context("--mount requires HOST:WORKSPACE[:read_only|read_write]")?;
-    let mode = match parts.next().unwrap_or("read_only") {
-        "read_only" | "ro" => MountMode::ReadOnly,
-        "read_write" | "rw" => MountMode::ReadWrite,
-        other => bail!("unknown --mount mode '{other}'. Expected read_only or read_write"),
-    };
-    Ok(ProfileMount {
-        host_path: PathBuf::from(host_path),
-        workspace_path: PathBuf::from(workspace_path),
-        mode,
-    })
+    Ok((kind, apps))
 }
 
 fn parse_profile_json_file_options(
@@ -2069,7 +2018,7 @@ fn parse_profile_template_options(
     let kind = args
         .first()
         .context(
-            "profile template requires a kind, for example project-dev, restricted-chrome, or browser-session",
+            "profile template requires a kind, for example project-dev, chrome, or browser-session",
         )?
         .to_string();
     let mut id = None;
@@ -2206,7 +2155,6 @@ fn parse_launch_options(args: &[String]) -> Result<LaunchOptions> {
     let mut profile_id = None;
     let mut cwd = None;
     let mut cwd_explicit = false;
-    let mut user_acknowledged_unenforced_policy = false;
     let mut env = Vec::new();
     let mut wait_window = false;
     let mut window_timeout_ms = None;
@@ -2235,10 +2183,6 @@ fn parse_launch_options(args: &[String]) -> Result<LaunchOptions> {
             "--env" => {
                 env.push(parse_env_assignment(value_after(args, index, "--env")?)?);
                 index += 2;
-            }
-            "--ack-unenforced-policy" => {
-                user_acknowledged_unenforced_policy = true;
-                index += 1;
             }
             "--dry-run" => {
                 dry_run = true;
@@ -2271,8 +2215,6 @@ fn parse_launch_options(args: &[String]) -> Result<LaunchOptions> {
                     command,
                     name,
                     profile_id: None,
-                    applied_policy: None,
-                    user_acknowledged_unenforced_policy,
                     cwd,
                     env,
                 };
@@ -2297,8 +2239,6 @@ fn parse_launch_options(args: &[String]) -> Result<LaunchOptions> {
                     command,
                     name,
                     profile_id: None,
-                    applied_policy: None,
-                    user_acknowledged_unenforced_policy,
                     cwd,
                     env,
                 };
@@ -2334,7 +2274,6 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions> {
     let mut profile_id = None;
     let mut cwd = None;
     let mut cwd_explicit = false;
-    let mut user_acknowledged_unenforced_policy = false;
     let mut timeout_ms = None;
     let mut tail_bytes = None;
     let mut kill_on_timeout = false;
@@ -2363,10 +2302,6 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions> {
             "--env" => {
                 env.push(parse_env_assignment(value_after(args, index, "--env")?)?);
                 index += 2;
-            }
-            "--ack-unenforced-policy" => {
-                user_acknowledged_unenforced_policy = true;
-                index += 1;
             }
             "--dry-run" => {
                 dry_run = true;
@@ -2401,8 +2336,6 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions> {
                     command,
                     name,
                     profile_id: None,
-                    applied_policy: None,
-                    user_acknowledged_unenforced_policy,
                     cwd,
                     env,
                 };
@@ -2427,8 +2360,6 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions> {
                     command,
                     name,
                     profile_id: None,
-                    applied_policy: None,
-                    user_acknowledged_unenforced_policy,
                     cwd,
                     env,
                 };
@@ -4174,10 +4105,6 @@ fn parse_workspace_setup_options(
                 options.dry_run = true;
                 index += 1;
             }
-            "--ack-unenforced-policy" => {
-                options.acknowledge_unenforced_policy = true;
-                index += 1;
-            }
             "--timeout-ms" => {
                 options.wait = true;
                 options.timeout_ms = Some(
@@ -4218,10 +4145,6 @@ fn parse_profile_launch_options(
             "--profile" => {
                 profile_id = Some(value_after(args, index, "--profile")?.to_string());
                 index += 2;
-            }
-            "--ack-unenforced-policy" => {
-                options.acknowledge_unenforced_policy = true;
-                index += 1;
             }
             "--dry-run" => {
                 options.dry_run = true;
@@ -4286,10 +4209,9 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
     let mut runtime_dir = None;
     let mut socket_path = None;
     let mut xauthority_path = None;
-    let mut policy_path = None;
     let mut permissions_source = None;
+    let mut protocol = None;
     let mut user_acknowledged_hidden_workspace = false;
-    let mut user_acknowledged_unenforced_policy = false;
     let mut index = 0;
 
     while index < args.len() {
@@ -4366,8 +4288,8 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
                 xauthority_path = Some(PathBuf::from(value_after(&args, index, "--xauthority")?));
                 index += 2;
             }
-            "--policy" => {
-                policy_path = Some(PathBuf::from(value_after(&args, index, "--policy")?));
+            "--protocol" => {
+                protocol = Some(value_after(&args, index, "--protocol")?.to_string());
                 index += 2;
             }
             "--permissions" => {
@@ -4379,15 +4301,16 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
                 user_acknowledged_hidden_workspace = true;
                 index += 1;
             }
-            "--ack-unenforced-policy" => {
-                user_acknowledged_unenforced_policy = true;
-                index += 1;
-            }
             flag => bail!("unknown daemon option '{flag}'"),
         }
     }
-    let applied_policy = policy_path.as_ref().map(read_applied_policy).transpose()?;
 
+    if protocol.as_deref() != Some(workspace::IPC_PROTOCOL_VERSION.to_string().as_str()) {
+        bail!(
+            "this workspace daemon speaks protocol {}, and the MCP server that started it is older; restart or reconnect the MCP server",
+            workspace::IPC_PROTOCOL_VERSION
+        );
+    }
     let id = id.context("daemon missing --id")?;
     let session_id = session_id.unwrap_or_else(|| workspace::new_session_id(&id));
 
@@ -4401,11 +4324,9 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
         session_id,
         purpose,
         profile_id,
-        applied_policy,
         profile_cwd,
         profile_env,
         user_acknowledged_hidden_workspace,
-        user_acknowledged_unenforced_policy,
         display: display.context("daemon missing --display")?,
         width: width.context("daemon missing --width")?,
         height: height.context("daemon missing --height")?,
@@ -4414,13 +4335,6 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
         xauthority_path: xauthority_path.context("daemon missing --xauthority")?,
         permissions_source,
     })
-}
-
-fn read_applied_policy(path: &PathBuf) -> Result<AppliedWorkspacePolicy> {
-    let content = fs::read_to_string(path)
-        .with_context(|| format!("failed to read applied policy {}", path.display()))?;
-    serde_json::from_str(&content)
-        .with_context(|| format!("failed to parse applied policy {}", path.display()))
 }
 
 fn value_after<'a>(args: &'a [String], index: usize, flag: &str) -> Result<&'a str> {
@@ -4471,10 +4385,10 @@ Usage:
   agent-workspace-linux profile export ID [--output PATH] [--replace]
   agent-workspace-linux profile delete [--dry-run] ID
   agent-workspace-linux profile template project-dev [--id ID] [--host-path PATH]
-  agent-workspace-linux profile template restricted-chrome [--id ID] [--browser-path PATH]
+  agent-workspace-linux profile template chrome [--id ID] [--browser-path PATH]
   agent-workspace-linux profile template browser-session [--id ID] [--browser-path PATH] --user-data-dir PATH
-  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--ack-unenforced-policy] [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland|cosmic] [--scale N] [--width PX] [--height PX]
-  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] [--ack-unenforced-policy] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland|cosmic] [--scale N] [--width PX] [--height PX]
+  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland|cosmic] [--scale N] [--width PX] [--height PX]
+  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland|cosmic] [--scale N] [--width PX] [--height PX]
   agent-workspace-linux workspace list
   agent-workspace-linux workspace cleanup [--id ID] [--dry-run]
   agent-workspace-linux workspace status [--id ID]
@@ -4482,9 +4396,9 @@ Usage:
   agent-workspace-linux workspace artifacts [--id ID] [--existing]
   agent-workspace-linux workspace ipc-info [--id ID]
   agent-workspace-linux workspace env [--id ID] [--shell]
-  agent-workspace-linux workspace launch [--dry-run] [--id ID] [--name NAME] [--profile PROFILE] [--ack-unenforced-policy] [--cwd DIR] [--env NAME=VALUE] [--wait-window] [--window-timeout-ms N] [--screenshot-window] -- COMMAND [ARGS...]
-  agent-workspace-linux workspace run [--dry-run] [--id ID] [--name NAME] [--profile PROFILE] [--ack-unenforced-policy] [--cwd DIR] [--env NAME=VALUE] [--timeout-ms N] [--tail-bytes N] [--kill-on-timeout] -- COMMAND [ARGS...]
-  agent-workspace-linux workspace launch-profile-apps [--dry-run] [--id ID] --profile PROFILE [--ack-unenforced-policy] [--wait-window] [--window-timeout-ms N] [--screenshot-window]
+  agent-workspace-linux workspace launch [--dry-run] [--id ID] [--name NAME] [--profile PROFILE] [--cwd DIR] [--env NAME=VALUE] [--wait-window] [--window-timeout-ms N] [--screenshot-window] -- COMMAND [ARGS...]
+  agent-workspace-linux workspace run [--dry-run] [--id ID] [--name NAME] [--profile PROFILE] [--cwd DIR] [--env NAME=VALUE] [--timeout-ms N] [--tail-bytes N] [--kill-on-timeout] -- COMMAND [ARGS...]
+  agent-workspace-linux workspace launch-profile-apps [--dry-run] [--id ID] --profile PROFILE [--wait-window] [--window-timeout-ms N] [--screenshot-window]
   agent-workspace-linux workspace apps [--id ID] [--app APP_ID_OR_PID_OR_NAME] [--name TEXT] [--command TEXT] [--profile PROFILE] [--running|--stopped]
   agent-workspace-linux workspace browser-targets [--id ID] [--app APP_ID_OR_PID_OR_NAME] [--user-data-dir PATH] [--timeout-ms N]
   agent-workspace-linux workspace browser-snapshot [--id ID] [--app APP_ID_OR_PID_OR_NAME] [--user-data-dir PATH] [--target TARGET_ID] [--title TEXT] [--url-contains TEXT] [--max-text-chars N] [--timeout-ms N]
@@ -4538,7 +4452,7 @@ Usage:
   agent-workspace-linux workspace logs [--id ID] [--stream stdout|stderr] [--tail-bytes N] APP_ID_OR_PID_OR_NAME
   agent-workspace-linux workspace wait-app [--id ID] [--timeout-ms N] [--kill-on-timeout] APP_ID_OR_PID_OR_NAME
   agent-workspace-linux workspace events [--id ID] [--tail N] [--since SEQUENCE]
-  agent-workspace-linux workspace setup [--dry-run] [--id ID] --profile PROFILE [--wait] [--timeout-ms N] [--kill-on-timeout] [--ack-unenforced-policy]
+  agent-workspace-linux workspace setup [--dry-run] [--id ID] --profile PROFILE [--wait] [--timeout-ms N] [--kill-on-timeout]
   agent-workspace-linux workspace kill-app [--id ID] [--dry-run] APP_ID_OR_PID_OR_NAME
   agent-workspace-linux workspace stop [--id ID] [--timeout-ms N] [--dry-run]"#
     );
@@ -4568,7 +4482,7 @@ Usage:
   agent-workspace-linux viewer close (--id ID | --all) [--dry-run]
 
 Opens the small host-visible Agent Workspace GPUI monitor.
-The viewer runs outside the MCP stdio server and surfaces the selected isolated
+The viewer runs outside the MCP stdio server and surfaces the selected
 workspace without taking over the user's desktop.
 By default it does not request always-on-top state; --always-on-top opts into
 Wayland layer-shell or X11/Xwayland above hints for hosts that explicitly want
@@ -4577,7 +4491,7 @@ that behavior.
 is removed; workspace_open_viewer uses this so MCP-launched monitors do not
 become orphan windows.
 --input-forwarding allows the viewer's explicit in-window Input toggle to arm
-manual mouse/keyboard/paste forwarding into the isolated workspace. It is off by
+manual mouse/keyboard/paste forwarding into the workspace. It is off by
 default and still requires a visible second-click confirmation in the viewer UI.
 The list and close subcommands use the repo-owned viewer registry, so they can
 inspect and close GPUI viewers even when the desktop compositor does not expose
@@ -4614,9 +4528,41 @@ mod xwayland_launcher_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    // An MCP server older than the binary would spawn a daemon whose replies
+    // it cannot read; the daemon refuses before creating anything.
+    #[test]
+    fn a_daemon_from_an_older_spawner_is_refused() {
+        let base = [
+            "--id",
+            "w",
+            "--display",
+            ":91",
+            "--width",
+            "800",
+            "--height",
+            "600",
+            "--runtime-dir",
+            "/tmp/w",
+            "--socket",
+            "/tmp/w/control.sock",
+            "--xauthority",
+            "/tmp/w/Xauthority",
+        ];
+        let error = parse_daemon_options(args(&base)).unwrap_err().to_string();
+        assert!(
+            error.contains("restart or reconnect the MCP server"),
+            "{error}"
+        );
+        let version = workspace::IPC_PROTOCOL_VERSION.to_string();
+        let mut current = vec!["--protocol", version.as_str()];
+        current.extend(base);
+        assert_eq!(parse_daemon_options(args(&current)).unwrap().id, "w");
     }
 
     #[test]
@@ -4713,8 +4659,6 @@ mod tests {
                 command: vec!["sh".to_string(), "-c".to_string(), "true".to_string()],
                 name: None,
                 profile_id: None,
-                applied_policy: None,
-                user_acknowledged_unenforced_policy: false,
                 cwd: None,
                 env: Vec::<EnvVar>::new(),
             })
@@ -4761,7 +4705,7 @@ mod tests {
             options
                 .permissions
                 .message
-                .contains("does not restrict network, mounts, or app launches"),
+                .contains("does not restrict app launches"),
             "empty permissions file should be advisory/open, not a forced MCP sandbox"
         );
     }

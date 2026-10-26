@@ -1,17 +1,20 @@
 # Security Policy
 
-`agent-workspace-linux` creates isolated Linux desktop workspaces for agents, so
-security reports should focus on boundary escapes, unsafe defaults, credential
-exposure, permission-ceiling bypasses, or real-world action approval failures.
+`agent-workspace-linux` runs Linux desktops in the background for agents. It is
+not a sandbox: workspace apps run as the user, with the user's files, network,
+keyring and SSH agent. Security reports should focus on actions reaching the
+user's visible desktop, wrong read-only/write/destructive marks, app allowlist
+bypasses, live-control bypasses, credential exposure in logs or events, or
+real-world action approval failures.
 
 ## Supported Versions
 
 | Version | Supported |
 |---------|-----------|
-| 0.1.x   | Yes       |
+| latest  | Yes       |
 
-This project is pre-1.0. Security fixes target `main` until release branches
-exist. Only the current `0.1.x` line receives fixes.
+This project is pre-1.0. Security fixes target `main` and ship in the next
+release.
 
 ## Reporting
 
@@ -29,28 +32,29 @@ Helpful reports include:
 - the exact MCP or CLI command used
 - whether the MCP was started with `--permissions`
 - the output of `agent-workspace-linux doctor`, with local paths redacted if needed
-- the smallest reproduction that shows the boundary failure
+- the smallest reproduction that shows the failure
 
 ## Trust Model
 
 - **Control socket**: the workspace control socket is a same-uid Unix socket
   with mode 0600. It provides no cross-user protection by design — any process
-  running as the same UID can connect. Running the server as a dedicated
-  isolated user is the recommended mitigation in multi-user environments.
-- **Permission ceiling**: with a `--permissions PATH` file (or the
-  `AGENT_WORKSPACE_PERMISSIONS` environment variable) the configured ceiling is
-  the authoritative boundary for that MCP process, enforced at both the MCP
-  front-end and the workspace daemon's IPC socket and unchangeable without
-  restarting the process. Without it, the MCP adds no ceiling of its own; the
-  host/client harness owns the session boundary.
+  running as the same UID can connect.
+- **Not a sandbox**: an app launched in a workspace can do anything you can.
+  Agents act for you; the controls below decide what they may do.
+- **Action marks**: every MCP tool is marked read-only, write, destructive or
+  open-world, so the agent host can ask before risky actions.
+- **App allowlist**: with a `--permissions PATH` file (or the
+  `AGENT_WORKSPACE_PERMISSIONS` environment variable), `apps.allow` limits which
+  programs agents may launch for the life of that MCP process, enforced at both
+  the MCP front end and the workspace daemon's IPC socket. Without it, the MCP
+  adds no ceiling of its own; the host/client harness owns approval.
 - **Live viewer control**: the GPUI monitor allows a human operator to pause or
   stop agent actions. This is best-effort — it does not provide a hard
   cryptographic guarantee against a racing agent action before the control
   signal is received.
-- **Workspace isolation**: workspace input, screenshots, windows, clipboard, and
-  browser control should target the isolated workspace, not the user's host
-  desktop or host Chrome. Leakage to the host display is a reportable boundary
-  violation.
+- **Workspace vs. desktop**: workspace input, screenshots, windows, clipboard,
+  and browser control target the workspace, not the user's visible desktop or
+  host Chrome. Leakage onto the desktop is a reportable bug.
 - **Browser profiles**: browser-session profiles are for explicitly
   user-approved browser data only. Use copied/disposable profiles for
   real-account dogfood whenever possible.

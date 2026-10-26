@@ -8,7 +8,6 @@ pub struct GuardrailSummary {
     pub acknowledgements: Vec<GuardrailRule>,
     pub previews: Vec<GuardrailRule>,
     pub explicit_overrides: Vec<GuardrailRule>,
-    pub policy_modes: Vec<GuardrailRule>,
     pub timeout_terminations: Vec<GuardrailRule>,
     pub scope_notes: Vec<GuardrailRule>,
 }
@@ -46,9 +45,9 @@ pub fn guardrail_summary() -> GuardrailSummary {
             agent_rule(
                 "workspace_open_profile",
                 "dry_run=true previews start/setup/startup; real open allowed only when live control is active",
-                "real open is blocked without hidden-workspace ack and any required policy ack",
-                "hidden workspace acknowledgement and possibly unenforced policy acknowledgement",
-                "acknowledge_hidden_workspace=true, acknowledge_unenforced_policy=true",
+                "real open is blocked without acknowledge_hidden_workspace=true",
+                "hidden workspace acknowledgement",
+                "acknowledge_hidden_workspace=true",
             ),
             agent_rule(
                 "profile_put/profile_import/profile_delete",
@@ -59,10 +58,10 @@ pub fn guardrail_summary() -> GuardrailSummary {
             ),
             agent_rule(
                 "workspace_launch_app/workspace_run_app",
-                "dry_run=true previews command/cwd/env/policy; real launch/run allowed only when live control is active",
-                "profile policy requests can block until acknowledged or enforced",
-                "unenforced policy acknowledgement when profile_check reports it",
-                "acknowledge_unenforced_policy=true",
+                "dry_run=true previews command/cwd/env; real launch/run allowed only when live control is active",
+                "programs outside a configured MCP app allowlist are rejected",
+                "user approval for apps that act outside the workspace, such as sending mail or pushing code",
+                "dry_run=true for preview",
             ),
             agent_rule(
                 "workspace_browser_navigate",
@@ -100,22 +99,6 @@ pub fn guardrail_summary() -> GuardrailSummary {
                 "--ack-hidden-workspace or acknowledge_hidden_workspace=true",
                 "Records explicit user awareness that a separate workspace exists outside the visible desktop.",
             ),
-            rule(
-                "unenforced-profile-policy",
-                "acknowledgement",
-                &[
-                    "workspace start --profile",
-                    "workspace open-profile",
-                    "workspace launch --profile",
-                    "workspace run --profile",
-                    "workspace setup",
-                    "workspace launch-profile-apps",
-                    "profile_check",
-                ],
-                "Profiles that request mount or network policy not enforced by the runtime are rejected at action time.",
-                "--ack-unenforced-policy or acknowledge_unenforced_policy=true",
-                "Records that the user accepted running with declared policy that is visible but not fully enforced.",
-            ),
         ],
         previews: vec![
             rule(
@@ -124,7 +107,7 @@ pub fn guardrail_summary() -> GuardrailSummary {
                 &["workspace start", "workspace_start"],
                 "Workspace start creates a hidden runtime only when dry_run is false.",
                 "--dry-run or dry_run=true",
-                "Returns acknowledgement, runtime readiness, profile policy, and would-start status without creating X11 runtime state.",
+                "Returns acknowledgement, runtime readiness, and would-start status without creating runtime state.",
             ),
             rule(
                 "profile-open-preview",
@@ -140,7 +123,7 @@ pub fn guardrail_summary() -> GuardrailSummary {
                 &["workspace launch", "workspace_launch_app"],
                 "Workspace launch spawns a process only when dry_run is false.",
                 "--dry-run or dry_run=true",
-                "Requires a running workspace daemon, then returns command, cwd/env, profile policy, acknowledgement, isolation, and would-launch status without creating an app record.",
+                "Requires a running workspace daemon, then returns command, cwd/env, and would-launch status without creating an app record.",
             ),
             rule(
                 "workspace-run-preview",
@@ -240,81 +223,6 @@ pub fn guardrail_summary() -> GuardrailSummary {
                 "Allows intentional overwrite of an existing exported profile JSON file.",
             ),
         ],
-        policy_modes: vec![
-            rule(
-                "profile-network-inherit-host",
-                "policy_mode",
-                &["profile network.mode=inherit_host", "profile_check"],
-                "No restricted network policy is requested.",
-                "No unenforced-policy acknowledgement is needed.",
-                "Launched apps use the host network, and profile_check reports network.state=not_requested.",
-            ),
-            rule(
-                "profile-network-disabled",
-                "policy_mode",
-                &[
-                    "profile network.mode=disabled",
-                    "profile_check",
-                    "workspace start --profile",
-                    "workspace launch --profile",
-                ],
-                "Network-disabled profiles are enforced only when bubblewrap is available.",
-                "Install bubblewrap for active --unshare-net enforcement, or pass --ack-unenforced-policy to run without it.",
-                "profile_check reports network.state=enforced with backend=bubblewrap_unshare_net, or state=unenforced with required_acknowledgement=ack_unenforced_policy.",
-            ),
-            rule(
-                "profile-network-local-only",
-                "policy_mode",
-                &[
-                    "profile network.mode=local_only",
-                    "profile_check",
-                    "workspace start --profile",
-                    "workspace launch --profile",
-                ],
-                "Local-only profiles are enforced when bubblewrap is available by launching apps in a loopback-only network namespace.",
-                "Install bubblewrap for active loopback-only enforcement, or pass --ack-unenforced-policy to run without it.",
-                "profile_check reports network.state=enforced with backend=bubblewrap_loopback_only when active; host localhost services are not bridged into the sandbox.",
-            ),
-            rule(
-                "profile-network-allowlist",
-                "policy_mode",
-                &[
-                    "profile network.mode=allowlist",
-                    "profile_check",
-                    "workspace start --profile",
-                    "workspace launch --profile",
-                ],
-                "Host allowlists are advanced/legacy declared intent and are outside the current closed/local/open product scope.",
-                "--ack-unenforced-policy or acknowledge_unenforced_policy=true",
-                "Records acceptance that allow_hosts is visible in policy status but launched apps still keep host network access.",
-            ),
-            rule(
-                "profile-mounts",
-                "policy_mode",
-                &[
-                    "profile mounts",
-                    "profile_check",
-                    "workspace start --profile",
-                    "workspace launch --profile",
-                ],
-                "Mount profiles are enforced only when bubblewrap is available.",
-                "Install bubblewrap for active mount namespace enforcement, or pass --ack-unenforced-policy to run without it.",
-                "profile_check reports mounts.state=enforced with backend=bubblewrap_mount_namespace, or state=unenforced with required_acknowledgement=ack_unenforced_policy.",
-            ),
-            rule(
-                "profile-require-enforced-policy",
-                "policy_guardrail",
-                &[
-                    "profile require_enforced_policy=true",
-                    "profile_check",
-                    "workspace start --profile",
-                    "workspace launch --profile",
-                ],
-                "Profiles may opt into fail-closed policy handling.",
-                "Set require_enforced_policy=true in the saved profile.",
-                "If any requested mount or network policy is unenforced, starts and launches are rejected even when --ack-unenforced-policy is passed.",
-            ),
-        ],
         timeout_terminations: vec![
             rule(
                 "run-app-kill-on-timeout",
@@ -355,9 +263,22 @@ pub fn guardrail_summary() -> GuardrailSummary {
                     "workspace window tools",
                     "workspace app tools",
                 ],
-                "Tools attach to the isolated workspace display and control socket, not the host desktop.",
+                "Tools attach to the workspace display and control socket, not the host desktop.",
                 "workspace start creates DISPLAY/XAUTHORITY/AGENT_WORKSPACE_SOCKET for the hidden workspace",
-                "Pointer, keyboard, window, clipboard, and app controls are scoped to the isolated X11 workspace.",
+                "Pointer, keyboard, window, clipboard, and app controls are scoped to the workspace's X11 display.",
+            ),
+            rule(
+                "workspace-apps-run-as-the-user",
+                "scope",
+                &[
+                    "workspace_launch_app",
+                    "workspace_run_app",
+                    "workspace_open_browser",
+                    "workspace_run_in_terminal",
+                ],
+                "The workspace is not a sandbox: an app launched in it acts for the user, outside the workspace too.",
+                "mcp_action_catalog marks read-only, write, destructive and open-world actions; an MCP app allowlist limits launches",
+                "Apps run as the user with the user's files, network, keyring and SSH agent; only their windows stay in the workspace.",
             ),
             rule(
                 "event-log-redaction",

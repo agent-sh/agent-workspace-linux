@@ -56,7 +56,7 @@ state without constantly capturing screen pixels. Screen streaming is off by
 default; enabling `View` overwrites one reusable frame file instead of creating a
 new timestamped screenshot per refresh. The footer favors user-useful context:
 in-flight viewer actions, latest workspace events, browser reads/navigations,
-active app/window, inferred task intent, and permission/isolation state.
+active app/window, inferred task intent, and permission state.
 
 Manual input forwarding is deliberately separate from MCP live control. The MCP
 can be `active` while the viewer remains monitor-only, and an input-capable

@@ -1,9 +1,8 @@
-use crate::policy::{AppliedWorkspacePolicy, NetworkMode};
 use crate::workspace::{EnvVar, WorkspaceStatus};
-use anyhow::{bail, Context, Result};
 use std::{
-    collections::BTreeSet,
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
@@ -23,13 +22,12 @@ pub(crate) fn merged_env(mut base: Vec<EnvVar>, overrides: Vec<EnvVar>) -> Vec<E
     base
 }
 
-/// Host-session environment variables that must not leak from the launching
-/// process into apps started inside the isolated workspace. These point at the
-/// host user's live desktop session services (D-Bus, accessibility, input,
-/// PulseAudio, SSH/GPG agents, keyring, login session) and would let a workspace
-/// app reach back into the host session. We remove them with targeted
-/// `env_remove` only; PATH/HOME and the session-specific display handling
-/// applied afterward are deliberately left intact.
+/// Variables of the user's desktop session that would make a workspace
+/// process use the user's desktop instead of the workspace: its buses,
+/// accessibility, input, sound and login session. Compositors and helpers run
+/// without them. Apps then get the workspace's display and buses, and back
+/// from the user's session what acts for the user: agents, sound and the
+/// XDG directories (`use_the_users_session`). PATH and HOME are left intact.
 const HOST_SESSION_ENV_VARS: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
     "DBUS_STARTER_ADDRESS",
@@ -61,9 +59,8 @@ pub(crate) fn scrub_host_session_environment(command: &mut Command) {
     }
 }
 
-/// The attach environment for trusted external controllers (the agent host,
-/// computer-use-linux). It keeps the compositor-facing session bus; only apps
-/// launched into the workspace are switched to the client bus.
+/// The attach environment for external controllers (the agent host,
+/// computer-use-linux): the workspace's display, buses and runtime directory.
 pub(crate) fn workspace_environment_variables(status: &WorkspaceStatus) -> Vec<EnvVar> {
     let mut variables = vec![
         EnvVar {
@@ -111,15 +108,13 @@ pub(crate) fn workspace_environment_variables(status: &WorkspaceStatus) -> Vec<E
     variables
 }
 
-/// Sandboxed launches get the client bus, which carries no compositor
-/// control services. Unsandboxed launches run as the same user with full file
-/// access and could open the control bus anyway; they keep it, as desktop
-/// services such as xdg-desktop-portal-kde need the compositor.
+/// The environment of an app launched into the workspace: the workspace's
+/// display, buses and runtime directory, the user's own session, then the
+/// launch's own variables.
 pub(crate) fn configure_launch_environment(
     command: &mut Command,
     status: &WorkspaceStatus,
     launch_env: &[EnvVar],
-    sandboxed: bool,
 ) {
     scrub_host_session_environment(command);
     for env_var in launch_env {
@@ -135,445 +130,115 @@ pub(crate) fn configure_launch_environment(
         &status.xauthority_path,
         &status.runtime_dir,
     );
-    if sandboxed {
-        configure_application_bus(command, status);
-    }
-}
-
-fn configure_application_bus(command: &mut Command, status: &WorkspaceStatus) {
-    status.session.configure_sandboxed_environment(command);
-    if status.session.backend.requires_client_application_bus() {
-        let bus = status.runtime_dir.join("client-bus");
-        command.env(
-            "DBUS_SESSION_BUS_ADDRESS",
-            crate::session::private::socket_address(&bus),
-        );
-    }
-}
-
-pub(crate) struct SessionSandboxResources {
-    pub(crate) read_only_binds: Vec<PathBuf>,
-    pub(crate) read_write_binds: Vec<PathBuf>,
-}
-
-pub(crate) struct BubblewrapSandbox {
-    pub(crate) args: Vec<String>,
-    pub(crate) mount_isolation: String,
-    pub(crate) network_isolation: String,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum LaunchNetworkPlan {
-    Host,
-    BubblewrapUnshareNet,
-    BubblewrapLoopbackOnly,
-}
-
-impl LaunchNetworkPlan {
-    fn uses_bubblewrap(self) -> bool {
-        matches!(
-            self,
-            Self::BubblewrapUnshareNet | Self::BubblewrapLoopbackOnly
-        )
-    }
-
-    fn unshare_net(self) -> bool {
-        matches!(
-            self,
-            Self::BubblewrapUnshareNet | Self::BubblewrapLoopbackOnly
-        )
-    }
-
-    fn isolation_label(self) -> &'static str {
-        match self {
-            Self::Host => "host",
-            Self::BubblewrapUnshareNet => "bubblewrap_unshare_net",
-            Self::BubblewrapLoopbackOnly => "bubblewrap_loopback_only",
+    use_the_users_session(command, crate::session::host_services::user_session_var);
+    for env_var in launch_env {
+        if is_user_session_var(&env_var.name) {
+            command.env(&env_var.name, &env_var.value);
         }
     }
 }
 
-/// `terminal_dir` is the private client directory of a managed terminal launch.
-/// It is the only client directory bound into the sandbox: sharing one across
-/// launches would let any sandboxed app drive another terminal's tmux server.
-pub(crate) fn bubblewrap_sandbox_for_launch(
-    status: &WorkspaceStatus,
-    policy: Option<&AppliedWorkspacePolicy>,
-    cwd: Option<&Path>,
-    terminal_dir: Option<&Path>,
-) -> Result<Option<BubblewrapSandbox>> {
-    let network = launch_network_plan(policy);
-    let mounts = uses_bubblewrap_mount_isolation(policy);
-    if !network.uses_bubblewrap() && !mounts {
-        return Ok(None);
-    }
+/// What a workspace app keeps of the user's own session. Native compositors
+/// keep their settings in private XDG directories and a private GSettings
+/// backend; apps use the user's (dconf reaches them through the relay).
+const USER_DIRECTORY_ENV_VARS: &[&str] = &[
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+    "GSETTINGS_BACKEND",
+];
+const USER_AGENT_ENV_VARS: &[&str] = &["SSH_AUTH_SOCK", "SSH_AGENT_PID", "GPG_AGENT_INFO"];
 
-    if mounts {
-        Ok(Some(BubblewrapSandbox {
-            args: restricted_mount_namespace_args(status, policy, cwd, network, terminal_dir)?,
-            mount_isolation: "bubblewrap_mount_namespace".to_string(),
-            network_isolation: network.isolation_label().to_string(),
-        }))
-    } else {
-        let mut args = vec![
-            "--bind".to_string(),
-            "/".to_string(),
-            "/".to_string(),
-            "--dev".to_string(),
-            "/dev".to_string(),
-            "--unshare-pid".to_string(),
-            "--proc".to_string(),
-            "/proc".to_string(),
-        ];
-        // Host desktop/system IPC is not part of ordinary host file access.
-        // Rebind only this workspace's display endpoints below.
-        for path in host_desktop_ipc_dirs() {
-            args.extend(["--tmpfs".to_string(), path.display().to_string()]);
-        }
-        // Keep desktop control/configuration private even for network-only
-        // profiles whose ordinary host files remain visible. Fresh procfs in the
-        // app PID namespace also prevents /proc/<host-pid>/root/fd bypasses.
-        // Bubblewrap does not traverse symlink parents for mount targets. Mask
-        // the real directory so short runtime aliases see the same private view.
-        let runtime_target =
-            fs::canonicalize(&status.runtime_dir).unwrap_or_else(|_| status.runtime_dir.clone());
-        let target_path = |path: &Path| {
-            path.strip_prefix(&status.runtime_dir)
-                .map(|relative| runtime_target.join(relative))
-                .unwrap_or_else(|_| path.to_path_buf())
+fn is_user_session_var(name: &str) -> bool {
+    USER_DIRECTORY_ENV_VARS.contains(&name)
+        || USER_AGENT_ENV_VARS.contains(&name)
+        || name == "PULSE_SERVER"
+}
+
+/// Apps act for the user: their config and data, SSH and GPG agents and
+/// audio. The keyring reaches them through the workspace bus instead.
+fn use_the_users_session(command: &mut Command, user: impl Fn(&str) -> Option<OsString>) {
+    for name in USER_DIRECTORY_ENV_VARS {
+        match user(name) {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
         };
-        // Mask every workspace under the runtime base, not just this one:
-        // sibling control sockets and buses are otherwise reachable whenever
-        // the base is outside the masked host runtime directory.
-        if let Some(base) = runtime_target.parent() {
-            args.extend(["--tmpfs".to_string(), base.display().to_string()]);
+    }
+    for name in USER_AGENT_ENV_VARS {
+        if let Some(value) = user(name) {
+            command.env(name, value);
         }
-        args.extend(["--tmpfs".to_string(), runtime_target.display().to_string()]);
-        let (resources, wayland) = app_session_resources(status, terminal_dir)?;
-        let mut dirs = BTreeSet::new();
-        for path in resources
-            .read_only_binds
-            .iter()
-            .chain(&resources.read_write_binds)
-        {
-            add_parent_dirs(&mut dirs, path);
-        }
-        for dir in dirs {
-            if dir.starts_with(&status.runtime_dir) && dir != status.runtime_dir {
-                args.extend(["--dir".to_string(), target_path(&dir).display().to_string()]);
-            }
-        }
-        for (flag, paths) in [
-            ("--ro-bind", resources.read_only_binds),
-            ("--bind", resources.read_write_binds),
-        ] {
-            for path in paths {
-                args.extend([
-                    flag.to_string(),
-                    path.display().to_string(),
-                    target_path(&path).display().to_string(),
-                ]);
-            }
-        }
-        if let Some((filtered, visible)) = wayland {
-            args.extend([
-                "--bind".to_string(),
-                filtered.display().to_string(),
-                target_path(&visible).display().to_string(),
-            ]);
-        }
-        if network.unshare_net() {
-            args.push("--unshare-net".to_string());
-        }
-        if let Some(cwd) = cwd {
-            args.push("--chdir".to_string());
-            args.push(cwd.display().to_string());
-        }
-        Ok(Some(BubblewrapSandbox {
-            args,
-            mount_isolation: "host".to_string(),
-            network_isolation: network.isolation_label().to_string(),
-        }))
+    }
+    // The workspace's runtime directory hides the user's sound server socket.
+    let pulse = user("PULSE_SERVER").or_else(|| {
+        let socket = PathBuf::from(user("XDG_RUNTIME_DIR")?).join("pulse/native");
+        socket
+            .exists()
+            .then(|| OsString::from(format!("unix:{}", socket.display())))
+    });
+    if let Some(pulse) = pulse {
+        command.env("PULSE_SERVER", pulse);
     }
 }
 
-pub(crate) fn launch_isolation_labels_from_sandbox(
-    sandbox: Option<&BubblewrapSandbox>,
-) -> (String, String) {
-    sandbox
-        .map(|sandbox| {
-            (
-                sandbox.mount_isolation.clone(),
-                sandbox.network_isolation.clone(),
-            )
-        })
-        .unwrap_or_else(|| ("host".to_string(), "host".to_string()))
-}
+/// Chromium browsers and the profile directory each uses by default, under
+/// the user's config directory.
+const CHROMIUM_PROFILES: &[(&str, &str)] = &[
+    ("google-chrome", "google-chrome"),
+    ("google-chrome-stable", "google-chrome"),
+    ("google-chrome-beta", "google-chrome-beta"),
+    ("google-chrome-unstable", "google-chrome-unstable"),
+    ("chromium", "chromium"),
+    ("chromium-browser", "chromium"),
+    ("brave-browser", "BraveSoftware/Brave-Browser"),
+    ("microsoft-edge", "microsoft-edge"),
+];
 
-pub(crate) fn launch_isolation_labels_for_policy(
-    policy: Option<&AppliedWorkspacePolicy>,
-) -> (String, String) {
-    let mount_isolation = if uses_bubblewrap_mount_isolation(policy) {
-        "bubblewrap_mount_namespace"
-    } else {
-        "host"
-    };
-    (
-        mount_isolation.to_string(),
-        launch_network_plan(policy).isolation_label().to_string(),
-    )
-}
-
-pub(crate) fn launch_network_plan(policy: Option<&AppliedWorkspacePolicy>) -> LaunchNetworkPlan {
-    if policy.is_some_and(|policy| {
-        matches!(policy.network.mode, NetworkMode::Disabled)
-            && policy.enforcement.network.enforced
-            && policy.runtime_capabilities.bubblewrap.ok
-    }) {
-        LaunchNetworkPlan::BubblewrapUnshareNet
-    } else if policy.is_some_and(|policy| {
-        matches!(policy.network.mode, NetworkMode::LocalOnly)
-            && policy.enforcement.network.enforced
-            && policy.runtime_capabilities.bubblewrap.ok
-    }) {
-        LaunchNetworkPlan::BubblewrapLoopbackOnly
-    } else {
-        LaunchNetworkPlan::Host
-    }
-}
-
-pub(crate) fn uses_bubblewrap_mount_isolation(policy: Option<&AppliedWorkspacePolicy>) -> bool {
-    policy.is_some_and(|policy| {
-        !policy.mounts.is_empty()
-            && policy.enforcement.mounts.enforced
-            && policy.runtime_capabilities.bubblewrap.ok
-    })
-}
-
-/// Host directories that hold desktop session IPC: the user runtime dir (also
-/// a non-standard XDG_RUNTIME_DIR), the system bus, X11 sockets and IBus,
-/// whose input-method bus lives in the cache dir and can log or inject keys.
-fn host_desktop_ipc_dirs() -> Vec<PathBuf> {
-    let home = env::var_os("HOME").map(PathBuf::from);
-    let xdg_dir = |name: &str, fallback: &str| {
-        env::var_os(name)
-            .map(PathBuf::from)
-            .filter(|path| path.is_absolute())
-            .or_else(|| home.as_ref().map(|home| home.join(fallback)))
-    };
-    let mut dirs = vec![
-        PathBuf::from(format!("/run/user/{}", unsafe { libc::geteuid() })),
-        PathBuf::from("/run/dbus"),
-        PathBuf::from("/tmp/.X11-unix"),
-    ];
-    dirs.extend(env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from));
-    dirs.extend(xdg_dir("XDG_CACHE_HOME", ".cache").map(|path| path.join("ibus")));
-    dirs.extend(xdg_dir("XDG_CONFIG_HOME", ".config").map(|path| path.join("ibus")));
-    let mut masked = BTreeSet::new();
-    dirs.into_iter()
-        .filter(|path| path.is_absolute() && path.is_dir())
-        .filter_map(|path| fs::canonicalize(path).ok())
-        .filter(|path| path != Path::new("/") && home.as_deref() != Some(path.as_path()))
-        .filter(|path| masked.insert(path.clone()))
-        .collect()
-}
-
-/// Also returns the backend's filtered Wayland socket and the main socket
-/// path apps see it at, when the backend's main socket is privileged.
-fn app_session_resources(
-    status: &WorkspaceStatus,
-    terminal_dir: Option<&Path>,
-) -> Result<(SessionSandboxResources, Option<(PathBuf, PathBuf)>)> {
-    let mut resources = status.session.sandbox_resources(
-        &status.xauthority_path,
-        &status.runtime_dir,
-        &status.display,
-    );
-    let control_bus = status.runtime_dir.join("session-bus");
-    let client_bus = status.runtime_dir.join("client-bus");
-    if status.session.backend.requires_client_application_bus() && !client_bus.exists() {
-        bail!(
-            "{:?} client bus is unavailable at {}; refusing to launch a sandboxed app",
-            status.session.backend,
-            client_bus.display()
-        );
-    }
-    for path in resources
-        .read_only_binds
-        .iter_mut()
-        .chain(&mut resources.read_write_binds)
-    {
-        if *path == control_bus {
-            *path = client_bus.clone();
-        }
-    }
-    if let Some(dir) = terminal_dir {
-        if !dir.starts_with(status.runtime_dir.join("client")) || !dir.is_dir() {
-            bail!(
-                "managed terminal directory {} is not a workspace client directory",
-                dir.display()
-            );
-        }
-        resources.read_write_binds.push(dir.to_path_buf());
-    }
-    let wayland = status.session.sandbox_wayland_socket(&status.runtime_dir);
-    if let Some((filtered, visible)) = &wayland {
-        crate::session::wayland_filter::require_socket(filtered)?;
-        resources
-            .read_write_binds
-            .retain(|path| path != visible && path != filtered);
-    }
-    Ok((resources, wayland))
-}
-
-pub(crate) fn restricted_mount_namespace_args(
-    status: &WorkspaceStatus,
-    policy: Option<&AppliedWorkspacePolicy>,
+/// Why a launch would open its window on the user's desktop, if it would. A
+/// Chromium browser started on a profile that a running browser holds hands
+/// its command line to that browser, and the window opens wherever that one
+/// runs. A browser of the user's desktop holds its default profile.
+pub(crate) fn desktop_handoff(
     cwd: Option<&Path>,
-    network: LaunchNetworkPlan,
-    terminal_dir: Option<&Path>,
-) -> Result<Vec<String>> {
-    let (resources, wayland) = app_session_resources(status, terminal_dir)?;
-    restricted_mount_namespace_args_with_resources(policy, cwd, network, resources, wayland)
-}
-
-fn restricted_mount_namespace_args_with_resources(
-    policy: Option<&AppliedWorkspacePolicy>,
-    cwd: Option<&Path>,
-    network: LaunchNetworkPlan,
-    resources: SessionSandboxResources,
-    wayland: Option<(PathBuf, PathBuf)>,
-) -> Result<Vec<String>> {
-    let policy = policy.context("mount namespace requested without an applied policy")?;
-    let mut args = Vec::new();
-    let mut dirs = BTreeSet::new();
-    let mut extra_read_only_binds = BTreeSet::new();
-    let mut add_dir = |path: &Path| {
-        if path != Path::new("/") {
-            dirs.insert(path.to_path_buf());
-        }
-    };
-    add_dir(Path::new("/tmp"));
-    for path in resources
-        .read_only_binds
+    command: &[String],
+    user: impl Fn(&str) -> Option<OsString>,
+    workspace_pid: impl Fn(u32) -> bool,
+) -> Option<String> {
+    let program = Path::new(command.first()?).file_name()?.to_str()?;
+    let (_, profile) = CHROMIUM_PROFILES
         .iter()
-        .chain(&resources.read_write_binds)
-    {
-        add_parent_dirs(&mut dirs, path);
-    }
-    if let Some((_, visible)) = &wayland {
-        add_parent_dirs(&mut dirs, visible);
-    }
-    for mount in &policy.mounts {
-        if !mount.workspace_path.is_absolute() {
-            bail!(
-                "profile mount workspace_path {} must be absolute for bubblewrap enforcement",
-                mount.workspace_path.display()
-            );
+        .find(|(name, _)| *name == program)?;
+    let args = &command[1..];
+    let explicit = args.iter().enumerate().find_map(|(i, arg)| {
+        if arg == "--user-data-dir" {
+            return args.get(i + 1).map(PathBuf::from);
         }
-        if !mount.host_path.exists() {
-            bail!(
-                "profile mount host_path {} does not exist",
-                mount.host_path.display()
-            );
-        }
-        add_parent_dirs(&mut dirs, &mount.workspace_path);
-    }
-    if let Some(parent) =
-        external_symlink_target_parent(Path::new("/etc/resolv.conf"), Path::new("/etc"))
-    {
-        add_parent_dirs(&mut dirs, &parent);
-        extra_read_only_binds.insert(parent);
-    }
-
-    for path in ["/usr", "/bin", "/lib", "/lib64", "/etc", "/opt"] {
-        if Path::new(path).exists() {
-            args.push("--ro-bind".to_string());
-            args.push(path.to_string());
-            args.push(path.to_string());
-        }
-    }
-    args.push("--unshare-pid".to_string());
-    args.push("--proc".to_string());
-    args.push("/proc".to_string());
-    args.push("--dev".to_string());
-    args.push("/dev".to_string());
-
-    for dir in dirs {
-        args.push("--dir".to_string());
-        args.push(dir.display().to_string());
-    }
-    for path in extra_read_only_binds {
-        args.push("--ro-bind".to_string());
-        args.push(path.display().to_string());
-        args.push(path.display().to_string());
-    }
-    for path in resources.read_only_binds {
-        args.push("--ro-bind".to_string());
-        args.push(path.display().to_string());
-        args.push(path.display().to_string());
-    }
-    for path in resources.read_write_binds {
-        args.push("--bind".to_string());
-        args.push(path.display().to_string());
-        args.push(path.display().to_string());
-    }
-    if let Some((filtered, visible)) = wayland {
-        args.push("--bind".to_string());
-        args.push(filtered.display().to_string());
-        args.push(visible.display().to_string());
-    }
-
-    for mount in &policy.mounts {
-        let canonical_host_path = fs::canonicalize(&mount.host_path).with_context(|| {
-            format!(
-                "failed to canonicalize profile mount host_path {}",
-                mount.host_path.display()
-            )
-        })?;
-        args.push(match mount.mode {
-            crate::policy::MountMode::ReadOnly => "--ro-bind".to_string(),
-            crate::policy::MountMode::ReadWrite => "--bind".to_string(),
-        });
-        args.push(canonical_host_path.display().to_string());
-        args.push(mount.workspace_path.display().to_string());
-    }
-    if network.unshare_net() {
-        args.push("--unshare-net".to_string());
-    }
-    args.push("--chdir".to_string());
-    args.push(
-        cwd.unwrap_or_else(|| Path::new("/tmp"))
-            .display()
-            .to_string(),
-    );
-    Ok(args)
-}
-
-pub(crate) fn external_symlink_target_parent(path: &Path, covered_root: &Path) -> Option<PathBuf> {
-    let _link_target = fs::read_link(path).ok()?;
-    let target = fs::canonicalize(path).ok()?;
-    let covered_root =
-        fs::canonicalize(covered_root).unwrap_or_else(|_| covered_root.to_path_buf());
-    if target.starts_with(covered_root) {
-        return None;
-    }
-    target.parent().map(Path::to_path_buf)
-}
-
-fn add_parent_dirs(dirs: &mut BTreeSet<PathBuf>, path: &Path) {
-    let mut parents = Vec::new();
-    let mut current = path.parent();
-    while let Some(parent) = current {
-        if parent == Path::new("/") {
-            break;
-        }
-        parents.push(parent.to_path_buf());
-        current = parent.parent();
-    }
-    for parent in parents.into_iter().rev() {
-        dirs.insert(parent);
-    }
+        arg.strip_prefix("--user-data-dir=").map(PathBuf::from)
+    });
+    let profile_dir = match explicit {
+        // The browser resolves a relative profile against its own cwd.
+        Some(dir) if dir.is_relative() => cwd
+            .map(Path::to_path_buf)
+            .or_else(|| env::current_dir().ok())?
+            .join(dir),
+        Some(dir) => dir,
+        None => user("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| Some(PathBuf::from(user("HOME")?).join(".config")))?
+            .join(profile),
+    };
+    let lock = profile_dir.join("SingletonLock");
+    // The lock is a symlink to "HOST-PID" for the browser holding the profile.
+    let owner = fs::read_link(&lock).ok()?;
+    let pid = owner.to_str()?.rsplit('-').next()?.parse::<u32>().ok()?;
+    // A browser the workspace itself launched opens new windows in it.
+    (Path::new(&format!("/proc/{pid}")).exists() && !workspace_pid(pid)).then(|| {
+        format!(
+            "{program} is already running on your desktop with the profile in {}; this launch would open its window there, not in the workspace. Pass a --user-data-dir the desktop browser does not hold (a copy of the profile keeps its logins) or use workspace_open_browser",
+            profile_dir.display()
+        )
+    })
 }
 
 pub(crate) fn resolve_command_path(program: &str) -> Option<PathBuf> {
@@ -584,277 +249,6 @@ pub(crate) fn resolve_command_path(program: &str) -> Option<PathBuf> {
     env::split_paths(&path)
         .map(|dir| dir.join(program))
         .find(|candidate| is_executable_file(candidate))
-}
-
-/// Unprivileged bubblewrap keeps the caller's supplementary groups, and groups
-/// such as docker or lxd are root-equivalent. When the owner has any, a
-/// sandboxed launch starts through `unshare` with a user namespace whose maps
-/// come from the setuid newuidmap/newgidmap (so setgroups stays allowed),
-/// drops every supplementary group and execs bubblewrap as the same uid with
-/// no capabilities. Inner root maps to one subordinate id nothing runs as.
-/// Best effort: when the groups cannot be dropped on this host, launches
-/// behave as before and keep them; `doctor` reports why.
-pub(crate) fn sandbox_launcher_prefix() -> Vec<String> {
-    cached_group_drop().clone().unwrap_or_default()
-}
-
-/// Whether sandboxed launches drop the owner's supplementary groups here, and
-/// why not when they cannot. Computed once per process: a daemon started
-/// before the host was fixed keeps its result until it restarts.
-pub(crate) fn group_drop_status() -> std::result::Result<bool, String> {
-    cached_group_drop()
-        .as_ref()
-        .map(|prefix| !prefix.is_empty())
-        .map_err(Clone::clone)
-}
-
-fn cached_group_drop() -> &'static std::result::Result<Vec<String>, String> {
-    static PREFIX: std::sync::OnceLock<std::result::Result<Vec<String>, String>> =
-        std::sync::OnceLock::new();
-    PREFIX.get_or_init(|| group_drop_prefix().map_err(|error| format!("{error:#}")))
-}
-
-fn group_drop_prefix() -> Result<Vec<String>> {
-    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
-    if supplementary_groups()?.iter().all(|group| *group == gid) {
-        return Ok(Vec::new());
-    }
-    let missing = |what: &str| {
-        anyhow::anyhow!(
-            "supplementary groups are kept in sandboxed launches ({what}); \
-             install uidmap and give your user a subordinate range, e.g. \
-             `sudo usermod --add-subuids 100000-165535 --add-subgids 100000-165535 $USER`"
-        )
-    };
-    for tool in ["newuidmap", "newgidmap"] {
-        resolve_executable_path(tool).ok_or_else(|| missing(&format!("{tool} not found")))?;
-    }
-    let unshare = resolve_executable_path("unshare").ok_or_else(|| missing("unshare not found"))?;
-    // Repeated --map-users/--map-groups ranges arrived in util-linux 2.40.
-    let version = Command::new(&unshare)
-        .arg("--version")
-        .env_clear()
-        .output()
-        .ok()
-        .and_then(|output| String::from_utf8(output.stdout).ok())
-        .and_then(|text| util_linux_version(&text));
-    if version.is_none_or(|version| version < (2, 40)) {
-        return Err(missing("util-linux 2.40 or newer is required for unshare"));
-    }
-    let name = user_name(uid);
-    let sub_uid = subordinate_start(Path::new("/etc/subuid"), uid, name.as_deref())
-        .ok_or_else(|| missing("no /etc/subuid range"))?;
-    let sub_gid = subordinate_start(Path::new("/etc/subgid"), uid, name.as_deref())
-        .ok_or_else(|| missing("no /etc/subgid range"))?;
-    let prefix = vec![
-        unshare.display().to_string(),
-        "--user".to_string(),
-        format!("--map-users={uid}:{uid}:1"),
-        format!("--map-users=0:{sub_uid}:1"),
-        format!("--map-groups={gid}:{gid}:1"),
-        format!("--map-groups=0:{sub_gid}:1"),
-        "--setuid".to_string(),
-        uid.to_string(),
-        "--setgid".to_string(),
-        gid.to_string(),
-        "--".to_string(),
-    ];
-    group_drop_preflight(&prefix)?;
-    Ok(prefix)
-}
-
-fn util_linux_version(text: &str) -> Option<(u32, u32)> {
-    let version = text.split_whitespace().last()?;
-    let mut parts = version.split('.');
-    Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
-}
-
-/// Runs the real chain once (the wrapper, then bubblewrap inside it), so a
-/// host that refuses either (user namespaces restricted by AppArmor,
-/// newuidmap denied, no_new_privs) keeps the previous behavior instead of
-/// every app exiting right after spawn.
-fn group_drop_preflight(prefix: &[String]) -> Result<()> {
-    let bwrap = resolve_executable_path("bwrap").context("bwrap not found")?;
-    let truth = resolve_executable_path("true").context("true not found")?;
-    let output = Command::new(&prefix[0])
-        .args(&prefix[1..])
-        .arg(bwrap)
-        .args([
-            "--ro-bind",
-            "/",
-            "/",
-            "--dev",
-            "/dev",
-            "--unshare-pid",
-            "--proc",
-            "/proc",
-            "--unshare-net",
-            "--",
-        ])
-        .arg(truth)
-        .env_clear()
-        .output()
-        .context("could not run unshare")?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let restricted = fs::read_to_string("/proc/sys/kernel/apparmor_restrict_unprivileged_userns")
-        .is_ok_and(|value| value.trim() == "1");
-    bail!(
-        "supplementary groups are kept in sandboxed launches: dropping them failed ({}){}",
-        String::from_utf8_lossy(&output.stderr).trim(),
-        if restricted {
-            ". AppArmor restricts unprivileged user namespaces here \
-             (kernel.apparmor_restrict_unprivileged_userns=1); see the README section \
-             on supplementary groups"
-        } else {
-            ""
-        }
-    )
-}
-
-/// A sandboxed launch command and the private descriptor carrying its
-/// arguments. Keep `args_fd` alive until the command is spawned.
-pub(crate) struct SandboxedCommand {
-    pub(crate) command: Command,
-    pub(crate) args_fd: std::os::fd::OwnedFd,
-}
-
-/// Builds a sandboxed launch. The launcher and bubblewrap run from absolute
-/// paths with an empty environment; the app's environment and argv reach
-/// bubblewrap through `--args` on a close-on-exec memfd that only this child
-/// inherits. Launch variables such as LD_PRELOAD or PATH therefore never
-/// apply to the launcher, and stay out of the world-readable command line.
-pub(crate) fn sandboxed_command(
-    sandbox_args: &[String],
-    program: &str,
-    program_args: &[String],
-    env: &[(std::ffi::OsString, std::ffi::OsString)],
-) -> Result<SandboxedCommand> {
-    use std::os::fd::AsRawFd;
-    use std::os::unix::process::CommandExt;
-    let bwrap = resolve_executable_path("bwrap").context("bwrap not found")?;
-    let args_fd = bwrap_args_memfd(sandbox_args, env)?;
-    let prefix = sandbox_launcher_prefix();
-    let mut command = match prefix.split_first() {
-        Some((launcher, args)) => {
-            let mut command = Command::new(launcher);
-            command.args(args).arg(&bwrap);
-            command
-        }
-        None => Command::new(&bwrap),
-    };
-    let fd = args_fd.as_raw_fd();
-    // bubblewrap reads only options from --args; the program stays on the
-    // command line after `--`.
-    command
-        .arg("--args")
-        .arg(fd.to_string())
-        .arg("--")
-        .arg(program)
-        .args(program_args)
-        .env_clear();
-    unsafe {
-        command.pre_exec(move || {
-            if libc::fcntl(fd, libc::F_SETFD, 0) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
-    Ok(SandboxedCommand { command, args_fd })
-}
-
-/// The environment (`--setenv`) and the sandbox options, as NUL-separated
-/// bubblewrap arguments in a close-on-exec memfd. bubblewrap itself starts
-/// with an empty environment, so it passes only these variables on.
-fn bwrap_args_memfd(
-    sandbox_args: &[String],
-    env: &[(std::ffi::OsString, std::ffi::OsString)],
-) -> Result<std::os::fd::OwnedFd> {
-    use std::os::fd::FromRawFd;
-    use std::os::unix::ffi::OsStrExt;
-    // Arguments are NUL-separated: a NUL inside any value would split it
-    // into extra bubblewrap options.
-    let mut bytes = Vec::new();
-    let mut push = |value: &[u8]| -> Result<()> {
-        if value.contains(&0) {
-            bail!("sandbox argument or environment value contains a NUL byte");
-        }
-        bytes.extend_from_slice(value);
-        bytes.push(0);
-        Ok(())
-    };
-    for (name, value) in env {
-        push(b"--setenv")?;
-        push(name.as_bytes())?;
-        push(value.as_bytes())?;
-    }
-    for arg in sandbox_args {
-        push(arg.as_bytes())?;
-    }
-    let raw = unsafe { libc::memfd_create(c"bwrap-args".as_ptr(), libc::MFD_CLOEXEC) };
-    if raw < 0 {
-        return Err(std::io::Error::last_os_error()).context("create bwrap argument memfd");
-    }
-    let args_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-    // A memfd on a standard stream would be replaced by the child's stdio.
-    if raw <= 2 {
-        bail!("bwrap argument memfd landed on standard stream {raw}");
-    }
-    let mut file = std::fs::File::from(args_fd.try_clone()?);
-    std::io::Write::write_all(&mut file, &bytes).context("write bwrap arguments")?;
-    std::io::Seek::rewind(&mut file).context("rewind bwrap arguments")?;
-    Ok(args_fd)
-}
-
-fn supplementary_groups() -> Result<Vec<libc::gid_t>> {
-    let count = unsafe { libc::getgroups(0, std::ptr::null_mut()) };
-    if count < 0 {
-        return Err(std::io::Error::last_os_error()).context("read supplementary groups");
-    }
-    let mut groups = vec![0 as libc::gid_t; count as usize];
-    let count = unsafe { libc::getgroups(count, groups.as_mut_ptr()) };
-    if count < 0 {
-        return Err(std::io::Error::last_os_error()).context("read supplementary groups");
-    }
-    groups.truncate(count as usize);
-    Ok(groups)
-}
-
-fn user_name(uid: libc::uid_t) -> Option<String> {
-    let mut buffer = vec![0 as libc::c_char; 16 * 1024];
-    let mut entry: libc::passwd = unsafe { std::mem::zeroed() };
-    let mut result = std::ptr::null_mut();
-    let status = unsafe {
-        libc::getpwuid_r(
-            uid,
-            &mut entry,
-            buffer.as_mut_ptr(),
-            buffer.len(),
-            &mut result,
-        )
-    };
-    if status != 0 || result.is_null() {
-        return None;
-    }
-    unsafe { std::ffi::CStr::from_ptr(entry.pw_name) }
-        .to_str()
-        .ok()
-        .map(str::to_string)
-}
-
-/// The first id of the user's range in an /etc/subuid-style file, matched by
-/// name or numeric uid.
-fn subordinate_start(path: &Path, uid: libc::uid_t, name: Option<&str>) -> Option<u64> {
-    let uid = uid.to_string();
-    fs::read_to_string(path).ok()?.lines().find_map(|line| {
-        let mut fields = line.trim().split(':');
-        let owner = fields.next()?;
-        let start = fields.next()?.parse::<u64>().ok()?;
-        let count = fields.next()?.parse::<u64>().ok()?;
-        (count >= 1 && (owner == uid || Some(owner) == name)).then_some(start)
-    })
 }
 
 pub(crate) fn resolve_executable_path(program: &str) -> Option<PathBuf> {
@@ -874,499 +268,7 @@ fn is_executable_file(path: &Path) -> bool {
 
 #[cfg(test)]
 mod tests {
-    #[test]
-    fn launch_environment_reaches_bubblewrap_only_through_private_arguments() {
-        let env = [
-            ("LD_PRELOAD".into(), "/tmp/inject.so".into()),
-            ("PATH".into(), "/nonexistent".into()),
-        ];
-        let fd = bwrap_args_memfd(
-            &["--ro-bind".to_string(), "/".to_string(), "/".to_string()],
-            &env,
-        )
-        .expect("memfd");
-        let mut bytes = Vec::new();
-        std::io::Read::read_to_end(&mut std::fs::File::from(fd), &mut bytes).expect("read");
-        let args = bytes
-            .split(|byte| *byte == 0)
-            .map(|arg| String::from_utf8_lossy(arg).into_owned())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            &args[..9],
-            [
-                "--setenv",
-                "LD_PRELOAD",
-                "/tmp/inject.so",
-                "--setenv",
-                "PATH",
-                "/nonexistent",
-                "--ro-bind",
-                "/",
-                "/",
-            ]
-        );
-        assert!(bwrap_args_memfd(&["--chdir".into(), "/w\0--bind\0/\0/x".into()], &[]).is_err());
-        assert!(bwrap_args_memfd(&[], &[("A".into(), "b\0c".into())]).is_err());
-    }
-
-    #[test]
-    fn subordinate_ranges_match_by_name_or_uid() {
-        let path = test_runtime("subuid");
-        fs::write(
-            &path,
-            "other:200000:65536\nalice:100000:0\nalice:300000:65536\n1000:400000:10\n",
-        )
-        .expect("write subuid");
-        assert_eq!(subordinate_start(&path, 1001, Some("alice")), Some(300000));
-        assert_eq!(subordinate_start(&path, 1000, None), Some(400000));
-        assert_eq!(subordinate_start(&path, 1002, Some("bob")), None);
-        fs::remove_file(path).expect("remove subuid");
-    }
-
     use super::*;
-
-    fn native_status(
-        runtime_dir: &Path,
-        backend: crate::session::SessionBackend,
-    ) -> WorkspaceStatus {
-        WorkspaceStatus {
-            id: "native-launch-test".to_string(),
-            session: crate::session::SessionSpec {
-                backend,
-                scale: 1.0,
-            },
-            session_id: "session-test".to_string(),
-            purpose: None,
-            profile_id: None,
-            applied_policy: None,
-            profile_cwd: None,
-            profile_env: Vec::new(),
-            user_acknowledged_hidden_workspace: true,
-            user_acknowledged_unenforced_policy: true,
-            ready: true,
-            started_at_unix: 1,
-            display: ":90".to_string(),
-            width: 1280,
-            height: 720,
-            runtime_dir: runtime_dir.to_path_buf(),
-            socket_path: runtime_dir.join("control.sock"),
-            xauthority_path: runtime_dir.join("Xauthority"),
-            daemon_pid: None,
-            x_server_pid: 0,
-            window_manager_pid: None,
-            last_event_sequence: 0,
-            apps: Vec::new(),
-        }
-    }
-
-    fn sandbox_policy(
-        mounts: Vec<crate::policy::ProfileMount>,
-        mode: NetworkMode,
-    ) -> AppliedWorkspacePolicy {
-        AppliedWorkspacePolicy::new_with_capabilities(
-            "native-launch-test".to_string(),
-            mounts,
-            crate::policy::NetworkPolicy {
-                mode,
-                allow_hosts: Vec::new(),
-            },
-            false,
-            0,
-            crate::policy::PolicyRuntimeCapabilities {
-                bubblewrap: crate::policy::PolicyToolCheck {
-                    ok: true,
-                    detail: "test capability".to_string(),
-                },
-                ..Default::default()
-            },
-        )
-    }
-
-    fn test_runtime(name: &str) -> PathBuf {
-        let unique = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock after epoch")
-            .as_nanos();
-        env::temp_dir().join(format!(
-            "agent-workspace-{name}-{}-{unique}",
-            std::process::id()
-        ))
-    }
-
-    fn assert_environment_uses_client_bus(backend: crate::session::SessionBackend) {
-        let runtime = test_runtime(&format!("missing-client-env-{backend:?}"));
-        let status = native_status(&runtime, backend);
-        let mut command = Command::new("true");
-        command.env("DBUS_SESSION_BUS_ADDRESS", "host-dbus");
-
-        configure_launch_environment(&mut command, &status, &[], true);
-
-        let address = command
-            .get_envs()
-            .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
-            .and_then(|(_, value)| value)
-            .expect("client bus address");
-        assert_eq!(
-            address.to_string_lossy(),
-            crate::session::private::socket_address(&runtime.join("client-bus"))
-        );
-    }
-
-    fn assert_sandboxes_reject_missing_client_bus(backend: crate::session::SessionBackend) {
-        let runtime = test_runtime(&format!("missing-client-sandbox-{backend:?}"));
-        let mount_host = runtime.join("mount-host");
-        fs::create_dir_all(&mount_host).expect("runtime and mount host");
-        let status = native_status(&runtime, backend);
-        let policies = [
-            sandbox_policy(Vec::new(), NetworkMode::Disabled),
-            sandbox_policy(
-                vec![crate::policy::ProfileMount {
-                    host_path: mount_host,
-                    workspace_path: PathBuf::from("/workspace/data"),
-                    mode: crate::policy::MountMode::ReadOnly,
-                }],
-                NetworkMode::InheritHost,
-            ),
-        ];
-
-        for policy in &policies {
-            let error = match bubblewrap_sandbox_for_launch(&status, Some(policy), None, None) {
-                Err(error) => error,
-                Ok(_) => panic!("missing client bus must fail closed"),
-            };
-            assert!(error.to_string().contains("client bus is unavailable"));
-        }
-
-        fs::remove_dir_all(runtime).expect("remove test runtime");
-    }
-
-    #[test]
-    fn only_sandboxed_apps_get_the_client_bus() {
-        let runtime = test_runtime("controller-bus");
-        fs::create_dir_all(&runtime).expect("runtime");
-        let status = native_status(&runtime, crate::session::SessionBackend::Kwin);
-        let control = crate::session::private::socket_address(&runtime.join("session-bus"));
-        let client = crate::session::private::socket_address(&runtime.join("client-bus"));
-        let attach = workspace_environment_variables(&status)
-            .into_iter()
-            .find(|var| var.name == "DBUS_SESSION_BUS_ADDRESS")
-            .expect("attach bus");
-        assert_eq!(attach.value, control);
-
-        let mut command = Command::new("true");
-        configure_launch_environment(&mut command, &status, &[], true);
-        let launched = command
-            .get_envs()
-            .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
-            .and_then(|(_, value)| value)
-            .expect("app bus");
-        assert_eq!(launched.to_string_lossy(), client);
-
-        let mut command = Command::new("true");
-        configure_launch_environment(&mut command, &status, &[], false);
-        let unsandboxed = command
-            .get_envs()
-            .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
-            .and_then(|(_, value)| value)
-            .expect("unsandboxed app bus");
-        assert_eq!(unsandboxed.to_string_lossy(), control);
-        fs::remove_dir_all(runtime).expect("remove test runtime");
-    }
-
-    #[test]
-    fn sandboxes_bind_only_their_own_terminal_client_dir() {
-        let runtime = test_runtime("terminal-client-dir");
-        let own = runtime.join("client").join("terminal-own");
-        let other = runtime.join("client").join("terminal-other");
-        fs::create_dir_all(&own).expect("own terminal dir");
-        fs::create_dir_all(&other).expect("other terminal dir");
-        let status = native_status(&runtime, crate::session::SessionBackend::X11);
-        let canonical = fs::canonicalize(&runtime).expect("canonical runtime");
-        let bound = |args: &[String], dir: &Path| {
-            let dir = dir.display().to_string();
-            args.windows(3)
-                .any(|window| window[0] == "--bind" && window[2] == dir)
-        };
-        let client = |name: &str| canonical.join("client").join(name);
-
-        for network in [NetworkMode::Disabled, NetworkMode::InheritHost] {
-            let mounts = if matches!(network, NetworkMode::InheritHost) {
-                vec![crate::policy::ProfileMount {
-                    host_path: runtime.clone(),
-                    workspace_path: PathBuf::from("/workspace/data"),
-                    mode: crate::policy::MountMode::ReadOnly,
-                }]
-            } else {
-                Vec::new()
-            };
-            let policy = sandbox_policy(mounts, network);
-            let app = bubblewrap_sandbox_for_launch(&status, Some(&policy), None, None)
-                .expect("app sandbox")
-                .expect("sandbox");
-            assert!(!bound(&app.args, &canonical.join("client")));
-            assert!(!bound(&app.args, &client("terminal-own")));
-
-            let terminal = bubblewrap_sandbox_for_launch(&status, Some(&policy), None, Some(&own))
-                .expect("terminal sandbox")
-                .expect("sandbox");
-            assert!(bound(&terminal.args, &client("terminal-own")) || bound(&terminal.args, &own));
-            assert!(!bound(&terminal.args, &client("terminal-other")));
-            assert!(!bound(&terminal.args, &other));
-        }
-
-        let outside = runtime.join("not-client");
-        fs::create_dir_all(&outside).expect("outside dir");
-        let policy = sandbox_policy(Vec::new(), NetworkMode::Disabled);
-        assert!(
-            bubblewrap_sandbox_for_launch(&status, Some(&policy), None, Some(&outside)).is_err()
-        );
-
-        fs::remove_dir_all(runtime).expect("remove test runtime");
-    }
-
-    #[test]
-    fn network_only_sandboxes_mask_every_workspace_runtime() {
-        let base = test_runtime("runtime-base");
-        let runtime = base.join("agent-workspace-linux").join("own");
-        fs::create_dir_all(&runtime).expect("runtime");
-        let status = native_status(&runtime, crate::session::SessionBackend::X11);
-        let policy = sandbox_policy(Vec::new(), NetworkMode::Disabled);
-        let sandbox = bubblewrap_sandbox_for_launch(&status, Some(&policy), None, None)
-            .expect("sandbox")
-            .expect("network sandbox");
-        let workspaces = fs::canonicalize(base.join("agent-workspace-linux"))
-            .expect("canonical base")
-            .display()
-            .to_string();
-        assert!(sandbox
-            .args
-            .windows(2)
-            .any(|window| window[0] == "--tmpfs" && window[1] == workspaces));
-
-        fs::remove_dir_all(base).expect("remove test runtime");
-    }
-
-    fn assert_sandboxes_bind_client_bus(backend: crate::session::SessionBackend) {
-        let runtime = test_runtime(&format!("working-client-sandbox-{backend:?}"));
-        let mount_host = runtime.join("mount-host");
-        fs::create_dir_all(&mount_host).expect("runtime and mount host");
-        let client_bus = runtime.join("client-bus");
-        let listener =
-            std::os::unix::net::UnixListener::bind(&client_bus).expect("working client bus socket");
-        let status = native_status(&runtime, backend);
-        let _filter = status
-            .session
-            .sandbox_wayland_socket(&runtime)
-            .map(|(filtered, _)| {
-                std::os::unix::net::UnixListener::bind(filtered).expect("filtered Wayland socket")
-            });
-        let policies = [
-            sandbox_policy(Vec::new(), NetworkMode::Disabled),
-            sandbox_policy(
-                vec![crate::policy::ProfileMount {
-                    host_path: mount_host,
-                    workspace_path: PathBuf::from("/workspace/data"),
-                    mode: crate::policy::MountMode::ReadOnly,
-                }],
-                NetworkMode::InheritHost,
-            ),
-        ];
-        // Bind targets use the canonical runtime, which differs from the
-        // source path under a symlinked TMPDIR, so compare resolved paths.
-        let client = fs::canonicalize(&client_bus).expect("canonical client bus");
-        let resolves_to_client =
-            |path: &str| fs::canonicalize(path).is_ok_and(|path| path == client);
-        let controls = [
-            runtime.join("session-bus"),
-            fs::canonicalize(&runtime)
-                .expect("canonical runtime")
-                .join("session-bus"),
-        ]
-        .map(|path| path.display().to_string());
-
-        for policy in &policies {
-            let sandbox = bubblewrap_sandbox_for_launch(&status, Some(policy), None, None)
-                .expect("working client bus sandbox")
-                .expect("sandbox");
-            assert!(sandbox.args.windows(3).any(|window| {
-                window[0] == "--bind"
-                    && resolves_to_client(&window[1])
-                    && resolves_to_client(&window[2])
-            }));
-            assert!(!sandbox.args.windows(3).any(|window| {
-                matches!(window[0].as_str(), "--bind" | "--ro-bind")
-                    && (controls.contains(&window[1]) || controls.contains(&window[2]))
-            }));
-        }
-
-        drop(listener);
-        fs::remove_dir_all(runtime).expect("remove test runtime");
-    }
-
-    #[test]
-    fn native_sandboxes_see_only_the_filtered_wayland_socket() {
-        for backend in [
-            crate::session::SessionBackend::Kwin,
-            crate::session::SessionBackend::Hyprland,
-            crate::session::SessionBackend::Cosmic,
-        ] {
-            let runtime = test_runtime(&format!("filtered-wayland-{backend:?}"));
-            let mount_host = runtime.join("mount-host");
-            fs::create_dir_all(&mount_host).expect("runtime and mount host");
-            let _bus = std::os::unix::net::UnixListener::bind(runtime.join("client-bus"))
-                .expect("client bus socket");
-            let status = native_status(&runtime, backend);
-            // The socket sandboxes would otherwise bind: the main socket, or
-            // COSMIC's security-context socket.
-            let (_, main) = status
-                .session
-                .sandbox_wayland_socket(&runtime)
-                .expect("native backends filter Wayland");
-            let _main = std::os::unix::net::UnixListener::bind(&main).expect("main socket");
-            let policies = [
-                sandbox_policy(Vec::new(), NetworkMode::Disabled),
-                sandbox_policy(
-                    vec![crate::policy::ProfileMount {
-                        host_path: mount_host,
-                        workspace_path: PathBuf::from("/workspace/data"),
-                        mode: crate::policy::MountMode::ReadOnly,
-                    }],
-                    NetworkMode::Disabled,
-                ),
-            ];
-            for policy in &policies {
-                let error = match bubblewrap_sandbox_for_launch(&status, Some(policy), None, None) {
-                    Err(error) => error,
-                    Ok(_) => panic!("a missing Wayland filter must fail closed"),
-                };
-                assert!(error.to_string().contains("sandbox Wayland filter"));
-            }
-            let filtered = runtime.join(crate::session::wayland_filter::SOCKET);
-            let _filter =
-                std::os::unix::net::UnixListener::bind(&filtered).expect("filtered socket");
-            let canonical = fs::canonicalize(&runtime).expect("canonical runtime");
-            let same = |arg: &str, path: &Path| {
-                Path::new(arg) == path
-                    || Path::new(arg) == canonical.join(path.file_name().unwrap())
-            };
-            for policy in &policies {
-                let sandbox = bubblewrap_sandbox_for_launch(&status, Some(policy), None, None)
-                    .expect("filtered sandbox")
-                    .expect("sandbox");
-                assert!(sandbox.args.windows(3).any(|window| {
-                    window[0] == "--bind" && same(&window[1], &filtered) && same(&window[2], &main)
-                }));
-                assert!(!sandbox.args.windows(3).any(|window| {
-                    matches!(window[0].as_str(), "--bind" | "--ro-bind") && same(&window[1], &main)
-                }));
-            }
-            fs::remove_dir_all(runtime).expect("remove test runtime");
-        }
-    }
-
-    #[test]
-    fn hyprland_crash_then_x11_same_runtime_ignores_stale_client_bus() {
-        let runtime = test_runtime("native-crash-x11-same-runtime");
-        fs::create_dir_all(&runtime).expect("create reused runtime");
-        let client_bus = runtime.join("client-bus");
-        let listener =
-            std::os::unix::net::UnixListener::bind(&client_bus).expect("native client bus socket");
-        let native = native_status(&runtime, crate::session::SessionBackend::Hyprland);
-        let mut native_command = Command::new("true");
-        configure_launch_environment(&mut native_command, &native, &[], true);
-        assert!(native_command
-            .get_envs()
-            .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
-            .and_then(|(_, value)| value)
-            .is_some());
-
-        drop(listener);
-        let x11 = native_status(&runtime, crate::session::SessionBackend::X11);
-        let mut command = Command::new("true");
-        command.env("DBUS_SESSION_BUS_ADDRESS", "host-dbus");
-        configure_launch_environment(&mut command, &x11, &[], true);
-
-        let address = command
-            .get_envs()
-            .find(|(name, _)| *name == "DBUS_SESSION_BUS_ADDRESS")
-            .expect("host bus scrubbed");
-        assert_eq!(address.1, None);
-        let policy = sandbox_policy(Vec::new(), NetworkMode::Disabled);
-        let sandbox = bubblewrap_sandbox_for_launch(&x11, Some(&policy), None, None)
-            .expect("X11 sandbox after native crash")
-            .expect("network sandbox");
-        let client_bus = fs::canonicalize(&runtime)
-            .expect("canonical runtime")
-            .join("client-bus")
-            .display()
-            .to_string();
-        assert!(!sandbox.args.windows(3).any(|window| {
-            matches!(window[0].as_str(), "--bind" | "--ro-bind")
-                && (window[1] == client_bus || window[2] == client_bus)
-        }));
-
-        fs::remove_dir_all(runtime).expect("remove reused runtime");
-    }
-
-    #[test]
-    fn kwin_environment_uses_client_bus_even_when_socket_is_missing() {
-        assert_environment_uses_client_bus(crate::session::SessionBackend::Kwin);
-    }
-
-    #[test]
-    fn gnome_environment_uses_client_bus_even_when_socket_is_missing() {
-        assert_environment_uses_client_bus(crate::session::SessionBackend::Gnome);
-    }
-
-    #[test]
-    fn hyprland_environment_uses_client_bus_even_when_socket_is_missing() {
-        assert_environment_uses_client_bus(crate::session::SessionBackend::Hyprland);
-    }
-
-    #[test]
-    fn cosmic_environment_uses_client_bus_even_when_socket_is_missing() {
-        assert_environment_uses_client_bus(crate::session::SessionBackend::Cosmic);
-    }
-
-    #[test]
-    fn kwin_sandboxes_reject_missing_client_bus() {
-        assert_sandboxes_reject_missing_client_bus(crate::session::SessionBackend::Kwin);
-    }
-
-    #[test]
-    fn gnome_sandboxes_reject_missing_client_bus() {
-        assert_sandboxes_reject_missing_client_bus(crate::session::SessionBackend::Gnome);
-    }
-
-    #[test]
-    fn hyprland_sandboxes_reject_missing_client_bus() {
-        assert_sandboxes_reject_missing_client_bus(crate::session::SessionBackend::Hyprland);
-    }
-
-    #[test]
-    fn cosmic_sandboxes_reject_missing_client_bus() {
-        assert_sandboxes_reject_missing_client_bus(crate::session::SessionBackend::Cosmic);
-    }
-
-    #[test]
-    fn kwin_sandboxes_bind_client_bus_not_control_bus() {
-        assert_sandboxes_bind_client_bus(crate::session::SessionBackend::Kwin);
-    }
-
-    #[test]
-    fn gnome_sandboxes_bind_client_bus_not_control_bus() {
-        assert_sandboxes_bind_client_bus(crate::session::SessionBackend::Gnome);
-    }
-
-    #[test]
-    fn hyprland_sandboxes_bind_client_bus_not_control_bus() {
-        assert_sandboxes_bind_client_bus(crate::session::SessionBackend::Hyprland);
-    }
-
-    #[test]
-    fn cosmic_sandboxes_bind_client_bus_not_control_bus() {
-        assert_sandboxes_bind_client_bus(crate::session::SessionBackend::Cosmic);
-    }
 
     #[test]
     fn merged_env_preserves_non_session_values_and_override_order() {
@@ -1414,50 +316,6 @@ mod tests {
     }
 
     #[test]
-    fn session_read_write_resources_bind_only_the_exact_runtime_socket() {
-        let policy = AppliedWorkspacePolicy::new_with_capabilities(
-            "qa".to_string(),
-            Vec::new(),
-            crate::policy::NetworkPolicy::default(),
-            false,
-            0,
-            crate::policy::PolicyRuntimeCapabilities::default(),
-        );
-        let xauthority = PathBuf::from("/tmp/workspace/Xauthority");
-        let socket = PathBuf::from("/run/user/1000/agent-workspace/wayland-0");
-        let args = restricted_mount_namespace_args_with_resources(
-            Some(&policy),
-            Some(Path::new("/tmp")),
-            LaunchNetworkPlan::Host,
-            SessionSandboxResources {
-                read_only_binds: vec![xauthority.clone()],
-                read_write_binds: vec![socket.clone()],
-            },
-            None,
-        )
-        .expect("mount namespace args");
-
-        let socket = socket.display().to_string();
-        assert!(args
-            .windows(3)
-            .any(|window| window == ["--bind", socket.as_str(), socket.as_str()]));
-        for broad_path in ["/run", "/run/user", "/run/user/1000"] {
-            assert!(!args.windows(3).any(|window| {
-                matches!(window[0].as_str(), "--bind" | "--ro-bind")
-                    && window[1] == broad_path
-                    && window[2] == broad_path
-            }));
-        }
-        assert!(args
-            .windows(2)
-            .any(|window| window == ["--dir", "/run/user/1000/agent-workspace"]));
-        let xauthority = xauthority.display().to_string();
-        assert!(args
-            .windows(3)
-            .any(|window| window == ["--ro-bind", xauthority.as_str(), xauthority.as_str()]));
-    }
-
-    #[test]
     fn executable_resolution_preserves_permission_and_strict_path_semantics() {
         let path = env::temp_dir().join(format!(
             "agent-workspace-non-executable-{}",
@@ -1480,5 +338,123 @@ mod tests {
         assert!(resolve_command_path("sh").is_some());
 
         fs::remove_file(path).expect("remove non-executable file");
+    }
+
+    #[test]
+    fn apps_get_the_users_directories_agents_and_sound() {
+        let runtime = env::temp_dir().join(format!(
+            "agent-workspace-user-session-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(runtime.join("pulse")).expect("runtime dir");
+        fs::write(runtime.join("pulse/native"), "").expect("pulse socket stand-in");
+        let user = |name: &str| match name {
+            "XDG_DATA_HOME" => Some(OsString::from("/home/me/.local/share")),
+            "SSH_AUTH_SOCK" => Some(OsString::from("/run/user/1000/ssh-agent.socket")),
+            "XDG_RUNTIME_DIR" => Some(runtime.clone().into_os_string()),
+            _ => None,
+        };
+        let mut command = Command::new("true");
+        command
+            .env("XDG_CONFIG_HOME", "/run/workspace/session-config")
+            .env("XDG_DATA_HOME", "/run/workspace/session-data");
+
+        use_the_users_session(&mut command, user);
+
+        let envs = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        // The compositor's private config is gone; the user's default applies.
+        assert_eq!(envs["XDG_CONFIG_HOME"], None);
+        assert_eq!(
+            envs["XDG_DATA_HOME"].as_deref(),
+            Some("/home/me/.local/share")
+        );
+        assert_eq!(
+            envs["SSH_AUTH_SOCK"].as_deref(),
+            Some("/run/user/1000/ssh-agent.socket")
+        );
+        assert_eq!(
+            envs["PULSE_SERVER"].as_deref(),
+            Some(format!("unix:{}/pulse/native", runtime.display()).as_str())
+        );
+        fs::remove_dir_all(runtime).ok();
+    }
+
+    #[test]
+    fn a_browser_on_a_profile_the_desktop_holds_is_refused() {
+        let home = env::temp_dir().join(format!("agent-workspace-handoff-{}", std::process::id()));
+        let profile = home.join(".config/google-chrome");
+        fs::create_dir_all(&profile).expect("profile dir");
+        std::os::unix::fs::symlink(
+            format!("host-{}", std::process::id()),
+            profile.join("SingletonLock"),
+        )
+        .expect("lock");
+        let user = |name: &str| (name == "HOME").then(|| home.clone().into_os_string());
+        let command = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+
+        let why = desktop_handoff(
+            None,
+            &command(&["/usr/bin/google-chrome", "https://example.com"]),
+            user,
+            |_| false,
+        )
+        .expect("the desktop browser holds the profile");
+        assert!(why.contains("--user-data-dir"), "{why}");
+        assert_eq!(
+            desktop_handoff(
+                None,
+                &command(&["google-chrome", "--user-data-dir=/tmp/x"]),
+                user,
+                |_| false
+            ),
+            None
+        );
+        assert_eq!(
+            desktop_handoff(None, &command(&["xterm"]), user, |_| false),
+            None
+        );
+        // A relative profile is the one under the browser's own cwd.
+        assert!(desktop_handoff(
+            Some(&home),
+            &command(&["google-chrome", "--user-data-dir=.config/google-chrome"]),
+            user,
+            |_| false
+        )
+        .is_some());
+        // Naming the profile the desktop browser holds hands off just the same.
+        let held = profile.display().to_string();
+        let explicit = format!("--user-data-dir={held}");
+        for args in [
+            vec!["google-chrome", explicit.as_str()],
+            vec!["google-chrome", "--user-data-dir", &held],
+        ] {
+            assert!(
+                desktop_handoff(None, &command(&args), user, |_| false).is_some(),
+                "{args:?}"
+            );
+        }
+
+        let ours = std::process::id();
+        assert_eq!(
+            desktop_handoff(None, &command(&["google-chrome"]), user, |pid| pid == ours),
+            None,
+            "a browser the workspace launched keeps its windows there"
+        );
+        fs::remove_file(profile.join("SingletonLock")).unwrap();
+        std::os::unix::fs::symlink("host-999999999", profile.join("SingletonLock")).unwrap();
+        assert_eq!(
+            desktop_handoff(None, &command(&["google-chrome"]), user, |_| false),
+            None,
+            "a stale lock holds nothing"
+        );
+        fs::remove_dir_all(home).ok();
     }
 }

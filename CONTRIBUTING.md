@@ -12,7 +12,7 @@ You need:
 
 ```bash
 sudo apt install xvfb openbox xdotool xauth x11-utils imagemagick xclip \
-    bubblewrap uidmap pkg-config libxkbcommon-x11-dev
+    dbus-daemon pkg-config libxkbcommon-x11-dev
 ```
 
 ## Build
@@ -67,8 +67,7 @@ agent-workspace-linux/
 │   ├── control.rs      # Live control state (active/read_only/paused)
 │   ├── guardrails.rs   # Action guardrails
 │   ├── profile.rs      # Profile management
-│   ├── policy.rs       # Policy enforcement
-│   ├── launch.rs       # Shared launch environment and sandbox construction
+│   ├── launch.rs       # Launch environment of workspace apps
 │   ├── session.rs      # Session model and backend dispatch
 │   ├── session/
 │   │   └── x11.rs      # X11/Xvfb/Openbox session adapter

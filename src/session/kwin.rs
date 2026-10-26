@@ -2,10 +2,7 @@
 //! No parent X11/Wayland display and no host input device is used.
 pub(crate) use super::private::bus_address;
 use super::private::{prepare_child, wait_for, PrivateSession};
-use crate::{
-    launch::SessionSandboxResources,
-    workspace::{cleanup_stale_process_pid, command_path_check, DaemonOptions},
-};
+use crate::workspace::{cleanup_stale_process_pid, command_path_check, DaemonOptions};
 use anyhow::{bail, Context, Result};
 use std::{
     fs,
@@ -93,39 +90,8 @@ pub(crate) fn configure_process_environment(
     }
 }
 
-pub(crate) fn sandbox_resources(
-    runtime: &Path,
-    xauthority: &Path,
-    display: &str,
-) -> SessionSandboxResources {
-    let mut read_only_binds = Vec::new();
-    if xauthority.is_file() {
-        read_only_binds.push(xauthority.to_path_buf());
-    }
-    let mut read_write_binds = vec![runtime.join(WAYLAND_SOCKET), runtime.join("session-bus")];
-    if let Some(number) = display
-        .strip_prefix(':')
-        .and_then(|s| s.split('.').next())
-        .filter(|s| !s.is_empty() && s.bytes().all(|c| c.is_ascii_digit()))
-    {
-        let socket = std::path::PathBuf::from(format!("/tmp/.X11-unix/X{number}"));
-        if socket.exists() {
-            read_write_binds.push(socket);
-        }
-    }
-    let atspi = runtime.join("at-spi/bus");
-    if atspi.exists() {
-        read_write_binds.push(atspi);
-    }
-    SessionSandboxResources {
-        read_only_binds,
-        read_write_binds,
-    }
-}
-
 pub(crate) struct KwinSession {
     private: PrivateSession,
-    filter: Option<super::wayland_filter::WaylandFilter>,
 }
 impl KwinSession {
     pub(crate) fn start(options: &mut DaemonOptions) -> Result<Self> {
@@ -179,7 +145,6 @@ impl KwinSession {
                 },
                 "",
             )?,
-            filter: None,
         };
         let client_env = runtime.join("kwin-client.json");
         if client_env.exists() {
@@ -340,18 +305,12 @@ impl KwinSession {
         let (width, height) = crate::desktop::kwin::probe(&options.runtime_dir)?;
         options.width = width;
         options.height = height;
-        // Sandboxed apps connect through the filter, never the main socket.
-        session.filter = Some(super::wayland_filter::WaylandFilter::start(
-            runtime,
-            &runtime.join(WAYLAND_SOCKET),
-        )?);
         Ok(session)
     }
     pub(crate) fn pid(&self) -> Option<u32> {
         self.private.pid()
     }
     pub(crate) fn shutdown(&mut self) {
-        self.filter = None;
         self.private.shutdown();
     }
 }

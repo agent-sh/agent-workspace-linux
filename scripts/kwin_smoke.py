@@ -113,8 +113,8 @@ for scale in (1, 1.5):
         env = workspace(id, "env")["environment"]["variables"]
         env = {entry["name"]: entry["value"] for entry in env}
         assert env["XDG_SESSION_TYPE"] == "wayland"
-        # Attached controllers (computer-use-linux) need the compositor bus;
-        # launched apps get client-bus instead (runtime_isolation_smoke.py).
+        # Attached controllers (computer-use-linux) and launched apps share the
+        # workspace session bus.
         assert env["DBUS_SESSION_BUS_ADDRESS"].endswith(f"/{id}/session-bus")
         assert env["WAYLAND_DISPLAY"] == "workspace-wayland"
         assert env["QT_QPA_PLATFORM"] == "wayland"
@@ -238,29 +238,17 @@ for scale in (1, 1.5):
             wait_for(lambda: not Path(f"/proc/{status['window_manager_pid']}").exists(), "compositor process cleanup")
             assert not (runtime / "workspace-wayland").exists(), "Wayland socket survived clean stop"
             assert not any(path.exists() for path in initial_x_sockets), "XWayland socket survived clean stop"
-# Enforced mounts + network namespace must retain the owning XWayland socket.
-project = Path("/tmp/legacy-project")
+# A launched XWayland terminal maps a window and runs on the workspace session bus.
+project = Path("/tmp/xwayland-project")
 project.mkdir()
-profile = Path("/tmp/legacy-profile.json")
-profile.write_text(json.dumps({"id":"kwin-restricted", "session":{"backend":"kwin"},
-    "cwd":"/workspace/project", "require_enforced_policy":True,
-    "network":{"mode":"disabled"}, "mounts":[{"host_path":str(project),
-    "workspace_path":"/workspace/project", "mode":"read_write"}]}))
-command("profile","import","--json",profile)
-id="kwin-restricted"
+id="kwin-xwayland"
 try:
-    workspace(id,"start","--profile","kwin-restricted","--ack-hidden-workspace", "--purpose","Legacy XWayland sandbox acceptance")
-    launch=workspace(id,"launch","--wait-window","--window-timeout-ms",10000,"--","xterm","-fa","monospace","-e","sh","-c","printf ready > /workspace/project/ready; exec tail -f /dev/null")
+    workspace(id,"start","--session","kwin","--ack-hidden-workspace", "--purpose","XWayland terminal acceptance")
+    launch=workspace(id,"launch","--wait-window","--window-timeout-ms",10000,"--","xterm","-fa","monospace","-e","sh","-c",'printf %s "$DBUS_SESSION_BUS_ADDRESS" > "$1/ready"; exec tail -f /dev/null',"sh",project)
     assert launch["windows"], launch
-    wait_for(lambda:(project/"ready").exists(),"XWayland terminal in enforced sandbox")
-    app=launch["apps"][0]
-    assert app["mount_isolation"]=="bubblewrap_mount_namespace",app
-    assert app["network_isolation"]=="bubblewrap_unshare_net",app
-    print("KWin restricted XWayland terminal passed",flush=True)
+    wait_for(lambda:(project/"ready").exists() and (project/"ready").read_text(),"XWayland terminal")
+    assert (project/"ready").read_text().endswith(f"/{id}/session-bus"), (project/"ready").read_text()
+    print("KWin XWayland terminal passed",flush=True)
 finally:
     workspace(id,"stop")
-# Sandboxed apps must reach only the filtered Wayland socket.
-(Path.home()/".cache").mkdir(exist_ok=True)
-subprocess.run(["python3","/opt/kwin-probe/sandbox_wayland_globals_smoke.py","kwin"],
-               env=dict(os.environ,AGENT_WORKSPACE_BIN=BIN,SANDBOX_GLOBALS_ARTIFACTS=str(ARTIFACTS)),check=True,timeout=300)
 print("KWin native acceptance passed", flush=True)

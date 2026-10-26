@@ -293,7 +293,7 @@ impl AgentWorkspaceLinux {
 impl AgentWorkspaceLinux {
     #[tool(
         name = "workspace_guardrails",
-        description = "Return machine-readable guardrails for isolated workspace actions, including concise agent_rules with allowed, blocked, requires_ack, and exact_parameter fields plus detailed acknowledgement, dry-run, override, policy, and timeout rules.",
+        description = "Return machine-readable guardrails for workspace actions, including concise agent_rules with allowed, blocked, requires_ack, and exact_parameter fields plus detailed acknowledgement, dry-run, override, policy, and timeout rules.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -307,7 +307,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "mcp_permissions",
-        description = "Return the spawn-time MCP permission state for this server process. If configured=true, populated network, mount, or app dimensions are immutable ceilings that clients may only narrow. If configured=false, this MCP imposes no ceiling and only reports the host/client harness boundary.",
+        description = "Return the spawn-time MCP permission state for this server process. If configured=true, a populated app allowlist is an immutable ceiling that clients may only narrow. If configured=false, this MCP imposes no ceiling and only reports the host/client harness boundary.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -444,7 +444,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_doctor",
-        description = "Report readiness for isolated Linux agent workspaces, including optional policy backend candidates such as bubblewrap, firejail, unshare, and slirp4netns.",
+        description = "Report readiness for background Linux agent workspaces: display, compositor, input, capture and viewer tools per backend.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -492,9 +492,6 @@ impl AgentWorkspaceLinux {
                     height: None,
                     cwd: None,
                     env: Vec::new(),
-                    mounts: Vec::new(),
-                    network: Default::default(),
-                    require_enforced_policy: false,
                     setup_commands: Vec::new(),
                     startup_apps: Vec::new(),
                 }],
@@ -602,7 +599,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "profile_template",
-        description = "Generate a starter profile without saving it. The project-dev template mounts a project directory read-write at /workspace/project and, when detected, mounts Cargo bin/rustup toolchains read-only without mounting Cargo credentials. The restricted-chrome template starts Chrome with network.mode=disabled, require_enforced_policy=true, an isolated user-data dir, and an explicit --no-sandbox startup command for bubblewrap network namespaces. The browser-session template requires user_data_dir, mounts that browser data directory read-write at /workspace/browser-user-data, inherits host network for authenticated web tasks, and visibly uses --no-sandbox because Chrome can abort inside the enforced mount namespace.",
+        description = "Generate a starter profile without saving it. Workspace apps run as the user, with the user's files and network. The project-dev template starts apps in the project directory. The chrome template starts Chrome on a fresh profile in /tmp/agent-workspace-chrome. The browser-session template requires user_data_dir and starts Chrome on that profile, with its logins; close the host browser or use a copied profile first.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -645,7 +642,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "profile_put",
-        description = "Create an agent workspace profile. Existing profile ids are rejected unless replace=true is set explicitly. Set dry_run=true to preview whether the profile would be created, replaced, or rejected without writing. Mounts, network, require_enforced_policy, and setup commands are persisted as declared intent and surfaced in workspace status; display size, cwd, and env are currently applied by the X11 runtime.",
+        description = "Create an agent workspace profile. Existing profile ids are rejected unless replace=true is set explicitly. Set dry_run=true to preview whether the profile would be created, replaced, or rejected without writing. Session, display size, cwd, env, setup commands and startup apps are saved.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -808,7 +805,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_start",
-        description = "Start an isolated agent workspace with its own display and control IPC socket. By default, when this MCP process is not --headless and workspace_doctor.ready_for_host_viewer=true, the tool also opens the small host-visible GPUI viewer immediately; set open_viewer=false to explicitly opt out. Set dry_run=true for a pre-daemon approval preview: it checks acknowledgement, runtime, and policy requirements without creating a runtime directory, daemon, display, viewer, or apps. Dry-run responses include an approval bundle for UI confirmation. Set acknowledge_hidden_workspace=true to confirm the user knows this creates a separate agent-controlled environment. Optional purpose records a human-readable reason in status and the start event. Optional session selects x11 (Xvfb with Openbox), kwin (native Wayland, KWin 6.6+), gnome (native Wayland, GNOME 50/51), i3 (private X11), hyprland (native Wayland, private KWin renderer), or cosmic (native Wayland, private software Weston parent), with optional output scale for Wayland; an explicit session overrides the profile, which overrides the default. If the selected profile requests currently unenforced mount or network restrictions, also set acknowledge_unenforced_policy=true. Mount, disabled-network, and local_only network profiles are enforced with bubblewrap when available; local_only uses a loopback-only namespace and does not bridge host localhost services. The current product network modes are closed/disabled, local/local_only, and open/inherit_host; allowlist network profiles are advanced/legacy declared intent only. Profiles with require_enforced_policy=true reject unenforced policy instead of accepting acknowledgement.",
+        description = "Start an agent workspace with its own display and control IPC socket. By default, when this MCP process is not --headless and workspace_doctor.ready_for_host_viewer=true, the tool also opens the small host-visible GPUI viewer immediately; set open_viewer=false to explicitly opt out. Set dry_run=true for a pre-daemon approval preview: it checks acknowledgement and runtime requirements without creating a runtime directory, daemon, display, viewer, or apps. Dry-run responses include an approval bundle for UI confirmation. Set acknowledge_hidden_workspace=true to confirm the user knows this creates a separate agent-controlled environment. Optional purpose records a human-readable reason in status and the start event. Optional session selects x11 (Xvfb with Openbox), kwin (native Wayland, KWin 6.6+), gnome (native Wayland, GNOME 50/51), i3 (private X11), hyprland (native Wayland, private KWin renderer), or cosmic (native Wayland, private software Weston parent), with optional output scale for Wayland; an explicit session overrides the profile, which overrides the default. Apps in the workspace run as the user, with the user's files, network, keyring and SSH agent; it is not a sandbox.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -858,7 +855,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_open_profile",
-        description = "Start a profile-backed isolated workspace, optionally record a human-readable purpose, optionally wait for profile setup, optionally kill timed-out setup commands, and launch that profile's startup apps in one operation after setup succeeds. By default, when this MCP process is not --headless and workspace_doctor.ready_for_host_viewer=true, the small host-visible GPUI viewer opens immediately after the workspace starts and before setup/startup apps run; set open_viewer=false to explicitly opt out. Set dry_run=true for a pre-daemon approval preview: it returns the start preview plus setup/startup declarations without creating a runtime directory, daemon, display, viewer, or apps. The preview approval bundle merges all required acknowledgements. Setup/startup entries in this pre-daemon preview are declarations; daemon-attached launch previews are available only after a workspace is running. Optional session selects x11 (Xvfb with Openbox), kwin (native Wayland, KWin 6.6+), gnome (native Wayland, GNOME 50/51), i3 (private X11), hyprland (native Wayland, private KWin renderer), or cosmic (native Wayland, private software Weston parent), with optional output scale for Wayland; an explicit session overrides the profile, which overrides the default. Set startup_wait_window=true to wait for each startup app's first visible window, or startup_screenshot_window=true to also capture each first startup window.",
+        description = "Start a profile-backed workspace, optionally record a human-readable purpose, optionally wait for profile setup, optionally kill timed-out setup commands, and launch that profile's startup apps in one operation after setup succeeds. By default, when this MCP process is not --headless and workspace_doctor.ready_for_host_viewer=true, the small host-visible GPUI viewer opens immediately after the workspace starts and before setup/startup apps run; set open_viewer=false to explicitly opt out. Set dry_run=true for a pre-daemon approval preview: it returns the start preview plus setup/startup declarations without creating a runtime directory, daemon, display, viewer, or apps. The preview approval bundle merges all required acknowledgements. Setup/startup entries in this pre-daemon preview are declarations; daemon-attached launch previews are available only after a workspace is running. Optional session selects x11 (Xvfb with Openbox), kwin (native Wayland, KWin 6.6+), gnome (native Wayland, GNOME 50/51), i3 (private X11), hyprland (native Wayland, private KWin renderer), or cosmic (native Wayland, private software Weston parent), with optional output scale for Wayland; an explicit session overrides the profile, which overrides the default. Set startup_wait_window=true to wait for each startup app's first visible window, or startup_screenshot_window=true to also capture each first startup window.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -943,7 +940,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_status",
-        description = "Return live status for an isolated agent workspace, including its per-run session_id, applied profile policy snapshot, and enforcement report when a profile started the workspace.",
+        description = "Return live status for an agent workspace, including its per-run session_id and the profile that started it.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1031,7 +1028,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_ipc_info",
-        description = "Return daemon IPC protocol metadata for an isolated agent workspace, including protocol version, session_id, transport, framing, encoding, and socket path.",
+        description = "Return daemon IPC protocol metadata for an agent workspace, including protocol version, session_id, transport, framing, encoding, and socket path.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1051,7 +1048,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_env",
-        description = "Return the workspace-local environment needed to attach external tools to an isolated agent workspace, including DISPLAY, XAUTHORITY, AGENT_WORKSPACE_SESSION_ID, runtime directory, and control socket path.",
+        description = "Return the workspace-local environment needed to attach external tools to an agent workspace, including DISPLAY, XAUTHORITY, AGENT_WORKSPACE_SESSION_ID, runtime directory, and control socket path.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1071,7 +1068,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_list",
-        description = "List known isolated agent workspace runtime directories and whether each workspace is currently running.",
+        description = "List known agent workspace runtime directories and whether each workspace is currently running.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1246,7 +1243,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_cleanup_stale",
-        description = "Remove stale isolated workspace runtime directories and best-effort terminate manifest-recorded orphan app process groups, X server, window manager, and daemon PIDs when their identity can be verified. Running workspaces are skipped. Set dry_run=true to return removable candidates plus process_cleanup actions without deleting files or signaling processes.",
+        description = "Remove stale workspace runtime directories and best-effort terminate manifest-recorded orphan app process groups, X server, window manager, and daemon PIDs when their identity can be verified. Running workspaces are skipped. Set dry_run=true to return removable candidates plus process_cleanup actions without deleting files or signaling processes.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -1278,7 +1275,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_launch_app",
-        description = "Launch an optionally named app inside an isolated agent workspace. Set dry_run=true for a daemon-attached preview against an already running workspace daemon; it fails when the workspace is not running and never starts a daemon for you. Dry-run returns the command, cwd/env, profile policy, approval bundle, and mount/network isolation without spawning a process. The command runs with the workspace attachment environment, including DISPLAY, XAUTHORITY, AGENT_WORKSPACE_ID, AGENT_WORKSPACE_RUNTIME_DIR, and AGENT_WORKSPACE_SOCKET. Set wait_window=true to wait for the launched app's first visible window and return it in the same response. Set screenshot_window=true to also capture the first visible launched-app window; this implies waiting for a window. If a launch profile is provided, its cwd/env and mount/network policy apply to this app; set acknowledge_unenforced_policy=true if that launch profile requests policy that remains unenforced. Action responses return the directly affected app in the top-level apps field and keep nested status compact; use workspace_status or workspace_list_apps for the full app history. Prefer the returned apps[0].id as app_id for later window-targeted actions because GUI window titles often change after launch.",
+        description = "Launch an optionally named app inside an agent workspace. Set dry_run=true for a daemon-attached preview against an already running workspace daemon; it fails when the workspace is not running and never starts a daemon for you. Dry-run returns the command, cwd/env and approval bundle without spawning a process. The app runs as the user, with the user's files, network, keyring and SSH agent; only its windows stay in the workspace. The command runs with the workspace attachment environment, including DISPLAY, XAUTHORITY, AGENT_WORKSPACE_ID, AGENT_WORKSPACE_RUNTIME_DIR, and AGENT_WORKSPACE_SOCKET. Set wait_window=true to wait for the launched app's first visible window and return it in the same response. Set screenshot_window=true to also capture the first visible launched-app window; this implies waiting for a window. If a launch profile is provided, its cwd/env apply to this app. Action responses return the directly affected app in the top-level apps field and keep nested status compact; use workspace_status or workspace_list_apps for the full app history. Prefer the returned apps[0].id as app_id for later window-targeted actions because GUI window titles often change after launch.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1324,7 +1321,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_run_app",
-        description = "Launch an optionally named app inside an isolated agent workspace, wait for it to exit or time out, optionally kill it on timeout, and return stdout/stderr logs in one response. Set dry_run=true for a daemon-attached preview against an already running workspace daemon; it fails when the workspace is not running and never starts a daemon for you. Dry-run returns launch/run options and an approval bundle without spawning a process. The command uses the same workspace attachment environment, optional cwd/env overrides, and optional launch profile policy as workspace_launch_app. Nested launch/wait/log responses keep status compact while the affected app and logs are returned in dedicated top-level fields.",
+        description = "Launch an optionally named app inside an agent workspace, wait for it to exit or time out, optionally kill it on timeout, and return stdout/stderr logs in one response. Set dry_run=true for a daemon-attached preview against an already running workspace daemon; it fails when the workspace is not running and never starts a daemon for you. Dry-run returns launch/run options and an approval bundle without spawning a process. The command uses the same workspace attachment environment, optional cwd/env overrides, and optional launch profile as workspace_launch_app. Nested launch/wait/log responses keep status compact while the affected app and logs are returned in dedicated top-level fields.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1400,7 +1397,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_run_in_terminal",
-        description = "Launch an xterm inside an isolated workspace backed by a per-workspace tmux socket. Returns a terminal_id, tmux pane target, pane tty, app_id, and window handles so TUI agents can use workspace_terminal_read and workspace_terminal_input instead of screenshots and coordinate guessing. The command is optional; when omitted tmux starts the default shell.",
+        description = "Launch an xterm inside a workspace backed by a per-workspace tmux socket. Returns a terminal_id, tmux pane target, pane tty, app_id, and window handles so TUI agents can use workspace_terminal_read and workspace_terminal_input instead of screenshots and coordinate guessing. The command is optional; when omitted tmux starts the default shell.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1566,7 +1563,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_list_apps",
-        description = "List apps launched inside an isolated agent workspace, optionally filtering by app id/pid/name, app name substring, command substring, profile id, or running/stopped state. Falls back to the saved app snapshot when the workspace daemon has stopped.",
+        description = "List apps launched inside an agent workspace, optionally filtering by app id/pid/name, app name substring, command substring, profile id, or running/stopped state. Falls back to the saved app snapshot when the workspace daemon has stopped.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1593,7 +1590,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_open_browser",
-        description = "Launch Chrome/Chromium inside an already-running isolated workspace with the correct workspace-owned browser-control flags: --user-data-dir, --remote-debugging-address=127.0.0.1, and --remote-debugging-port=0. Defaults to a disposable per-workspace browser profile and about:blank, waits for the first window, then returns app_id and browser_target_id handles. Use this before workspace_browser_navigate/snapshot/click so agents do not need to shell out or hand-build Chrome flags.",
+        description = "Launch Chrome/Chromium inside an already-running workspace with the correct workspace-owned browser-control flags: --user-data-dir, --remote-debugging-address=127.0.0.1, and --remote-debugging-port=0. Defaults to a disposable per-workspace browser profile and about:blank, waits for the first window, then returns app_id and browser_target_id handles. Use this before workspace_browser_navigate/snapshot/click so agents do not need to shell out or hand-build Chrome flags.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1639,7 +1636,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_browser_targets",
-        description = "Read-only discovery for a Chrome/Chromium browser launched inside an isolated workspace. It derives the DevTools endpoint from the running workspace app's --user-data-dir and DevToolsActivePort file, maps /workspace browser-profile mounts back to their host copy when needed, and returns Chrome DevTools page targets. Use this for workspace-owned browser control instead of attaching to the user's host Chrome bridge.",
+        description = "Read-only discovery for a Chrome/Chromium browser launched inside a workspace. It derives the DevTools endpoint from the running workspace app's --user-data-dir and DevToolsActivePort file and returns Chrome DevTools page targets. Use this for workspace-owned browser control instead of attaching to the user's host Chrome bridge.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1670,7 +1667,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_browser_snapshot",
-        description = "Read the current DOM text, title, URL, headings, and links from a Chrome/Chromium page target launched inside the isolated workspace. This uses the workspace-owned Chrome DevTools target discovered from the running workspace browser app, not the host Chrome bridge, and records a metadata-only browser_snapshot workspace event without raw DOM text, headings, or links.",
+        description = "Read the current DOM text, title, URL, headings, and links from a Chrome/Chromium page target launched inside the workspace. This uses the workspace-owned Chrome DevTools target discovered from the running workspace browser app, not the host Chrome bridge, and records a metadata-only browser_snapshot workspace event without raw DOM text, headings, or links.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1705,7 +1702,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_browser_search_results",
-        description = "Extract structured product/search result cards from a Chrome/Chromium page target launched inside the isolated workspace. This uses the workspace-owned Chrome DevTools target, returns titles, prices, visible VRAM/memory GB, ratings, availability, delivery snippets, and links when present, can filter by min_vram_gb for GPU shopping, and records a metadata-only browser_search_results workspace event without raw result text or links.",
+        description = "Extract structured product/search result cards from a Chrome/Chromium page target launched inside the workspace. This uses the workspace-owned Chrome DevTools target, returns titles, prices, visible VRAM/memory GB, ratings, availability, delivery snippets, and links when present, can filter by min_vram_gb for GPU shopping, and records a metadata-only browser_search_results workspace event without raw result text or links.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1741,7 +1738,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_browser_navigate",
-        description = "Navigate a Chrome/Chromium page target launched inside the isolated workspace to an http(s), data:, or about:blank URL using the workspace-owned Chrome DevTools connection. This is workspace browser control, not host Chrome control; it is blocked while live MCP control is read_only or paused and records a browser_navigate workspace event.",
+        description = "Navigate a Chrome/Chromium page target launched inside the workspace to an http(s), data:, or about:blank URL using the workspace-owned Chrome DevTools connection. This is workspace browser control, not host Chrome control; it is blocked while live MCP control is read_only or paused and records a browser_navigate workspace event.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1783,7 +1780,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_browser_click",
-        description = "Click inside a workspace-owned Chrome/Chromium page target through Chrome DevTools. Target by CSS selector, visible text, or viewport_x/viewport_y page coordinates; viewport coordinates are page viewport-relative, not window/screenshot coordinates, so agents do not subtract browser toolbar height. This mutates only the isolated workspace browser, records a metadata-only browser_click event, and can return a post-click page snapshot.",
+        description = "Click inside a workspace-owned Chrome/Chromium page target through Chrome DevTools. Target by CSS selector, visible text, or viewport_x/viewport_y page coordinates; viewport coordinates are page viewport-relative, not window/screenshot coordinates, so agents do not subtract browser toolbar height. This mutates only the workspace browser, records a metadata-only browser_click event, and can return a post-click page snapshot.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -1827,7 +1824,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_list_windows",
-        description = "List windows inside an isolated agent workspace, optionally filtering by title/class/pid/app. By default this returns visible windows; set include_hidden=true to include minimized/hidden windows with visibility metadata.",
+        description = "List windows inside an agent workspace, optionally filtering by title/class/pid/app. By default this returns visible windows; set include_hidden=true to include minimized/hidden windows with visibility metadata.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1854,7 +1851,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_active_window",
-        description = "Report the currently active visible window inside an isolated agent workspace.",
+        description = "Report the currently active visible window inside an agent workspace.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1874,7 +1871,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_pointer",
-        description = "Report the current pointer coordinates inside an isolated agent workspace.",
+        description = "Report the current pointer coordinates inside an agent workspace.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1894,7 +1891,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_observe",
-        description = "Return status, windows, active window, pointer coordinates, optional root screenshot, and optional recent/incremental events for an isolated agent workspace. By default windows are visible-only; set include_hidden=true to include minimized/hidden windows. When screenshot=true and output_path is omitted, repeated live observation reuses observe-frame.png instead of accumulating timestamped screenshots.",
+        description = "Return status, windows, active window, pointer coordinates, optional root screenshot, and optional recent/incremental events for an agent workspace. By default windows are visible-only; set include_hidden=true to include minimized/hidden windows. When screenshot=true and output_path is omitted, repeated live observation reuses observe-frame.png instead of accumulating timestamped screenshots.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1922,7 +1919,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_wait_window",
-        description = "Wait for a visible window inside an isolated agent workspace, optionally filtered by title substring, pid, or launched app id/pid.",
+        description = "Wait for a visible window inside an agent workspace, optionally filtered by title substring, pid, or launched app id/pid.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1949,7 +1946,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_screenshot",
-        description = "Capture a screenshot of the isolated agent workspace root display and return the PNG path.",
+        description = "Capture a screenshot of the agent workspace root display and return the PNG path.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1969,7 +1966,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_screenshot_window",
-        description = "Capture a screenshot of a specific visible window inside an isolated agent workspace, targeted by X11 window id or by title/class/pid/app filters.",
+        description = "Capture a screenshot of a specific visible window inside an agent workspace, targeted by X11 window id or by title/class/pid/app filters.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -1998,7 +1995,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_focus_window",
-        description = "Focus a visible window inside an isolated agent workspace by X11 window id. Response includes the focused window and active_window when focus can be resolved after the action.",
+        description = "Focus a visible window inside an agent workspace by X11 window id. Response includes the focused window and active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2023,7 +2020,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_focus_matching_window",
-        description = "Wait for and focus a visible window inside an isolated agent workspace, filtered by title substring, class substring, pid, or launched app id/pid. Response includes the matched window and active_window when focus can be resolved after the action.",
+        description = "Wait for and focus a visible window inside an agent workspace, filtered by title substring, class substring, pid, or launched app id/pid. Response includes the matched window and active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2057,7 +2054,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_close_window",
-        description = "Request that a window inside an isolated agent workspace close by X11 window id. Response includes the window record that was targeted for close. Set dry_run=true to resolve and return the targeted window without closing it.",
+        description = "Request that a window inside an agent workspace close by X11 window id. Response includes the window record that was targeted for close. Set dry_run=true to resolve and return the targeted window without closing it.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2085,7 +2082,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_close_matching_window",
-        description = "Wait for and request close of a visible window inside an isolated agent workspace, filtered by title substring, class substring, pid, or launched app id/pid. Set dry_run=true to resolve and return the matched window without closing it.",
+        description = "Wait for and request close of a visible window inside an agent workspace, filtered by title substring, class substring, pid, or launched app id/pid. Set dry_run=true to resolve and return the matched window without closing it.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2123,7 +2120,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_move_window",
-        description = "Move a visible window inside an isolated agent workspace by X11 id or by title/class/pid/app filters. Coordinates are workspace-local top-left pixels.",
+        description = "Move a visible window inside an agent workspace by X11 id or by title/class/pid/app filters. Coordinates are workspace-local top-left pixels.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2160,7 +2157,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_resize_window",
-        description = "Resize a visible window inside an isolated agent workspace by X11 id or by title/class/pid/app filters. Size is in pixels.",
+        description = "Resize a visible window inside an agent workspace by X11 id or by title/class/pid/app filters. Size is in pixels.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2197,7 +2194,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_raise_window",
-        description = "Raise a visible window inside an isolated agent workspace above other windows, targeted by X11 id or title/class/pid/app filters.",
+        description = "Raise a visible window inside an agent workspace above other windows, targeted by X11 id or title/class/pid/app filters.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2232,7 +2229,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_minimize_window",
-        description = "Minimize a visible window inside an isolated agent workspace, targeted by X11 id or title/class/pid/app filters. Response includes the refreshed window record after minimization.",
+        description = "Minimize a visible window inside an agent workspace, targeted by X11 id or title/class/pid/app filters. Response includes the refreshed window record after minimization.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2302,7 +2299,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_click",
-        description = "Click workspace-local coordinates inside an isolated agent workspace, optionally setting button and repeat count. Response includes pointer and active_window when focus can be resolved after the action.",
+        description = "Click workspace-local coordinates inside an agent workspace, optionally setting button and repeat count. Response includes pointer and active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2329,7 +2326,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_click_window",
-        description = "Click a coordinate relative to a visible window inside an isolated agent workspace, targeted by X11 window id or by title/class/pid/app filters, optionally setting button and repeat count. Response includes pointer, target window, and active_window when focus can be resolved after the action.",
+        description = "Click a coordinate relative to a visible window inside an agent workspace, targeted by X11 window id or by title/class/pid/app filters, optionally setting button and repeat count. Response includes pointer, target window, and active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2368,7 +2365,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_move_pointer",
-        description = "Move the pointer to workspace-local coordinates inside an isolated agent workspace without clicking. Response includes pointer and active_window when focus can be resolved after the action.",
+        description = "Move the pointer to workspace-local coordinates inside an agent workspace without clicking. Response includes pointer and active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2393,7 +2390,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_move_pointer_window",
-        description = "Move the pointer to coordinates relative to a visible window inside an isolated agent workspace, targeted by X11 window id or by title/class/pid/app filters, without clicking. Response includes pointer, target window, and active_window when focus can be resolved after the action.",
+        description = "Move the pointer to coordinates relative to a visible window inside an agent workspace, targeted by X11 window id or by title/class/pid/app filters, without clicking. Response includes pointer, target window, and active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2430,7 +2427,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_drag",
-        description = "Drag from one workspace-local coordinate to another inside an isolated agent workspace, optionally setting the mouse button. Response includes pointer and active_window when focus can be resolved after the action.",
+        description = "Drag from one workspace-local coordinate to another inside an agent workspace, optionally setting the mouse button. Response includes pointer and active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2461,7 +2458,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_drag_window",
-        description = "Drag between coordinates relative to a visible window inside an isolated agent workspace, targeted by X11 window id or by title/class/pid/app filters, optionally setting the mouse button. Response includes pointer, target window, and active_window when focus can be resolved after the action.",
+        description = "Drag between coordinates relative to a visible window inside an agent workspace, targeted by X11 window id or by title/class/pid/app filters, optionally setting the mouse button. Response includes pointer, target window, and active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2501,7 +2498,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_scroll",
-        description = "Scroll at workspace-local coordinates inside an isolated agent workspace. Direction is up, down, left, or right; amount is wheel ticks. Response includes pointer and active_window when focus can be resolved after the action.",
+        description = "Scroll at workspace-local coordinates inside an agent workspace. Direction is up, down, left, or right; amount is wheel ticks. Response includes pointer and active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2528,7 +2525,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_scroll_window",
-        description = "Scroll at coordinates relative to a visible window inside an isolated agent workspace, targeted by X11 window id or by title/class/pid/app filters. Direction is up, down, left, or right; amount is wheel ticks. Response includes pointer, target window, and active_window when focus can be resolved after the action.",
+        description = "Scroll at coordinates relative to a visible window inside an agent workspace, targeted by X11 window id or by title/class/pid/app filters. Direction is up, down, left, or right; amount is wheel ticks. Response includes pointer, target window, and active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2567,7 +2564,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_key",
-        description = "Send a key chord to the isolated agent workspace with xdotool syntax, for example Return or ctrl+l. Response includes active_window when focus can be resolved after the action.",
+        description = "Send a key chord to the agent workspace with xdotool syntax, for example Return or ctrl+l. Response includes active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2592,7 +2589,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_key_window",
-        description = "Send a key chord to a specific visible window inside an isolated agent workspace, targeted by X11 window id or by title/class/pid/app filters. Prefer app_id from workspace_launch_app when controlling a launched app because GUI titles can change. Response includes the target window and active_window when focus can be resolved after the action.",
+        description = "Send a key chord to a specific visible window inside an agent workspace, targeted by X11 window id or by title/class/pid/app filters. Prefer app_id from workspace_launch_app when controlling a launched app because GUI titles can change. Response includes the target window and active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2628,7 +2625,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_type_text",
-        description = "Type literal text into the focused app inside an isolated agent workspace. Response includes active_window when focus can be resolved after the action.",
+        description = "Type literal text into the focused app inside an agent workspace. Response includes active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2653,7 +2650,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_type_window",
-        description = "Type literal text into a specific visible window inside an isolated agent workspace, targeted by X11 window id or by title/class/pid/app filters. Prefer app_id from workspace_launch_app when controlling a launched app because GUI titles can change. Response includes the target window and active_window when focus can be resolved after the action.",
+        description = "Type literal text into a specific visible window inside an agent workspace, targeted by X11 window id or by title/class/pid/app filters. Prefer app_id from workspace_launch_app when controlling a launched app because GUI titles can change. Response includes the target window and active_window when focus can be resolved after the action.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2689,7 +2686,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_set_clipboard",
-        description = "Set the clipboard selection inside an isolated agent workspace. Text is capped at 64 KiB. Event logs store only size metadata, not the raw clipboard text.",
+        description = "Set the clipboard selection inside an agent workspace. Text is capped at 64 KiB. Event logs store only size metadata, not the raw clipboard text.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2714,7 +2711,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_get_clipboard",
-        description = "Read the clipboard selection inside an isolated agent workspace.",
+        description = "Read the clipboard selection inside an agent workspace.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2734,7 +2731,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_paste_text",
-        description = "Set the isolated workspace clipboard to text, then send a paste key chord to the focused app. Text is capped at 64 KiB. Defaults to ctrl+v. Response includes active_window when focus can be resolved after the action. Event logs store only size metadata, not the raw text.",
+        description = "Set the workspace clipboard to text, then send a paste key chord to the focused app. Text is capped at 64 KiB. Defaults to ctrl+v. Response includes active_window when focus can be resolved after the action. Event logs store only size metadata, not the raw text.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2759,7 +2756,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_paste_window",
-        description = "Set the isolated workspace clipboard to text, focus a visible window by X11 id/title/class/pid/app filter, then send a paste key chord. Text is capped at 64 KiB. Prefer app_id from workspace_launch_app when controlling a launched app because GUI titles can change. Defaults to ctrl+v. Response includes the target window and active_window when focus can be resolved after the action. Event logs store only size metadata, not the raw text.",
+        description = "Set the workspace clipboard to text, focus a visible window by X11 id/title/class/pid/app filter, then send a paste key chord. Text is capped at 64 KiB. Prefer app_id from workspace_launch_app when controlling a launched app because GUI titles can change. Defaults to ctrl+v. Response includes the target window and active_window when focus can be resolved after the action. Event logs store only size metadata, not the raw text.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2796,7 +2793,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_read_app_log",
-        description = "Read stdout or stderr captured from an app launched inside an isolated agent workspace, falling back to saved log paths when the workspace daemon has stopped.",
+        description = "Read stdout or stderr captured from an app launched inside an agent workspace, falling back to saved log paths when the workspace daemon has stopped.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -2821,7 +2818,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_wait_app",
-        description = "Wait until an app launched inside an isolated agent workspace exits, or until timeout_ms elapses. Defaults to 30000ms. Set kill_on_timeout=true to terminate the app process group when the timeout elapses.",
+        description = "Wait until an app launched inside an agent workspace exits, or until timeout_ms elapses. Defaults to 30000ms. Set kill_on_timeout=true to terminate the app process group when the timeout elapses.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -2880,7 +2877,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_run_profile_setup",
-        description = "Launch setup commands declared by a saved profile inside an already running isolated workspace. Set dry_run=true for daemon-attached setup previews; it fails when the workspace is not running and never starts a daemon for you. Dry-run returns one launch preview per setup command without spawning processes. Set wait=true or timeout_ms to supervise setup in sequence and report completion/success; set kill_on_timeout=true to terminate timed-out setup commands.",
+        description = "Launch setup commands declared by a saved profile inside an already running workspace. Set dry_run=true for daemon-attached setup previews; it fails when the workspace is not running and never starts a daemon for you. Dry-run returns one launch preview per setup command without spawning processes. Set wait=true or timeout_ms to supervise setup in sequence and report completion/success; set kill_on_timeout=true to terminate timed-out setup commands.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2910,7 +2907,6 @@ impl AgentWorkspaceLinux {
                         wait: params.wait || params.timeout_ms.is_some(),
                         timeout_ms: params.timeout_ms,
                         kill_on_timeout: params.kill_on_timeout,
-                        acknowledge_unenforced_policy: params.acknowledge_unenforced_policy,
                     },
                 )
             }) {
@@ -2947,7 +2943,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_launch_profile_apps",
-        description = "Launch startup apps declared by a saved profile inside an already running isolated workspace. Set dry_run=true for daemon-attached startup previews; it fails when the workspace is not running and never starts a daemon for you. Dry-run returns one launch preview per startup app without spawning processes. Set wait_window=true to wait for each startup app's first visible window, or screenshot_window=true to also capture each first startup window.",
+        description = "Launch startup apps declared by a saved profile inside an already running workspace. Set dry_run=true for daemon-attached startup previews; it fails when the workspace is not running and never starts a daemon for you. Dry-run returns one launch preview per startup app without spawning processes. Set wait_window=true to wait for each startup app's first visible window, or screenshot_window=true to also capture each first startup window.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,
@@ -2974,7 +2970,6 @@ impl AgentWorkspaceLinux {
                     &profile_id,
                     profile::ProfileStartupOptions {
                         dry_run: params.dry_run,
-                        acknowledge_unenforced_policy: params.acknowledge_unenforced_policy,
                         wait_window: params.wait_window,
                         window_timeout_ms: params.window_timeout_ms,
                         screenshot_window: params.screenshot_window,
@@ -3008,7 +3003,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_kill_app",
-        description = "Terminate an app launched inside an isolated agent workspace by app id or pid. Set dry_run=true to resolve and return the matched app without terminating it.",
+        description = "Terminate an app launched inside an agent workspace by app id or pid. Set dry_run=true to resolve and return the matched app without terminating it.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3033,7 +3028,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "workspace_stop",
-        description = "Stop an isolated agent workspace, terminate apps launched inside it, return the apps stopped by the shutdown, and wait for the daemon IPC socket to close. Defaults to a 30000ms wait; set timeout_ms to override. Set dry_run=true to return currently running apps without stopping the workspace.",
+        description = "Stop an agent workspace, terminate apps launched inside it, return the apps stopped by the shutdown, and wait for the daemon IPC socket to close. Defaults to a 30000ms wait; set timeout_ms to override. Set dry_run=true to return currently running apps without stopping the workspace.",
         annotations(
             read_only_hint = false,
             destructive_hint = true,
@@ -3124,11 +3119,11 @@ fn sanitize_tool_schema(tool: &mut rmcp::model::Tool) {
     name = "agent-workspace-linux",
     instructions = "\
 Use mcp_agent_context for one low-noise snapshot with active/read_only/paused, headless/no-host-display, viewer, app_id/window_id/viewer_id/browser_target_id handles, and recovery hints. Use mcp_permissions first when the host may have spawned this MCP with a permissions ceiling, mcp_control_state to check whether live user control has put the server in active, read_only, or paused mode, mcp_action_catalog when deciding whether a tool is read-only, idempotent, destructive, host-visible/open-world, or blocked by live control, mcp_session_brief when you need a condensed session summary with suggested next actions, and mcp_task_plan when the user intent is app QA, browser/shopping, observation, or cleanup and you need a safe read-only plan before calling mutating tools. \
-If configured=true, any populated permission dimensions are an immutable spawn-time ceiling for profile, start, launch, setup, and startup actions; clients may only narrow those dimensions. If configured=true but restricted=false, the MCP has an explicit empty/open ceiling, so enforcement stays open while the configured state remains visible. If configured=false, the MCP does not impose its own ceiling; respect the host/client harness boundary and use mcp_action_catalog plus each tool's annotations and description to classify the action type before acting. \
+Workspaces are not sandboxes: launched apps run as the user with the user's files, network, keyring and SSH agent, so treat their actions as the user's own. If configured=true, a populated app allowlist is an immutable spawn-time ceiling for profile, start, launch, setup, and startup actions; clients may only narrow it. If configured=true but restricted=false, the ceiling file has no app allowlist, so launches stay open while the configured state remains visible. If configured=false, the MCP does not impose its own ceiling; respect the host/client harness boundary and use mcp_action_catalog plus each tool's annotations and description to classify the action type before acting. \
 Use mcp_control_update only when the user or controlling UI asks to switch active/read_only/paused; when reactivating from read_only or paused to active, pass confirmed_user_request=true only after explicit user or controlling UI approval. read_only and paused block mutating agent actions while preserving inspection and safety stop. \
 workspace_start and workspace_open_profile are host-visible/open-world by default because non-headless sessions with workspace_doctor.ready_for_host_viewer=true auto-open the GPUI monitor; pass open_viewer=false only when the user or embedding host explicitly wants no monitor. \
 Use workspace_open_browser to launch workspace-owned Chrome/Chromium with --user-data-dir and loopback DevTools flags before browser navigation, snapshots, search extraction, or browser clicks. Use workspace_browser_click for CSS selector, visible text, or page viewport-coordinate clicks. Use workspace_run_in_terminal for TUI apps, then workspace_terminal_read for exact pane text and workspace_terminal_input for batched focus-independent keys/text. \
-workspace_open_viewer is host-visible and open-world; it can launch the GPUI monitor unless this MCP process was started with --headless or workspace_doctor reports ready_for_host_viewer=false, in which case it must run without host-visible UI. Use workspace_list_viewers and workspace_close_viewer for repo-owned GPUI viewer lifecycle control when compositor/window automation cannot see or close the viewer; workspace_close_viewer only signals registered viewer pids whose command line still matches the registry entry, and dry_run=true previews the close. Use workspace_guardrails to inspect acknowledgement, dry-run, explicit override, timeout-termination, and workspace-scope rules for UI approval flows. Use workspace_doctor to check runtime readiness, viewer host-display readiness, and optional policy backend candidates. Use profile_list/profile_get/profile_check/profile_validate/profile_template/profile_put/profile_import/profile_export/profile_delete to manage saved environment profiles. Use profile_validate to preflight a local JSON profile file without saving it. Use profile_export to return a saved profile and optionally write it to output_path; set replace=true only when intentionally overwriting an existing file. Use profile_put with dry_run=true to preview whether a profile would be created, replaced, or rejected without writing. Use profile_import when the UI has a local JSON file path instead of an already parsed profile object. Use profile_delete with dry_run=true to return the saved profile without deleting it. profile_template can generate starter JSON such as project-dev, restricted-chrome, and browser-session before saving with profile_put; restricted-chrome and browser-session intentionally expose their --no-sandbox browser commands for bubblewrap namespace compatibility. browser-session requires user_data_dir and is intended only for explicitly user-approved browser data directories. profile_check preflights acknowledgement requirements and unenforced policy warnings before workspace_start. Preview scope matters: workspace_start dry_run=true and workspace_open_profile dry_run=true are pre-daemon approval previews that do not create runtime state; workspace_launch_app, workspace_run_app, workspace_run_profile_setup, and workspace_launch_profile_apps dry_run=true are daemon-attached previews and require an already running workspace. Dry-run preview responses include an approval bundle when acknowledgement UI data is available. workspace_start requires acknowledge_hidden_workspace=true before creating a new hidden agent-controlled environment. Pass purpose when a human-readable reason should be shown in workspace_status and the start event. If a profile requests policy that remains unenforced, workspace_start also requires acknowledge_unenforced_policy=true. Mount profiles, disabled-network profiles, and local_only network profiles are enforced with bubblewrap when bubblewrap is available; local_only uses a loopback-only sandbox namespace and does not bridge host localhost services. The current product network modes are closed/disabled, local/local_only, and open/inherit_host; allowlist network profiles are advanced/legacy declared intent only and are not enforced by the X11 runtime. workspace_status reports live daemon state, including the applied profile policy snapshot, discovered backend candidates from start time, and enforcement state. Use workspace_manifest to inspect saved manifest state from disk for live or stopped workspaces without contacting the workspace daemon. Use workspace_artifacts to inventory saved runtime files such as manifest, event log, daemon logs, app logs, and screenshots when present; set existing_only=true when only present paths are needed. Use workspace_ipc_info to verify daemon IPC protocol metadata, transport, framing, encoding, and socket path. Use workspace_env to get DISPLAY, XAUTHORITY, runtime directory, and control socket values for external tools that need to attach to the hidden workspace. Use workspace_list to discover known/running workspaces and workspace_cleanup_stale with dry_run=true to preview unreachable runtime directories and verified orphan process cleanup before deletion. Use workspace_list_apps to inspect launched apps, including named apps and running/stopped state; it can read the saved app snapshot after a workspace has stopped. Use workspace_browser_targets after launching Chrome/Chromium with --remote-debugging-port=0 to discover workspace-owned page targets, workspace_browser_snapshot to read page title/text/links, and workspace_browser_navigate to change the workspace browser page without using the host Chrome bridge or external browser automation. App action and log-read responses include the directly affected app in the top-level apps field when available. Use workspace_open_profile to start a profile-backed workspace, optionally wait for setup, and open startup apps after setup succeeds in one call. Use workspace_start before launching apps manually. workspace_launch_profile_apps opens startup apps declared by the selected profile. workspace_run_app is the preferred one-shot helper for QA commands that should return stdout/stderr; set kill_on_timeout=true to terminate timed-out commands. workspace_wait_app also accepts kill_on_timeout=true to terminate an already launched app when its wait timeout elapses. workspace_launch_app and workspace_run_app accept optional names, workspace_list_apps can filter by app name or running pid or app_id, and named apps can be referenced anywhere an app target is accepted, including logs, waits, kill dry-runs, kills, and window app_id filters. workspace_launch_app, workspace_run_profile_setup, workspace_focus_window, workspace_focus_matching_window, workspace_close_window, workspace_close_matching_window, workspace_move_window, workspace_resize_window, workspace_raise_window, workspace_minimize_window, workspace_show_window, workspace_click, workspace_click_window, workspace_move_pointer, workspace_move_pointer_window, workspace_drag, workspace_drag_window, workspace_scroll, workspace_scroll_window, workspace_key, workspace_key_window, workspace_type_text, workspace_type_window, workspace_set_clipboard, workspace_get_clipboard, workspace_paste_text, and workspace_paste_window run only inside the isolated agent workspace; they do not target the user's host desktop. Use workspace_wait_window, workspace_active_window, workspace_pointer, workspace_observe, workspace_focus_matching_window, workspace_move_window, workspace_resize_window, workspace_raise_window, workspace_minimize_window, workspace_show_window, workspace_click_window, workspace_move_pointer_window, workspace_drag_window, workspace_scroll_window, workspace_key_window, workspace_type_window, or workspace_paste_window after launching GUI apps. Prefer window-targeted tools when acting on a specific app window rather than the workspace root or current focus. Window match filters accept title_contains, class_contains, pid, or app_id; class_contains matches wm_class and wm_instance. Use workspace_move_window, workspace_resize_window, workspace_raise_window, workspace_minimize_window, and workspace_show_window to arrange app windows before screenshots or repeated QA interactions. workspace_show_window match filters include hidden windows, so it can restore minimized apps by title/class/pid/app without first listing its raw X11 id. Use workspace_list_windows with title_contains, class_contains, pid, or app_id filters to inspect specific current app windows. Use workspace_list_windows or workspace_observe with include_hidden=true when a minimized or hidden app needs to be found again; returned windows include wm_class, wm_instance, and app_id when X11/process metadata is available. Use workspace_paste_text or workspace_paste_window when inserting long text is more reliable than synthetic typing. Use workspace_run_profile_setup with wait=true when setup command completion matters; set kill_on_timeout=true to clean up timed-out setup commands. Use workspace_status or workspace_observe when a full live app snapshot is useful. Use workspace_observe, workspace_screenshot, workspace_screenshot_window, workspace_list_apps, workspace_browser_targets, workspace_browser_snapshot, workspace_list_windows, workspace_active_window, workspace_pointer, workspace_wait_app, workspace_read_app_log, workspace_get_clipboard, and workspace_events to inspect the workspace before acting. For incremental event polling, pass workspace_events since_sequence with the last seen event sequence. workspace_screenshot_window captures a specific app window by id/title/class/pid/app filters. workspace_read_app_log can read saved stdout/stderr after a workspace has stopped when its manifest remains on disk. workspace_events records IPC activity without storing raw typed text, raw clipboard-set text, or raw pasted text, and can read saved event history after a workspace has stopped. workspace_close_window, workspace_close_matching_window, workspace_kill_app, workspace_minimize_window, and workspace_show_window affect only workspace-local windows/apps. workspace_close_window and workspace_close_matching_window with dry_run=true resolve the targeted window without closing it. workspace_kill_app with dry_run=true resolves the matched app without terminating it. workspace_stop with dry_run=true previews currently running apps without stopping; without dry_run it terminates the workspace and apps launched inside it, then waits for the daemon IPC socket to close."
+workspace_open_viewer is host-visible and open-world; it can launch the GPUI monitor unless this MCP process was started with --headless or workspace_doctor reports ready_for_host_viewer=false, in which case it must run without host-visible UI. Use workspace_list_viewers and workspace_close_viewer for repo-owned GPUI viewer lifecycle control when compositor/window automation cannot see or close the viewer; workspace_close_viewer only signals registered viewer pids whose command line still matches the registry entry, and dry_run=true previews the close. Use workspace_guardrails to inspect acknowledgement, dry-run, explicit override, timeout-termination, and workspace-scope rules for UI approval flows. Use workspace_doctor to check runtime readiness and viewer host-display readiness. Use profile_list/profile_get/profile_check/profile_validate/profile_template/profile_put/profile_import/profile_export/profile_delete to manage saved environment profiles. Use profile_validate to preflight a local JSON profile file without saving it. Use profile_export to return a saved profile and optionally write it to output_path; set replace=true only when intentionally overwriting an existing file. Use profile_put with dry_run=true to preview whether a profile would be created, replaced, or rejected without writing. Use profile_import when the UI has a local JSON file path instead of an already parsed profile object. Use profile_delete with dry_run=true to return the saved profile without deleting it. profile_template can generate starter JSON such as project-dev, chrome, and browser-session before saving with profile_put. browser-session requires user_data_dir and is intended only for explicitly user-approved browser data directories. profile_check preflights acknowledgement requirements and warnings before workspace_start. Preview scope matters: workspace_start dry_run=true and workspace_open_profile dry_run=true are pre-daemon approval previews that do not create runtime state; workspace_launch_app, workspace_run_app, workspace_run_profile_setup, and workspace_launch_profile_apps dry_run=true are daemon-attached previews and require an already running workspace. Dry-run preview responses include an approval bundle when acknowledgement UI data is available. workspace_start requires acknowledge_hidden_workspace=true before creating a new hidden agent-controlled environment. Pass purpose when a human-readable reason should be shown in workspace_status and the start event. workspace_status reports live daemon state, including the profile that started the workspace. Use workspace_manifest to inspect saved manifest state from disk for live or stopped workspaces without contacting the workspace daemon. Use workspace_artifacts to inventory saved runtime files such as manifest, event log, daemon logs, app logs, and screenshots when present; set existing_only=true when only present paths are needed. Use workspace_ipc_info to verify daemon IPC protocol metadata, transport, framing, encoding, and socket path. Use workspace_env to get DISPLAY, XAUTHORITY, runtime directory, and control socket values for external tools that need to attach to the hidden workspace. Use workspace_list to discover known/running workspaces and workspace_cleanup_stale with dry_run=true to preview unreachable runtime directories and verified orphan process cleanup before deletion. Use workspace_list_apps to inspect launched apps, including named apps and running/stopped state; it can read the saved app snapshot after a workspace has stopped. Use workspace_browser_targets after launching Chrome/Chromium with --remote-debugging-port=0 to discover workspace-owned page targets, workspace_browser_snapshot to read page title/text/links, and workspace_browser_navigate to change the workspace browser page without using the host Chrome bridge or external browser automation. App action and log-read responses include the directly affected app in the top-level apps field when available. Use workspace_open_profile to start a profile-backed workspace, optionally wait for setup, and open startup apps after setup succeeds in one call. Use workspace_start before launching apps manually. workspace_launch_profile_apps opens startup apps declared by the selected profile. workspace_run_app is the preferred one-shot helper for QA commands that should return stdout/stderr; set kill_on_timeout=true to terminate timed-out commands. workspace_wait_app also accepts kill_on_timeout=true to terminate an already launched app when its wait timeout elapses. workspace_launch_app and workspace_run_app accept optional names, workspace_list_apps can filter by app name or running pid or app_id, and named apps can be referenced anywhere an app target is accepted, including logs, waits, kill dry-runs, kills, and window app_id filters. workspace_launch_app, workspace_run_profile_setup, workspace_focus_window, workspace_focus_matching_window, workspace_close_window, workspace_close_matching_window, workspace_move_window, workspace_resize_window, workspace_raise_window, workspace_minimize_window, workspace_show_window, workspace_click, workspace_click_window, workspace_move_pointer, workspace_move_pointer_window, workspace_drag, workspace_drag_window, workspace_scroll, workspace_scroll_window, workspace_key, workspace_key_window, workspace_type_text, workspace_type_window, workspace_set_clipboard, workspace_get_clipboard, workspace_paste_text, and workspace_paste_window run only inside the agent workspace; they do not target the user's host desktop. Use workspace_wait_window, workspace_active_window, workspace_pointer, workspace_observe, workspace_focus_matching_window, workspace_move_window, workspace_resize_window, workspace_raise_window, workspace_minimize_window, workspace_show_window, workspace_click_window, workspace_move_pointer_window, workspace_drag_window, workspace_scroll_window, workspace_key_window, workspace_type_window, or workspace_paste_window after launching GUI apps. Prefer window-targeted tools when acting on a specific app window rather than the workspace root or current focus. Window match filters accept title_contains, class_contains, pid, or app_id; class_contains matches wm_class and wm_instance. Use workspace_move_window, workspace_resize_window, workspace_raise_window, workspace_minimize_window, and workspace_show_window to arrange app windows before screenshots or repeated QA interactions. workspace_show_window match filters include hidden windows, so it can restore minimized apps by title/class/pid/app without first listing its raw X11 id. Use workspace_list_windows with title_contains, class_contains, pid, or app_id filters to inspect specific current app windows. Use workspace_list_windows or workspace_observe with include_hidden=true when a minimized or hidden app needs to be found again; returned windows include wm_class, wm_instance, and app_id when X11/process metadata is available. Use workspace_paste_text or workspace_paste_window when inserting long text is more reliable than synthetic typing. Use workspace_run_profile_setup with wait=true when setup command completion matters; set kill_on_timeout=true to clean up timed-out setup commands. Use workspace_status or workspace_observe when a full live app snapshot is useful. Use workspace_observe, workspace_screenshot, workspace_screenshot_window, workspace_list_apps, workspace_browser_targets, workspace_browser_snapshot, workspace_list_windows, workspace_active_window, workspace_pointer, workspace_wait_app, workspace_read_app_log, workspace_get_clipboard, and workspace_events to inspect the workspace before acting. For incremental event polling, pass workspace_events since_sequence with the last seen event sequence. workspace_screenshot_window captures a specific app window by id/title/class/pid/app filters. workspace_read_app_log can read saved stdout/stderr after a workspace has stopped when its manifest remains on disk. workspace_events records IPC activity without storing raw typed text, raw clipboard-set text, or raw pasted text, and can read saved event history after a workspace has stopped. workspace_close_window, workspace_close_matching_window, workspace_kill_app, workspace_minimize_window, and workspace_show_window affect only workspace-local windows/apps. workspace_close_window and workspace_close_matching_window with dry_run=true resolve the targeted window without closing it. workspace_kill_app with dry_run=true resolves the matched app without terminating it. workspace_stop with dry_run=true previews currently running apps without stopping; without dry_run it terminates the workspace and apps launched inside it, then waits for the daemon IPC socket to close."
 )]
 impl ServerHandler for AgentWorkspaceLinux {
     // overridden so advertised tool schemas pass strict validators — the macro
@@ -3808,7 +3803,7 @@ fn build_mcp_task_plan_with_context(
     match normalized_intent.as_str() {
         "app_qa" => {
             recommended_profile_kind = "project-dev".to_string();
-            summary = "Plan for project or desktop app QA in an isolated workspace.".to_string();
+            summary = "Plan for project or desktop app QA in a workspace.".to_string();
             if workspace_running {
                 assumptions.push(format!(
                     "Workspace {workspace_id:?} is already running; continue from the live workspace instead of starting another project profile unless the user asks for a fresh run."
@@ -3991,7 +3986,6 @@ fn build_mcp_task_plan_with_context(
                             "id": workspace_id,
                             "profile": profile_id,
                             "acknowledge_hidden_workspace": true,
-                            "acknowledge_unenforced_policy": true,
                             "purpose": "Project QA",
                             "setup": true,
                             "setup_timeout_ms": 30000,
@@ -4079,7 +4073,7 @@ fn build_mcp_task_plan_with_context(
                             "profile": null
                         }),
                         false,
-                        "Call only after the user reviews the project mount, setup/startup commands, network behavior, and dry-run save result.",
+                        "Call only after the user reviews the project directory, setup/startup commands, and dry-run save result.",
                         "Mutating profile write; requires explicit approval and active live control.",
                         false,
                         true,
@@ -4103,7 +4097,6 @@ fn build_mcp_task_plan_with_context(
                             "id": workspace_id,
                             "profile": "project-dev",
                             "acknowledge_hidden_workspace": true,
-                            "acknowledge_unenforced_policy": true,
                             "purpose": "Project QA",
                             "setup": true,
                             "setup_timeout_ms": 30000,
@@ -4647,7 +4640,7 @@ fn build_mcp_task_plan_with_context(
                         "user_data_dir": params.user_data_dir
                     }),
                     params.user_data_dir.is_some() && permission_blockers.is_empty(),
-                    "The browser-session template mounts explicitly approved browser data and inherits host networking for authenticated web tasks.",
+                    "The browser-session template starts Chrome on explicitly approved browser data, with its logins, for authenticated web tasks.",
                     "Read-only template generation. The user must approve the browser data directory and should close the host browser or use a copied profile.",
                     true,
                     false,
@@ -4698,7 +4691,7 @@ fn build_mcp_task_plan_with_context(
                                 "profile": null
                             }),
                             false,
-                            "Call only after the user reviews the browser binary, user-data directory, network behavior, and dry-run save result.",
+                            "Call only after the user reviews the browser binary, user-data directory, and dry-run save result.",
                             "Mutating profile write; requires explicit approval and active live control.",
                             false,
                             true,
@@ -5592,7 +5585,7 @@ fn mcp_task_plan_app_qa_action_boundaries(
             false,
             None,
             target_inputs,
-            "Keyboard, pointer, clipboard, and window actions are scoped to the isolated workspace, but they should wait for observation and a stable app/window target.",
+            "Keyboard, pointer, clipboard, and window actions are scoped to the workspace, but they should wait for observation and a stable app/window target.",
         ),
         mcp_task_plan_action_boundary(
             "write_mounted_project_files",
@@ -7326,7 +7319,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 true,
                 false,
                 "observation_allowed",
-                "Reads local runtime readiness and policy backend candidates.",
+                "Reads local runtime readiness per backend.",
             ),
             mcp_action(
                 "profile_path",
@@ -7659,7 +7652,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
             .with_parameter_note(
                 "input_forwarding",
                 "true",
-                "Launches or reuses a viewer capable of explicit in-viewer manual mouse/keyboard/paste forwarding into the isolated workspace; forwarding still starts disabled.",
+                "Launches or reuses a viewer capable of explicit in-viewer manual mouse/keyboard/paste forwarding into the workspace; forwarding still starts disabled.",
                 "Allowed while live control is read_only or paused because this only opens host-visible UI; actual forwarded input remains blocked unless MCP control is active.",
                 "Use only when the user explicitly wants manual/RW viewer control.",
             ),
@@ -7726,7 +7719,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active_unless_dry_run",
-                "Starts an app inside the isolated workspace unless dry_run=true.",
+                "Starts an app inside the workspace unless dry_run=true.",
             )
             .with_parameter_note(
                 "dry_run",
@@ -7744,7 +7737,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active_unless_dry_run",
-                "Runs an app inside the isolated workspace unless dry_run=true.",
+                "Runs an app inside the workspace unless dry_run=true.",
             )
             .with_parameter_note(
                 "dry_run",
@@ -7880,7 +7873,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "observation_allowed",
-                "Discovers Chrome DevTools targets for a browser app launched inside the isolated workspace, deriving the endpoint from the workspace app user-data directory instead of the host Chrome bridge.",
+                "Discovers Chrome DevTools targets for a browser app launched inside the workspace, deriving the endpoint from the workspace app user-data directory instead of the host Chrome bridge.",
             )
             .with_parameter_note(
                 "app_id",
@@ -7962,7 +7955,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 true,
                 "blocked_when_not_active",
-                "Navigates a workspace-owned Chrome/Chromium page target to an http(s), data:, or about:blank URL and records a browser_navigate workspace event. This stays inside the isolated workspace browser rather than the user's host Chrome bridge.",
+                "Navigates a workspace-owned Chrome/Chromium page target to an http(s), data:, or about:blank URL and records a browser_navigate workspace event. This stays inside the workspace browser rather than the user's host Chrome bridge.",
             )
             .with_parameter_note(
                 "url",
@@ -8117,7 +8110,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 true,
                 false,
                 "blocked_when_not_active",
-                "Changes focus inside the isolated workspace.",
+                "Changes focus inside the workspace.",
             ),
             mcp_action(
                 "workspace_focus_matching_window",
@@ -8128,7 +8121,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 true,
                 false,
                 "blocked_when_not_active",
-                "Finds and focuses a matching isolated workspace window.",
+                "Finds and focuses a matching workspace window.",
             ),
             mcp_action(
                 "workspace_close_window",
@@ -8175,7 +8168,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Moves an isolated workspace window.",
+                "Moves a workspace window.",
             ),
             mcp_action(
                 "workspace_resize_window",
@@ -8186,7 +8179,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Resizes an isolated workspace window.",
+                "Resizes a workspace window.",
             ),
             mcp_action(
                 "workspace_raise_window",
@@ -8197,7 +8190,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Raises an isolated workspace window.",
+                "Raises a workspace window.",
             ),
             mcp_action(
                 "workspace_minimize_window",
@@ -8208,7 +8201,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Minimizes an isolated workspace window.",
+                "Minimizes a workspace window.",
             ),
             mcp_action(
                 "workspace_show_window",
@@ -8219,7 +8212,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Shows or maps an isolated workspace window.",
+                "Shows or maps a workspace window.",
             ),
             mcp_action(
                 "workspace_click",
@@ -8230,7 +8223,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Injects a click inside the isolated workspace.",
+                "Injects a click inside the workspace.",
             ),
             mcp_action(
                 "workspace_click_window",
@@ -8241,7 +8234,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Injects a window-relative click inside the isolated workspace.",
+                "Injects a window-relative click inside the workspace.",
             ),
             mcp_action(
                 "workspace_move_pointer",
@@ -8252,7 +8245,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 true,
                 false,
                 "blocked_when_not_active",
-                "Moves the isolated workspace pointer.",
+                "Moves the workspace pointer.",
             ),
             mcp_action(
                 "workspace_move_pointer_window",
@@ -8263,7 +8256,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 true,
                 false,
                 "blocked_when_not_active",
-                "Moves the isolated workspace pointer relative to a window.",
+                "Moves the workspace pointer relative to a window.",
             ),
             mcp_action(
                 "workspace_drag",
@@ -8274,7 +8267,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Injects a drag inside the isolated workspace.",
+                "Injects a drag inside the workspace.",
             ),
             mcp_action(
                 "workspace_drag_window",
@@ -8285,7 +8278,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Injects a window-relative drag inside the isolated workspace.",
+                "Injects a window-relative drag inside the workspace.",
             ),
             mcp_action(
                 "workspace_scroll",
@@ -8296,7 +8289,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Injects a scroll inside the isolated workspace.",
+                "Injects a scroll inside the workspace.",
             ),
             mcp_action(
                 "workspace_scroll_window",
@@ -8307,7 +8300,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Injects a window-relative scroll inside the isolated workspace.",
+                "Injects a window-relative scroll inside the workspace.",
             ),
             mcp_action(
                 "workspace_key",
@@ -8318,7 +8311,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Sends a key chord inside the isolated workspace.",
+                "Sends a key chord inside the workspace.",
             ),
             mcp_action(
                 "workspace_key_window",
@@ -8329,7 +8322,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Sends a key chord to a matching isolated workspace window.",
+                "Sends a key chord to a matching workspace window.",
             ),
             mcp_action(
                 "workspace_type_text",
@@ -8340,7 +8333,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Types literal text inside the isolated workspace.",
+                "Types literal text inside the workspace.",
             ),
             mcp_action(
                 "workspace_type_window",
@@ -8351,7 +8344,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Types literal text into a matching isolated workspace window.",
+                "Types literal text into a matching workspace window.",
             ),
             mcp_action(
                 "workspace_set_clipboard",
@@ -8362,7 +8355,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 true,
                 false,
                 "blocked_when_not_active",
-                "Sets the isolated workspace clipboard.",
+                "Sets the workspace clipboard.",
             ),
             mcp_action(
                 "workspace_get_clipboard",
@@ -8373,7 +8366,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "observation_allowed",
-                "Reads the isolated workspace clipboard.",
+                "Reads the workspace clipboard.",
             ),
             mcp_action(
                 "workspace_paste_text",
@@ -8384,7 +8377,7 @@ fn mcp_action_catalog() -> McpActionCatalog {
                 false,
                 false,
                 "blocked_when_not_active",
-                "Sets clipboard text and sends paste inside the isolated workspace.",
+                "Sets clipboard text and sends paste inside the workspace.",
             ),
             mcp_action(
                 "workspace_paste_window",
@@ -8822,8 +8815,6 @@ struct WorkspaceStartParams {
     #[serde(default)]
     acknowledge_hidden_workspace: bool,
     #[serde(default)]
-    acknowledge_unenforced_policy: bool,
-    #[serde(default)]
     dry_run: bool,
     #[serde(default)]
     width: Option<u32>,
@@ -8860,7 +8851,6 @@ impl WorkspaceStartParams {
         }
         options.session = SessionSpec::resolve(self.session, Some(options.session));
         options.user_acknowledged_hidden_workspace = self.acknowledge_hidden_workspace;
-        options.user_acknowledged_unenforced_policy = self.acknowledge_unenforced_policy;
         Ok(options)
     }
 }
@@ -8876,8 +8866,6 @@ struct WorkspaceOpenProfileParams {
     session: Option<SessionSpec>,
     #[serde(default)]
     acknowledge_hidden_workspace: bool,
-    #[serde(default)]
-    acknowledge_unenforced_policy: bool,
     #[serde(default)]
     dry_run: bool,
     #[serde(default)]
@@ -8926,7 +8914,6 @@ impl WorkspaceOpenProfileParams {
         }
         options.session = SessionSpec::resolve(self.session, Some(options.session));
         options.user_acknowledged_hidden_workspace = self.acknowledge_hidden_workspace;
-        options.user_acknowledged_unenforced_policy = self.acknowledge_unenforced_policy;
         Ok((options, profile_id))
     }
 
@@ -8942,11 +8929,9 @@ impl WorkspaceOpenProfileParams {
                     || self.setup_kill_on_timeout,
                 timeout_ms: self.setup_timeout_ms,
                 kill_on_timeout: self.setup_kill_on_timeout,
-                acknowledge_unenforced_policy: self.acknowledge_unenforced_policy,
             },
             startup: profile::ProfileStartupOptions {
                 dry_run: self.dry_run,
-                acknowledge_unenforced_policy: self.acknowledge_unenforced_policy,
                 wait_window: self.startup_wait_window
                     || self.startup_window_timeout_ms.is_some()
                     || self.startup_screenshot_window,
@@ -9183,8 +9168,6 @@ struct WorkspaceLaunchParams {
     #[serde(default)]
     profile: Option<String>,
     #[serde(default)]
-    acknowledge_unenforced_policy: bool,
-    #[serde(default)]
     dry_run: bool,
     command: Vec<String>,
     #[serde(default)]
@@ -9206,8 +9189,6 @@ impl WorkspaceLaunchParams {
             command: self.command,
             name: self.name,
             profile_id: None,
-            applied_policy: None,
-            user_acknowledged_unenforced_policy: self.acknowledge_unenforced_policy,
             cwd: self.cwd,
             env: self.env,
         };
@@ -9226,8 +9207,6 @@ struct WorkspaceRunParams {
     name: Option<String>,
     #[serde(default)]
     profile: Option<String>,
-    #[serde(default)]
-    acknowledge_unenforced_policy: bool,
     #[serde(default)]
     dry_run: bool,
     command: Vec<String>,
@@ -9250,8 +9229,6 @@ impl WorkspaceRunParams {
             command: self.command,
             name: self.name,
             profile_id: None,
-            applied_policy: None,
-            user_acknowledged_unenforced_policy: self.acknowledge_unenforced_policy,
             cwd: self.cwd,
             env: self.env,
         };
@@ -9715,8 +9692,6 @@ struct WorkspaceSetupParams {
     timeout_ms: Option<u64>,
     #[serde(default)]
     kill_on_timeout: bool,
-    #[serde(default)]
-    acknowledge_unenforced_policy: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, JsonSchema)]
@@ -9724,8 +9699,6 @@ struct WorkspaceProfileLaunchParams {
     #[serde(default)]
     id: Option<String>,
     profile: String,
-    #[serde(default)]
-    acknowledge_unenforced_policy: bool,
     #[serde(default)]
     dry_run: bool,
     #[serde(default)]
@@ -10125,6 +10098,36 @@ mod tests {
         assert_eq!(info.server_info.name, "agent-workspace-linux");
     }
 
+    // Agents trust these texts: none may claim a workspace contains its apps.
+    #[test]
+    fn no_tool_text_claims_the_workspace_is_a_sandbox() {
+        let info = AgentWorkspaceLinux::default().get_info();
+        let mut texts = vec![(
+            "instructions".to_string(),
+            info.instructions.unwrap_or_default(),
+        )];
+        for tool in AgentWorkspaceLinux::tool_router().list_all() {
+            let description = tool.description.as_deref().unwrap_or_default().to_string();
+            texts.push((tool.name.to_string(), description));
+        }
+        for (name, text) in texts {
+            let text = text
+                .replace("not a sandbox", "")
+                .replace("not sandboxes", "")
+                .to_ascii_lowercase();
+            for claim in [
+                "bubblewrap",
+                "unenforced",
+                "isolat",
+                "sandbox",
+                "mount policy",
+                "network policy",
+            ] {
+                assert!(!text.contains(claim), "{name} still says {claim:?}");
+            }
+        }
+    }
+
     /// Read frames until the response for `id` arrives, skipping notifications
     /// and anything else the server may interleave ahead of it.
     async fn read_response<R: AsyncBufRead + Unpin>(reader: &mut R, id: u64) -> serde_json::Value {
@@ -10322,8 +10325,6 @@ mod tests {
             pid: 1234,
             process_group_id: Some(1234),
             profile_id: Some("project-dev".to_string()),
-            mount_isolation: "bubblewrap_mount_namespace".to_string(),
-            network_isolation: "host".to_string(),
             command: vec!["xterm".to_string(), "-title".to_string(), id.to_string()],
             cwd: None,
             env: Vec::new(),
@@ -10346,11 +10347,9 @@ mod tests {
             session_id: "session-1".to_string(),
             purpose: Some("Project QA".to_string()),
             profile_id: Some("project-dev".to_string()),
-            applied_policy: None,
             profile_cwd: None,
             profile_env: Vec::new(),
             user_acknowledged_hidden_workspace: true,
-            user_acknowledged_unenforced_policy: false,
             ready: true,
             started_at_unix: 1,
             display: ":90".to_string(),
@@ -10377,11 +10376,9 @@ mod tests {
             session_id: "session-2".to_string(),
             purpose: Some("Stopped browser task".to_string()),
             profile_id: Some("browser-session".to_string()),
-            applied_policy: None,
             profile_cwd: None,
             profile_env: Vec::new(),
             user_acknowledged_hidden_workspace: true,
-            user_acknowledged_unenforced_policy: false,
             ready: false,
             started_at_unix: 1,
             stopped_at_unix: Some(60),

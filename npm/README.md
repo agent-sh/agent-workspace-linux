@@ -1,6 +1,6 @@
 # @agent-sh/agent-workspace-linux
 
-npm distribution wrapper for the [`agent-workspace-linux`](https://github.com/agent-sh/agent-workspace-linux) MCP server — isolated Linux desktop workspaces for AI agents.
+npm distribution wrapper for the [`agent-workspace-linux`](https://github.com/agent-sh/agent-workspace-linux) MCP server: background Linux desktops for AI agents.
 
 ## Installation
 

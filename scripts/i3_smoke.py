@@ -104,6 +104,9 @@ try:
     wait(lambda: any(w["id"]==wid for w in ws("windows")["windows"]),"show restored window")
     ws("focus-window",wid)
     assert ws("active-window")["active_window"]["id"]==wid
+    # Launched apps run on the workspace session bus.
+    bus=ws("run","--timeout-ms",10000,"--","sh","-c",'test -S "$AGENT_WORKSPACE_RUNTIME_DIR/session-bus" && printf %s "$DBUS_SESSION_BUS_ADDRESS"')
+    assert bus["succeeded"] and bus["stdout"]["content"].endswith(f"/{ID}/session-bus"),bus
     mcp=Mcp(BIN,ROOT/"mcp.log",env=ENV,headless=True)
     terminal=mcp.tool("workspace_run_in_terminal",{"id":ID,"terminal_id":"acceptance","title":"i3 terminal","command":["sh","-c","printf I3_TERMINAL; exec tail -f /dev/null"]})
     assert terminal["ok"],terminal
@@ -115,19 +118,6 @@ try:
     wait(lambda: all(stopped(pid) for pid in [status["window_manager_pid"],status["x_server_pid"],*terminal_pids]),"owned session processes stopped")
     assert not (runtime/"i3.sock").exists(), "i3 IPC socket survived stop"
     status=None
-    # Restricted applications must not gain the i3 command socket through the X11 bind.
-    project=ROOT/"project";project.mkdir()
-    profile=ROOT/"profile.json"
-    profile.write_text(json.dumps({"id":"i3-restricted","session":{"backend":"i3"},"cwd":"/workspace/project","require_enforced_policy":True,"network":{"mode":"disabled"},"mounts":[{"host_path":str(project),"workspace_path":"/workspace/project","mode":"read_write"}]}))
-    command("profile","import","--json",profile)
-    ID="restricted"
-    status=ws("start","--profile","i3-restricted","--ack-hidden-workspace")["status"]
-    private_socket=str(Path(status["runtime_dir"])/"i3.sock")
-    script='if test -S "$1"; then exit 42; fi; printf isolated > /workspace/project/ready; exec tail -f /dev/null'
-    app=ws("launch","--wait-window","--window-timeout-ms",10000,"--","xterm","-e","sh","-c",script,"sh",private_socket)
-    wait(lambda: (project/"ready").exists(),"restricted X11 client and hidden i3 socket")
-    assert app["apps"][0]["mount_isolation"]=="bubblewrap_mount_namespace",app
-    assert app["apps"][0]["network_isolation"]=="bubblewrap_unshare_net",app
     print(f"i3 acceptance passed; evidence {ROOT}",flush=True)
 except Exception:
     if status:

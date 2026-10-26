@@ -1,7 +1,6 @@
 use crate::{
     control::{self, McpControlMode, McpControlState},
     permissions::McpPermissionState,
-    policy::{AppliedWorkspacePolicy, NetworkMode},
     profile, workspace,
 };
 use anyhow::{bail, Context as AnyhowContext, Result};
@@ -1459,7 +1458,7 @@ impl AgentWorkspaceViewer {
             self.input_forwarding_enabled = true;
             self.input_forwarding_arm_expires_at_unix = None;
             self.message =
-                "Manual input forwarding enabled; clicks, scroll, keys, and host clipboard paste target only the isolated workspace"
+                "Manual input forwarding enabled; clicks, scroll, keys, and host clipboard paste target only the workspace"
                     .to_string();
             self.error = None;
         } else {
@@ -2198,7 +2197,6 @@ fn run_viewer_action(
                 id,
                 purpose: Some(format!("Opened from Agent Workspace Viewer ({profile_id})")),
                 user_acknowledged_hidden_workspace: true,
-                user_acknowledged_unenforced_policy: true,
                 // Propagate the ceiling into the spawned daemon so a
                 // viewer-started profile workspace enforces it at the IPC
                 // socket, not only in the front-end validate below.
@@ -2209,11 +2207,9 @@ fn run_viewer_action(
                 run_setup: true,
                 setup: profile::ProfileSetupOptions {
                     wait: true,
-                    acknowledge_unenforced_policy: true,
                     ..Default::default()
                 },
                 startup: profile::ProfileStartupOptions {
-                    acknowledge_unenforced_policy: true,
                     wait_window: true,
                     window_timeout_ms: Some(10_000),
                     ..Default::default()
@@ -2867,7 +2863,7 @@ impl Render for AgentWorkspaceViewer {
             )
         } else if let Some(seconds_left) = input_forward_confirm_seconds_left {
             format!(
-                "Manual input is opt-in: click Input again within {seconds_left}s to forward clicks, scroll, keyboard, and host clipboard paste into the isolated workspace"
+                "Manual input is opt-in: click Input again within {seconds_left}s to forward clicks, scroll, keyboard, and host clipboard paste into the workspace"
             )
         } else if let Some(reason) = input_forwarding_wait_reason {
             format!("Manual input forwarding is enabled but {reason}")
@@ -3108,7 +3104,7 @@ impl Render for AgentWorkspaceViewer {
                                 "viewer-input-on",
                                 "Input",
                                 Some(tooltip_text(
-                                    "Manual input forwarding is ON: clicks, drag release, scroll, keyboard, and host clipboard paste target the isolated workspace. Hover motion is not forwarded.",
+                                    "Manual input forwarding is ON: clicks, drag release, scroll, keyboard, and host clipboard paste target the workspace. Hover motion is not forwarded.",
                                 )),
                                 on_input,
                             )
@@ -3117,7 +3113,7 @@ impl Render for AgentWorkspaceViewer {
                                 "viewer-input-confirm",
                                 "Input?",
                                 Some(tooltip_text(
-                                    "Confirm opt-in: forward viewer clicks, scroll, keyboard, and host clipboard text into the isolated workspace only",
+                                    "Confirm opt-in: forward viewer clicks, scroll, keyboard, and host clipboard text into the workspace only",
                                 )),
                                 on_input,
                             )
@@ -5225,18 +5221,7 @@ fn footer_isolation_label(
     let profile = workspace_entry_profile_id(entry)
         .map(|profile| format!("Profile: {profile}"))
         .unwrap_or_else(|| "Profile: default".to_string());
-    let Some(policy) = workspace_entry_policy(entry) else {
-        return format!(
-            "{profile} | Scope: display/input | Net: host | Mounts: host | {permission}"
-        );
-    };
-
-    let network = network_policy_label(policy);
-    let mounts = mount_policy_label(policy);
-    let acknowledgement = policy_acknowledgement_label(policy, workspace_entry_policy_ack(entry));
-    format!(
-        "{profile} | Scope: display/input | {network} | {mounts}{acknowledgement} | {permission}"
-    )
+    format!("{profile} | Scope: display/input | {permission}")
 }
 
 fn footer_task_label(
@@ -5333,22 +5318,6 @@ fn permission_ceiling_label(permissions: &McpPermissionState) -> String {
     }
 
     let mut parts = Vec::new();
-    if let Some(network) = &permissions.ceiling.network {
-        parts.push(match network.mode {
-            NetworkMode::InheritHost => "net host".to_string(),
-            NetworkMode::Disabled => "net off".to_string(),
-            NetworkMode::LocalOnly => {
-                if network.allow_hosts.is_empty() {
-                    "net local".to_string()
-                } else {
-                    format!("net local {}", network.allow_hosts.len())
-                }
-            }
-        });
-    }
-    if !permissions.ceiling.mounts.is_empty() {
-        parts.push(format!("mounts {}", permissions.ceiling.mounts.len()));
-    }
     if !permissions.ceiling.apps.allow.is_empty() {
         parts.push(format!("apps {}", permissions.ceiling.apps.allow.len()));
     }
@@ -5397,21 +5366,6 @@ fn footer_apps_label(
     parts.join(" | ")
 }
 
-fn workspace_entry_policy(
-    entry: &workspace::WorkspaceListEntry,
-) -> Option<&AppliedWorkspacePolicy> {
-    entry
-        .status
-        .as_ref()
-        .and_then(|status| status.applied_policy.as_ref())
-        .or_else(|| {
-            entry
-                .manifest
-                .as_ref()
-                .and_then(|manifest| manifest.applied_policy.as_ref())
-        })
-}
-
 fn workspace_entry_profile_id(entry: &workspace::WorkspaceListEntry) -> Option<&str> {
     entry
         .status
@@ -5423,50 +5377,6 @@ fn workspace_entry_profile_id(entry: &workspace::WorkspaceListEntry) -> Option<&
                 .as_ref()
                 .and_then(|manifest| manifest.profile_id.as_deref())
         })
-}
-
-fn workspace_entry_policy_ack(entry: &workspace::WorkspaceListEntry) -> bool {
-    entry
-        .status
-        .as_ref()
-        .map(|status| status.user_acknowledged_unenforced_policy)
-        .or_else(|| {
-            entry
-                .manifest
-                .as_ref()
-                .map(|manifest| manifest.user_acknowledged_unenforced_policy)
-        })
-        .unwrap_or(false)
-}
-
-fn network_policy_label(policy: &AppliedWorkspacePolicy) -> String {
-    match policy.network.mode {
-        NetworkMode::InheritHost => "Net: host".to_string(),
-        NetworkMode::Disabled if policy.enforcement.network.enforced => "Net: off".to_string(),
-        NetworkMode::Disabled => "Net: off declared".to_string(),
-        NetworkMode::LocalOnly if policy.enforcement.network.enforced => "Net: local".to_string(),
-        NetworkMode::LocalOnly => "Net: local declared".to_string(),
-    }
-}
-
-fn mount_policy_label(policy: &AppliedWorkspacePolicy) -> String {
-    match (policy.mounts.len(), policy.enforcement.mounts.enforced) {
-        (0, _) => "Mounts: host".to_string(),
-        (count, true) => format!("Mounts: {count} scoped"),
-        (count, false) => format!("Mounts: {count} declared"),
-    }
-}
-
-fn policy_acknowledgement_label(policy: &AppliedWorkspacePolicy, acknowledged: bool) -> String {
-    if policy.blocks_requested_unenforced_policy() {
-        " | Policy blocked".to_string()
-    } else if policy.has_requested_unenforced_policy() && acknowledged {
-        " | Limits acknowledged".to_string()
-    } else if policy.has_requested_unenforced_policy() {
-        " | Needs policy ack".to_string()
-    } else {
-        String::new()
-    }
 }
 
 fn active_target_label(
@@ -5974,26 +5884,7 @@ mod tests {
         );
     }
 
-    use crate::policy::{
-        MountMode, NetworkPolicy, PolicyRuntimeCapabilities, PolicyToolCheck, ProfileMount,
-    };
     use std::path::PathBuf;
-
-    fn tool(ok: bool) -> PolicyToolCheck {
-        PolicyToolCheck {
-            ok,
-            detail: if ok { "ok" } else { "missing" }.to_string(),
-        }
-    }
-
-    fn capabilities(bubblewrap: bool) -> PolicyRuntimeCapabilities {
-        PolicyRuntimeCapabilities::from_tools(
-            tool(bubblewrap),
-            tool(false),
-            tool(false),
-            tool(false),
-        )
-    }
 
     fn temp_test_path(name: &str) -> PathBuf {
         env::temp_dir().join(format!(
@@ -6379,22 +6270,6 @@ mod tests {
         );
     }
 
-    fn policy(
-        network: NetworkPolicy,
-        mounts: Vec<ProfileMount>,
-        require_full_enforcement: bool,
-        bubblewrap: bool,
-    ) -> AppliedWorkspacePolicy {
-        AppliedWorkspacePolicy::new_with_capabilities(
-            "qa".to_string(),
-            mounts,
-            network,
-            require_full_enforcement,
-            0,
-            capabilities(bubblewrap),
-        )
-    }
-
     fn app(id: &str, name: &str, running: bool) -> workspace::WorkspaceApp {
         workspace::WorkspaceApp {
             id: id.to_string(),
@@ -6402,8 +6277,6 @@ mod tests {
             pid: 42,
             process_group_id: None,
             profile_id: Some("qa".to_string()),
-            mount_isolation: "host".to_string(),
-            network_isolation: "host".to_string(),
             command: vec![name.to_string()],
             cwd: None,
             env: Vec::new(),
@@ -6432,11 +6305,9 @@ mod tests {
             session_id: format!("session-{id}"),
             purpose: Some(purpose.to_string()),
             profile_id: Some(profile_id.to_string()),
-            applied_policy: None,
             profile_cwd: None,
             profile_env: Vec::new(),
             user_acknowledged_hidden_workspace: true,
-            user_acknowledged_unenforced_policy: false,
             ready: true,
             started_at_unix: 1,
             display: display.to_string(),
@@ -6453,12 +6324,7 @@ mod tests {
         }
     }
 
-    fn viewer_profile(
-        id: &str,
-        network: NetworkPolicy,
-        mounts: Vec<ProfileMount>,
-        startup_command: Vec<&str>,
-    ) -> profile::WorkspaceProfile {
+    fn viewer_profile(id: &str, startup_command: Vec<&str>) -> profile::WorkspaceProfile {
         profile::WorkspaceProfile {
             id: id.to_string(),
             description: None,
@@ -6467,9 +6333,6 @@ mod tests {
             height: None,
             cwd: None,
             env: Vec::new(),
-            mounts,
-            network,
-            require_enforced_policy: false,
             setup_commands: Vec::new(),
             startup_apps: vec![profile::ProfileStartupApp {
                 name: Some("app".to_string()),
@@ -6489,7 +6352,6 @@ mod tests {
         workspace::WorkspaceStartOptions {
             id: "viewer-test".to_string(),
             profile_id: Some(profile.id.clone()),
-            applied_policy: Some(profile::applied_policy(profile)),
             user_acknowledged_hidden_workspace: true,
             ..Default::default()
         }
@@ -6556,16 +6418,7 @@ mod tests {
 
     #[test]
     fn viewer_clean_permissions_do_not_add_a_profile_ceiling() {
-        let profile = viewer_profile(
-            "clean",
-            NetworkPolicy::default(),
-            vec![ProfileMount {
-                host_path: PathBuf::from("/home/me/project"),
-                workspace_path: PathBuf::from("/workspace/project"),
-                mode: MountMode::ReadWrite,
-            }],
-            vec!["bash", "-lc", "echo ok"],
-        );
+        let profile = viewer_profile("clean", vec!["bash", "-lc", "echo ok"]);
         let options = viewer_start_options_for_profile(&profile);
 
         validate_viewer_profile_start_permissions(
@@ -6578,18 +6431,11 @@ mod tests {
 
     #[test]
     fn viewer_profile_start_respects_explicit_permission_ceiling() {
-        let profile = viewer_profile(
-            "locked",
-            NetworkPolicy::default(),
-            Vec::new(),
-            vec!["bash", "-lc", "echo ok"],
-        );
+        let profile = viewer_profile("locked", vec!["bash", "-lc", "echo ok"]);
         let options = viewer_start_options_for_profile(&profile);
         let permissions = McpPermissionState::from_ceiling(
             Some(PathBuf::from("/tmp/permissions.json")),
             crate::permissions::McpPermissionCeiling {
-                network: None,
-                mounts: Vec::new(),
                 apps: crate::permissions::AppPermissionCeiling {
                     allow: vec![PathBuf::from("xterm")],
                 },
@@ -6914,69 +6760,13 @@ mod tests {
         let restricted = McpPermissionState::from_ceiling(
             Some(PathBuf::from("/tmp/permissions.json")),
             crate::permissions::McpPermissionCeiling {
-                network: Some(NetworkPolicy {
-                    mode: NetworkMode::Disabled,
-                    allow_hosts: Vec::new(),
-                }),
-                mounts: vec![ProfileMount {
-                    host_path: PathBuf::from("/tmp/project"),
-                    workspace_path: PathBuf::from("/workspace/project"),
-                    mode: MountMode::ReadOnly,
-                }],
                 apps: crate::permissions::AppPermissionCeiling {
                     allow: vec![PathBuf::from("/bin/sh")],
                 },
             },
         );
 
-        assert_eq!(
-            permission_ceiling_label(&restricted),
-            "MCP ceiling: net off, mounts 1, apps 1"
-        );
-    }
-
-    #[test]
-    fn policy_labels_show_enforced_network_and_mount_state() {
-        let policy = policy(
-            NetworkPolicy {
-                mode: NetworkMode::Disabled,
-                allow_hosts: Vec::new(),
-            },
-            vec![ProfileMount {
-                host_path: PathBuf::from("/tmp/project"),
-                workspace_path: PathBuf::from("/workspace/project"),
-                mode: MountMode::ReadOnly,
-            }],
-            false,
-            true,
-        );
-
-        assert_eq!(network_policy_label(&policy), "Net: off");
-        assert_eq!(mount_policy_label(&policy), "Mounts: 1 scoped");
-        assert_eq!(policy_acknowledgement_label(&policy, false), "");
-    }
-
-    #[test]
-    fn policy_labels_call_out_unenforced_acknowledgement_state() {
-        let policy = policy(
-            NetworkPolicy {
-                mode: NetworkMode::LocalOnly,
-                allow_hosts: Vec::new(),
-            },
-            Vec::new(),
-            false,
-            false,
-        );
-
-        assert_eq!(network_policy_label(&policy), "Net: local declared");
-        assert_eq!(
-            policy_acknowledgement_label(&policy, false),
-            " | Needs policy ack"
-        );
-        assert_eq!(
-            policy_acknowledgement_label(&policy, true),
-            " | Limits acknowledged"
-        );
+        assert_eq!(permission_ceiling_label(&restricted), "MCP ceiling: apps 1");
     }
 
     #[test]

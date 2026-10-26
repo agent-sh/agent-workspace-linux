@@ -62,9 +62,9 @@ pub(crate) struct PrivateSession {
     pub(crate) compositor: Option<Child>,
     bus: Option<Child>,
     system_bus: Option<Child>,
-    client_bus: Option<Child>,
     accessibility_bus: Option<Child>,
     accessibility_services: Vec<zbus::blocking::Connection>,
+    user_services: Vec<super::host_services::Relay>,
 }
 impl PrivateSession {
     pub(crate) fn start(
@@ -80,9 +80,9 @@ impl PrivateSession {
             compositor: None,
             bus: None,
             system_bus: None,
-            client_bus: None,
             accessibility_bus: None,
             accessibility_services: Vec::new(),
+            user_services: Vec::new(),
         };
         session.bus = Some(start_private_bus(
             runtime,
@@ -92,14 +92,7 @@ impl PrivateSession {
             extra_policy,
             &configure,
         )?);
-        session.client_bus = Some(start_private_bus(
-            runtime,
-            "client",
-            &socket_address(&runtime.join("client-bus")),
-            &[],
-            "",
-            &configure,
-        )?);
+        session.user_services = user_services(runtime);
         let registry =
             Path::new("/usr/share/dbus-1/accessibility-services/org.a11y.atspi.Registry.service");
         if registry.is_file() {
@@ -113,30 +106,25 @@ impl PrivateSession {
                 "",
                 &configure,
             )?);
-            for bus in [
-                bus_address(runtime),
-                socket_address(&runtime.join("client-bus")),
-            ] {
-                session.accessibility_services.push(
-                    zbus::blocking::connection::Builder::address(bus.as_str())?
-                        .method_timeout(Duration::from_secs(5))
-                        .name("org.a11y.Bus")?
-                        .serve_at(
-                            "/org/a11y/bus",
-                            AccessibilityBus {
-                                address: address.clone(),
-                            },
-                        )?
-                        .serve_at(
-                            "/org/a11y/bus",
-                            AccessibilityStatus {
-                                enabled: true,
-                                screen_reader_enabled: false,
-                            },
-                        )?
-                        .build()?,
-                );
-            }
+            session.accessibility_services.push(
+                zbus::blocking::connection::Builder::address(bus_address(runtime).as_str())?
+                    .method_timeout(Duration::from_secs(5))
+                    .name("org.a11y.Bus")?
+                    .serve_at(
+                        "/org/a11y/bus",
+                        AccessibilityBus {
+                            address: address.clone(),
+                        },
+                    )?
+                    .serve_at(
+                        "/org/a11y/bus",
+                        AccessibilityStatus {
+                            enabled: true,
+                            screen_reader_enabled: false,
+                        },
+                    )?
+                    .build()?,
+            );
             fs::write(address_file, address)?;
         }
         Ok(session)
@@ -166,12 +154,12 @@ impl PrivateSession {
         self.compositor.as_ref().map(Child::id)
     }
     pub(crate) fn shutdown(&mut self) {
+        self.user_services.clear();
         self.accessibility_services.clear();
         for slot in [
             &mut self.compositor,
             &mut self.accessibility_bus,
             &mut self.bus,
-            &mut self.client_bus,
             &mut self.system_bus,
         ] {
             if let Some(mut child) = slot.take() {
@@ -239,6 +227,27 @@ impl Drop for PrivateSession {
         self.shutdown();
     }
 }
+/// A workspace session bus on its own, for backends without a private session.
+pub(crate) fn start_session_bus(runtime: &Path, configure: impl Fn(&mut Command)) -> Result<Child> {
+    start_private_bus(
+        runtime,
+        "session",
+        &bus_address(runtime),
+        &[],
+        "",
+        &configure,
+    )
+}
+
+/// The user's keyring on the workspace session bus. A workspace without it
+/// still starts: apps then cannot reach saved logins, which the log says.
+pub(crate) fn user_services(runtime: &Path) -> Vec<super::host_services::Relay> {
+    super::host_services::start(&bus_address(runtime)).unwrap_or_else(|error| {
+        eprintln!("agent workspace: keyring not relayed into the workspace: {error:#}");
+        Vec::new()
+    })
+}
+
 fn start_private_bus(
     runtime: &Path,
     kind: &str,
@@ -282,7 +291,7 @@ fn start_private_bus(
 <deny send_destination="org.freedesktop.DBus" send_interface="org.freedesktop.DBus" send_member="ReloadConfig"/>
 {extra_policy}
 </policy></busconfig>"#,
-            bus_type = if kind == "client" { "session" } else { kind },
+            bus_type = kind,
             address = escape(address),
             services = escape(&service_dir.to_string_lossy()),
             uid = unsafe { libc::geteuid() }
@@ -290,8 +299,6 @@ fn start_private_bus(
     )?;
     let socket = if kind == "session" {
         runtime.join("session-bus")
-    } else if kind == "client" {
-        runtime.join("client-bus")
     } else if kind == "accessibility" {
         runtime.join("at-spi/bus")
     } else {

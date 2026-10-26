@@ -1,10 +1,7 @@
 //! A private Hyprland instance nested in a private KWin virtual renderer.
 //! Aquamarine requires a dma-buf allocator; neither compositor uses a host display.
 use super::private::{prepare_child, unreaped_exit, wait_for, PrivateSession, UnreapedExit};
-use crate::{
-    launch::SessionSandboxResources,
-    workspace::{command_path_check, DaemonOptions},
-};
+use crate::workspace::{command_path_check, DaemonOptions};
 use anyhow::{bail, Context, Result};
 use std::{
     fs,
@@ -100,15 +97,6 @@ pub(crate) fn configure_process_environment(
         .env_remove("HYPRLAND_CMD")
         .env_remove("HYPRLAND_CONFIG")
         .env("DBUS_SYSTEM_BUS_ADDRESS", "unix:path=/nonexistent");
-}
-pub(crate) fn sandbox_resources(
-    runtime: &Path,
-    xauthority: &Path,
-    display: &str,
-) -> SessionSandboxResources {
-    // KWin's generic resources include only display/auth/private bus/a11y,
-    // never the privileged Hyprland IPC or private renderer socket.
-    super::kwin::sandbox_resources(runtime, xauthority, display)
 }
 /// XWayland's compositor-owned wrapper adds authentication before it starts.
 /// Hyprland itself does not pass -auth, including for its abstract X socket.
@@ -211,7 +199,6 @@ pub(crate) struct HyprlandSession {
     compositor: Option<Child>,
     parent: Option<Child>,
     private: PrivateSession,
-    filter: Option<super::wayland_filter::WaylandFilter>,
 }
 impl HyprlandSession {
     pub(crate) fn start(options: &mut DaemonOptions) -> Result<Self> {
@@ -235,7 +222,6 @@ impl HyprlandSession {
             compositor: None,
             parent: None,
             private,
-            filter: None,
         };
         let mut parent = match parent_render_node() {
             Some(node) => {
@@ -507,18 +493,12 @@ impl HyprlandSession {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        // Sandboxed apps connect through the filter, never the main socket.
-        session.filter = Some(super::wayland_filter::WaylandFilter::start(
-            runtime,
-            &socket_path,
-        )?);
         Ok(session)
     }
     pub(crate) fn pid(&self) -> Option<u32> {
         self.compositor.as_ref().map(Child::id)
     }
     pub(crate) fn shutdown(&mut self) {
-        self.filter = None;
         // Do not signal while Hyprland is already in its IPC-triggered cleanup.
         // Keep its renderer alive until the child has completed teardown.
         if self.ipc_ready

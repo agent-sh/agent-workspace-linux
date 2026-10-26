@@ -104,8 +104,8 @@ for scale in (1, 1.5):
         env = workspace(id, "env")["environment"]["variables"]
         env = {entry["name"]: entry["value"] for entry in env}
         assert env["XDG_SESSION_TYPE"] == "wayland"
-        # Attached controllers (computer-use-linux) need the compositor bus;
-        # launched apps get client-bus instead (runtime_isolation_smoke.py).
+        # Attached controllers (computer-use-linux) and launched apps share the
+        # workspace session bus.
         assert env["DBUS_SESSION_BUS_ADDRESS"].endswith(f"/{id}/session-bus")
         assert env["WAYLAND_DISPLAY"] == "workspace-wayland"
         assert env["QT_QPA_PLATFORM"] == "wayland"
@@ -286,36 +286,17 @@ for scale in (1, 1.5):
             wait_for(lambda: not Path(f"/proc/{status['window_manager_pid']}").exists(), "compositor process cleanup")
             assert not (runtime / "workspace-wayland").exists(), "Wayland socket survived clean stop"
             assert not any(path.exists() for path in initial_x_sockets), "XWayland socket survived clean stop"
-# Enforced mounts + network namespace must retain the owning XWayland socket.
-project = Path("/tmp/legacy-project")
+# A launched XWayland terminal maps a window and runs on the workspace session bus.
+project = Path("/tmp/xwayland-project")
 project.mkdir()
-profile = Path("/tmp/legacy-profile.json")
-profile.write_text(json.dumps({"id":"hyprland-restricted", "session":{"backend":"hyprland"},
-    "cwd":"/workspace/project", "require_enforced_policy":True,
-    "network":{"mode":"disabled"}, "mounts":[{"host_path":str(project),
-    "workspace_path":"/workspace/project", "mode":"read_write"}]}))
-command("profile","import","--json",profile)
-id="hyprland-restricted"
+id="hyprland-xwayland"
 try:
-    workspace(id,"start","--profile","hyprland-restricted","--ack-hidden-workspace", "--purpose","Legacy XWayland sandbox acceptance")
-    launch=workspace(id,"launch","--wait-window","--window-timeout-ms",10000,"--","xterm","-fa","monospace","-e","sh","-c",'test ! -e "$XDG_RUNTIME_DIR/hyprland-ipc" && test ! -e "$XDG_RUNTIME_DIR/hyprland-parent" && printf ready > /workspace/project/ready; exec tail -f /dev/null')
+    workspace(id,"start","--session","hyprland","--ack-hidden-workspace", "--purpose","XWayland terminal acceptance")
+    launch=workspace(id,"launch","--wait-window","--window-timeout-ms",10000,"--","xterm","-fa","monospace","-e","sh","-c",'printf %s "$DBUS_SESSION_BUS_ADDRESS" > "$1/ready"; exec tail -f /dev/null',"sh",project)
     assert launch["windows"], launch
-    wait_for(lambda:(project/"ready").exists(),"XWayland terminal in enforced sandbox")
-    app=launch["apps"][0]
-    assert app["mount_isolation"]=="bubblewrap_mount_namespace",app
-    assert app["network_isolation"]=="bubblewrap_unshare_net",app
-    private_runtime = workspace(id,"status")["runtime_dir"]
-    fd_probe = "import os,sys; root=sys.argv[1]; targets=[os.readlink('/proc/self/fd/'+fd) for fd in os.listdir('/proc/self/fd') if os.path.exists('/proc/self/fd/'+fd) and os.path.isdir('/proc/self/fd/'+fd)]; assert not any(t.startswith(root) and not t.startswith(root+'/client') for t in targets), targets"
-    result = workspace(id,"run","--timeout-ms",10000,"--","python3","-c",fd_probe,private_runtime)
-    assert result["exit_code"] == 0, result
-    print("Hyprland restricted XWayland terminal passed",flush=True)
+    wait_for(lambda:(project/"ready").exists() and (project/"ready").read_text(),"XWayland terminal")
+    assert (project/"ready").read_text().endswith(f"/{id}/session-bus"), (project/"ready").read_text()
+    print("Hyprland XWayland terminal passed",flush=True)
 finally:
     workspace(id,"stop")
-(Path.home()/".cache").mkdir(exist_ok=True)
-subprocess.run(["python3","/opt/hyprland-probe/runtime_isolation_smoke.py"],
-               env=dict(os.environ,AGENT_WORKSPACE_BIN=BIN,AWL_TEST_SESSION="hyprland"),check=True,timeout=180)
-# Sandboxed apps must reach only the filtered Wayland socket.
-(Path.home()/".cache").mkdir(exist_ok=True)
-subprocess.run(["python3","/opt/hyprland-probe/sandbox_wayland_globals_smoke.py","hyprland"],
-               env=dict(os.environ,AGENT_WORKSPACE_BIN=BIN,SANDBOX_GLOBALS_ARTIFACTS=str(ARTIFACTS)),check=True,timeout=300)
 print("Hyprland native acceptance passed", flush=True)

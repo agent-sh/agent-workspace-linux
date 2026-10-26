@@ -9,5 +9,5 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 # ibus installs /etc/xdg/Xwayland-session.d/10-ibus-x11; the probe proves it never runs.
 RUN apt-get update && apt-get install -y --no-install-recommends python3-pyqt6 python3-pil ibus && rm -rf /var/lib/apt/lists/*
-COPY gnome_smoke.py gnome_fixture.py gnome_qt_fixture.py gnome_primary_reader.py kwin_mcp.py sandbox_wayland_globals_smoke.py wayland_globals_probe.py /opt/gnome-probe/
+COPY gnome_smoke.py gnome_fixture.py gnome_qt_fixture.py gnome_primary_reader.py kwin_mcp.py /opt/gnome-probe/
 ENTRYPOINT ["python3","/opt/gnome-probe/gnome_smoke.py"]

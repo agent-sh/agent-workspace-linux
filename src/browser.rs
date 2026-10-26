@@ -1,5 +1,4 @@
 use crate::launch::resolve_executable_path;
-use crate::policy::ProfileMount;
 use crate::session::SessionSpec;
 use crate::workspace::{self, WorkspaceApp, WorkspaceStatus};
 use anyhow::{anyhow, bail, Context, Result};
@@ -561,8 +560,6 @@ pub fn workspace_browser_open_plan(
             command,
             name: Some("workspace-browser".to_string()),
             profile_id: None,
-            applied_policy: None,
-            user_acknowledged_unenforced_policy: false,
             cwd: None,
             env: Vec::new(),
         },
@@ -2132,11 +2129,9 @@ fn select_browser_app(
             continue;
         }
         let workspace_user_data_dir = command_user_data_dir(&app.command);
-        let host_user_data_dir = user_data_dir.map(Path::to_path_buf).or_else(|| {
-            workspace_user_data_dir
-                .as_deref()
-                .map(|path| host_path_for_user_data_dir(status, path))
-        });
+        let host_user_data_dir = user_data_dir
+            .map(Path::to_path_buf)
+            .or_else(|| workspace_user_data_dir.clone());
         let remote_debugging_port = command_remote_debugging_port(&app.command);
         let remote_debugging_address = command_remote_debugging_address(&app.command);
         if !looks_like_browser_app(app, remote_debugging_port, workspace_user_data_dir.as_ref()) {
@@ -2205,27 +2200,6 @@ fn looks_like_browser_app(
         && workspace_user_data_dir.is_some()
 }
 
-fn host_path_for_user_data_dir(status: &WorkspaceStatus, path: &Path) -> PathBuf {
-    if path.exists() {
-        return path.to_path_buf();
-    }
-    if let Some(mapped) = status
-        .applied_policy
-        .as_ref()
-        .and_then(|policy| map_mount_path(&policy.mounts, path))
-    {
-        return mapped;
-    }
-    path.to_path_buf()
-}
-
-fn map_mount_path(mounts: &[ProfileMount], workspace_path: &Path) -> Option<PathBuf> {
-    mounts.iter().find_map(|mount| {
-        let relative = workspace_path.strip_prefix(&mount.workspace_path).ok()?;
-        Some(mount.host_path.join(relative))
-    })
-}
-
 fn workspace_browser_command(
     browser_path: &Path,
     user_data_dir: &Path,
@@ -2235,7 +2209,6 @@ fn workspace_browser_command(
     vec![
         browser_path.display().to_string(),
         format!("--user-data-dir={}", user_data_dir.display()),
-        "--no-sandbox".to_string(),
         "--disable-dev-shm-usage".to_string(),
         "--remote-debugging-address=127.0.0.1".to_string(),
         "--remote-debugging-port=0".to_string(),
@@ -2676,11 +2649,9 @@ mod tests {
             session_id: "session-browser-dogfood".to_string(),
             purpose: None,
             profile_id: None,
-            applied_policy: None,
             profile_cwd: None,
             profile_env: Vec::new(),
             user_acknowledged_hidden_workspace: true,
-            user_acknowledged_unenforced_policy: false,
             ready: true,
             started_at_unix: 1,
             display: ":90".to_string(),
@@ -2699,8 +2670,6 @@ mod tests {
                 pid: 4242,
                 process_group_id: Some(4242),
                 profile_id: None,
-                mount_isolation: "host".to_string(),
-                network_isolation: "host".to_string(),
                 command: vec![
                     "/usr/bin/google-chrome-stable".to_string(),
                     "--user-data-dir=/tmp/browser-profile".to_string(),
@@ -2766,21 +2735,6 @@ mod tests {
             matches_browser_app_ref(&status.apps[0], "workspace-chrome-cdp"),
             "direct helper should match the launched app name"
         );
-    }
-
-    #[test]
-    fn mount_mapping_resolves_workspace_profile_path() {
-        let mounts = vec![ProfileMount {
-            host_path: PathBuf::from("/home/me/profile-copy"),
-            workspace_path: PathBuf::from("/workspace/browser-user-data"),
-            mode: crate::policy::MountMode::ReadWrite,
-        }];
-
-        assert_eq!(
-            map_mount_path(&mounts, Path::new("/workspace/browser-user-data/Default")).as_deref(),
-            Some(Path::new("/home/me/profile-copy/Default"))
-        );
-        assert!(map_mount_path(&mounts, Path::new("/tmp/profile")).is_none());
     }
 
     #[test]

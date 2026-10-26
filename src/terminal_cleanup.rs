@@ -20,8 +20,8 @@ fn managed_socket(runtime: &Path, app: &WorkspaceApp) -> Option<(PathBuf, PathBu
     managed_command_socket(runtime, &app.command)
 }
 
-/// Each managed terminal owns `runtime/client/terminal-ID/`, the only client
-/// directory its sandbox may see. Returns that directory for a launch command
+/// Each managed terminal owns `runtime/client/terminal-ID/` for its tmux
+/// socket. Returns that directory for a launch command
 /// built by `terminal_launch_plan`; legacy runtime-root sockets have none.
 pub(super) fn managed_terminal_client_dir(runtime: &Path, command: &[String]) -> Option<PathBuf> {
     let (_, socket) = managed_command_socket(runtime, command)?;

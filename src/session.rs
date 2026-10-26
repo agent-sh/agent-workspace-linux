@@ -1,10 +1,10 @@
 pub(crate) mod cosmic;
 pub(crate) mod gnome;
+pub(crate) mod host_services;
 pub(crate) mod hyprland;
 pub(crate) mod i3;
 pub(crate) mod kwin;
 pub(crate) mod private;
-pub(crate) mod wayland_filter;
 pub(crate) mod x11;
 
 use crate::desktop::DesktopControl;
@@ -27,36 +27,6 @@ impl SessionSpec {
         explicit.or(profile).unwrap_or_default()
     }
 
-    pub fn describe_policy(self, policy: &mut crate::policy::AppliedWorkspacePolicy) {
-        let (backend, detail) = match self.backend {
-            SessionBackend::Cosmic => (
-                "cosmic_wayland_runtime",
-                "workspace apps use a private native COSMIC display and session bus",
-            ),
-            SessionBackend::Gnome => (
-                "gnome_wayland_runtime",
-                "workspace apps use a private GNOME Wayland display and session bus",
-            ),
-            SessionBackend::Kwin => (
-                "kwin_wayland_runtime",
-                "workspace apps use a private KWin Wayland display and session bus",
-            ),
-            SessionBackend::Hyprland => (
-                "hyprland_wayland_runtime",
-                "workspace apps use private Hyprland Wayland and XWayland displays and a private session bus",
-            ),
-            SessionBackend::I3 => (
-                "i3_xauth_display",
-                "workspace apps run on a private X11 display managed by i3 with scoped authority",
-            ),
-            SessionBackend::X11 => (
-                "xvfb_xauth_display",
-                "workspace apps run on a private X11 DISPLAY with a scoped XAUTHORITY",
-            ),
-        };
-        policy.enforcement.display_isolation.backend = Some(backend.to_owned());
-        policy.enforcement.display_isolation.detail = detail.to_owned();
-    }
     pub fn matches(self, other: Self) -> bool {
         self.backend == other.backend
             && (self.scale - other.scale).abs()
@@ -151,62 +121,6 @@ impl SessionSpec {
         }
     }
 
-    /// Environment for sandboxed launches only, applied after
-    /// `configure_process_environment`. Attached controllers and unsandboxed
-    /// launches keep the latter, as they do the control bus.
-    pub(crate) fn configure_sandboxed_environment(self, command: &mut Command) {
-        if self.backend == SessionBackend::Cosmic {
-            cosmic::configure_sandboxed_environment(command);
-        }
-    }
-
-    pub(crate) fn sandbox_resources(
-        self,
-        xauthority_path: &Path,
-        runtime_dir: &Path,
-        display: &str,
-    ) -> crate::launch::SessionSandboxResources {
-        match self.backend {
-            SessionBackend::X11 | SessionBackend::I3 => {
-                x11::sandbox_resources(xauthority_path, display)
-            }
-            SessionBackend::Gnome => {
-                gnome::sandbox_resources(runtime_dir, xauthority_path, display)
-            }
-            SessionBackend::Kwin => kwin::sandbox_resources(runtime_dir, xauthority_path, display),
-            SessionBackend::Hyprland => {
-                hyprland::sandbox_resources(runtime_dir, xauthority_path, display)
-            }
-            SessionBackend::Cosmic => {
-                cosmic::sandbox_resources(runtime_dir, xauthority_path, display)
-            }
-        }
-    }
-
-    /// The filtered Wayland socket a backend binds into sandboxes in place
-    /// of its main socket, and that main socket's app-visible path.
-    pub(crate) fn sandbox_wayland_socket(
-        self,
-        runtime_dir: &Path,
-    ) -> Option<(std::path::PathBuf, std::path::PathBuf)> {
-        match self.backend {
-            SessionBackend::Kwin => Some(wayland_filter::sandbox_socket(
-                runtime_dir,
-                kwin::WAYLAND_SOCKET,
-            )),
-            SessionBackend::Hyprland => Some(wayland_filter::sandbox_socket(
-                runtime_dir,
-                hyprland::WAYLAND_SOCKET,
-            )),
-            // COSMIC's own security-context socket is the filter's upstream.
-            SessionBackend::Cosmic => Some(wayland_filter::sandbox_socket(
-                runtime_dir,
-                cosmic::APP_SOCKET,
-            )),
-            SessionBackend::X11 | SessionBackend::I3 | SessionBackend::Gnome => None,
-        }
-    }
-
     pub(crate) fn chrome_ozone_platform(self) -> &'static str {
         match self.backend {
             SessionBackend::X11 | SessionBackend::I3 => x11::CHROME_OZONE_PLATFORM,
@@ -286,13 +200,6 @@ pub enum SessionBackend {
 }
 
 impl SessionBackend {
-    pub(crate) fn requires_client_application_bus(self) -> bool {
-        matches!(
-            self,
-            Self::Kwin | Self::Gnome | Self::Hyprland | Self::Cosmic
-        )
-    }
-
     fn as_str(self) -> &'static str {
         match self {
             Self::X11 => "x11",

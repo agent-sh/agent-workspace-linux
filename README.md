@@ -34,7 +34,7 @@ Agents that "use a computer" usually take over *your* screen. They move your mou
 | Use case | When |
 |---|---|
 | **GUI and web QA** | An agent must test an app or website without hijacking your desktop or Chrome session. |
-| **Isolated browsing** | Web or shopping automation should run in a throwaway profile you can watch and stop. |
+| **Background browsing** | Web or shopping tasks run in a browser you can watch and stop, on a throwaway profile or your own logins. |
 | **Clean desktops** | You need a fresh Linux desktop to run, screenshot and inspect an app, then tear it down. |
 | **Unattended agents** | A long-running or headless agent needs a desktop of its own. |
 
@@ -46,7 +46,7 @@ This is not a tool for driving your actual desktop. For that, use its sibling [c
 
 ```bash
 sudo apt install xvfb openbox xdotool xauth x11-utils imagemagick xclip \
-    bubblewrap uidmap pkg-config libxkbcommon-x11-dev
+    dbus-daemon pkg-config libxkbcommon-x11-dev
 ```
 
 Other backends need [their own packages](#backend-packages).
@@ -95,7 +95,7 @@ With cargo or a prebuilt binary, copy `skills/agent-workspace-linux/` into your 
 ## Quick start
 
 ```bash
-# 1. What can this machine run? (dependencies, display, sandbox backends)
+# 1. What can this machine run? (dependencies, displays, backends)
 agent-workspace-linux doctor
 
 # 2. Preview a workspace without creating anything
@@ -137,10 +137,10 @@ Extra packages on top of the [X11 set](#install), for Ubuntu 26.04:
 | Backend | Packages |
 |---|---|
 | i3 | `i3-wm` |
-| KWin | `kwin-wayland kwin-common libkscreen-bin libkf6service-bin wl-clipboard xwayland dbus-daemon` |
-| GNOME | `gnome-shell xwayland libglib2.0-bin dbus-daemon` |
-| Hyprland | `hyprland kwin-wayland xwayland grim wtype wl-clipboard dbus-daemon` |
-| COSMIC | `weston xwayland x11-xserver-utils wl-clipboard dbus-daemon`, plus `cosmic-comp` (below) |
+| KWin | `kwin-wayland kwin-common libkscreen-bin libkf6service-bin wl-clipboard xwayland` |
+| GNOME | `gnome-shell xwayland libglib2.0-bin bubblewrap` |
+| Hyprland | `hyprland kwin-wayland xwayland grim wtype wl-clipboard bubblewrap` |
+| COSMIC | `weston xwayland x11-xserver-utils wl-clipboard bubblewrap`, plus `cosmic-comp` (below) |
 
 "Render node" means your user can read and write a `/dev/dri/renderD*` device, usually through the `render` group. On a host with an NVIDIA GPU and another GPU, Hyprland renders on the other one.
 
@@ -219,7 +219,7 @@ Hyprland runs on a private KWin renderer with a separate headless output, native
 
 <br>
 
-`cosmic-comp` runs under a software-only Weston headless parent, with no host display, input device or GPU. It supports fractional scaling and authenticated XWayland clients. See [COSMIC setup and isolation](docs/native-cosmic.md) for its private launcher restrictions.
+`cosmic-comp` runs under a software-only Weston headless parent, with no host display, input device or GPU. It supports fractional scaling and authenticated XWayland clients. See [the COSMIC guide](docs/native-cosmic.md).
 
 </details>
 
@@ -263,28 +263,23 @@ ws = websocket.create_connection(ws_debugger_url, suppress_origin=True)
 
 ## Security model
 
-### Who controls the boundaries
+The workspace is not a sandbox. Apps launched in it run as you, with your files, network, keyring and SSH agent. Only their windows stay in the workspace. An agent acting there acts for you, so the controls decide what it may do, not what it can reach.
 
-| Scenario | Who sets the boundary | What is enforced | Runtime override? |
-|---|---|---|---|
-| **Default** (no `--permissions`) | Your **agent host** (Claude Code, Codex, ...) | No ceiling of its own; the host's approval flow applies. One explicit hidden-workspace acknowledgement scopes workspace-local actions to that environment. | Yes. The host and user own approvals. |
-| **Developer ceiling** (`--permissions file.json` or `AGENT_WORKSPACE_PERMISSIONS`) | The **developer or operator** who launched the MCP | Network mode, mount paths and an app allowlist, enforced at the MCP front end **and** the daemon's IPC socket, so workspace apps and other same-uid processes are capped too. | **No.** Only by restarting the MCP. This is the authoritative boundary. |
-| **Live viewer control** (pause, read-only) | The **human watching** | Honors a runtime pause when the shared control state is readable. If the daemon cannot read it, mutating IPC fails closed while inspection and stop stay available. | A convenience layer, not the security boundary. |
-| **Workspace vs. host** | The **runtime** | Input, screenshots, windows, clipboard and browser control target the hidden workspace only, never your desktop or host Chrome. | Leakage to the host is a reportable bug. |
+### What decides what an agent does
 
-By default the agent host owns permission. A developer can lock a hard, daemon-enforced ceiling. The viewer gives a human live pause, read-only and stop. See [docs/permission-model.md](docs/permission-model.md) and [SECURITY.md](SECURITY.md).
+| Control | Who sets it | What it does |
+|---|---|---|
+| **Your agent host** (Claude Code, Codex, ...) | You | Approves tool calls in its own flow. Every tool is marked read-only, write, destructive or open-world in its MCP annotations and in `mcp_action_catalog`, so the host can ask before the risky ones. Starting a hidden workspace needs one explicit acknowledgement. |
+| **App allowlist** (`--permissions file.json` or `AGENT_WORKSPACE_PERMISSIONS`) | You or the operator who launched the MCP | Limits which programs agents may launch, enforced at the MCP front end and the daemon's socket for the life of the MCP process. |
+| **Live viewer control** (pause, read-only, stop) | The human watching | Stops or freezes the agent at any time. If the daemon cannot read the shared control state, mutating calls fail closed. |
+| **Workspace vs. desktop** | The runtime | Input, screenshots, windows, clipboard and browser control target the workspace only, never your desktop or your host Chrome. Leakage onto your desktop is a reportable bug. |
 
-### What a sandboxed app sees
+### What a workspace app gets
 
-- **Its own namespaces.** Sandboxed apps get private process namespaces and only the workspace display, an application bus without compositor methods, the accessibility bus and, for a managed terminal, that terminal's own socket directory.
-- **No host desktop IPC.** Network-only profiles keep normal host file access but hide every workspace runtime and the host session bus, system bus, X11 sockets and IBus.
-- **A filtered Wayland socket.** On Hyprland, KWin and COSMIC, a filter forwards only an allow-list of ordinary app globals. Capture, input injection, input method, toplevel and workspace management, layer shell, session lock, output control and clipboard-manager globals stay hidden, and binds of hidden names are refused. The daemon's own helpers keep the unfiltered socket. `scripts/sandbox_wayland_globals_smoke.py` checks this on each native backend.
-- **No supplementary groups** where the host allows it (see [Limitations](#limitations)).
+- **Your session.** Your home, config and data directories, network, SSH and GPG agents, sound, your settings (dconf) and your keyring: the workspace relays the Secret Service, KWallet and dconf from your session bus, so Chrome on your profile has your saved logins.
+- **The workspace's display and bus.** A private display and its own session bus, so a single-instance app opens its window in the workspace, not on your desktop.
 
-> [!WARNING]
-> The Wayland filter does not cover X11. Sandboxed apps share the workspace's X11 display (Xvfb or XWayland) and accessibility bus with its other apps. Do not run untrusted sandboxed apps next to unsandboxed apps or terminals in the same workspace.
-
-Unsandboxed apps and attached controllers such as computer-use-linux use the compositor control bus, as in a regular desktop session.
+See [docs/permission-model.md](docs/permission-model.md) and [SECURITY.md](SECURITY.md).
 
 ### Cleanup
 
@@ -295,22 +290,22 @@ Managed terminal sessions end when their workspace stops, even after the termina
 | Concept | What it is |
 |---|---|
 | **Hidden workspace** | A private X11 or Wayland display, window manager or compositor, and control socket. Apps launched into it attach to that display, not your session. Creating one needs `--ack-hidden-workspace`, so it is never silent. |
-| **Permission ceiling** | Optional JSON (`network`, `mounts`, `apps`), enforced for the life of the MCP process. Mount and network isolation use [bubblewrap](https://github.com/containers/bubblewrap). |
-| **Profiles** | Reusable workspace definitions: mounts, network mode, setup commands, startup apps. Start from `profile template project-dev` or `browser-session`. |
+| **Permission ceiling** | Optional JSON app allowlist (`apps.allow`), enforced for the life of the MCP process. |
+| **Profiles** | Reusable workspace definitions: backend, size, working directory, environment, setup commands, startup apps. Start from `profile template project-dev`, `chrome` or `browser-session`. |
 | **Viewer** | A small GPUI window with workspace state, a live screen view and pause, read-only and stop controls. Not always-on-top by default. |
 | **Workspace browser** | Workspace-owned Chrome or Chromium over a loopback DevTools endpoint, so automation never attaches to your host Chrome. |
 
 ## The skill
 
-The MCP exposes about 86 tools. To keep them out of the agent's context, it ships a skill at [`skills/agent-workspace-linux/SKILL.md`](skills/agent-workspace-linux/SKILL.md). Only its short description stays loaded. When a task needs an isolated desktop or browser, the agent reads the skill, which routes it through the phases (orient, start, observe, act, stop) and loads tool schemas on demand.
+The MCP exposes about 86 tools. To keep them out of the agent's context, it ships a skill at [`skills/agent-workspace-linux/SKILL.md`](skills/agent-workspace-linux/SKILL.md). Only its short description stays loaded. When a task needs a background desktop or browser, the agent reads the skill, which routes it through the phases (orient, start, observe, act, stop) and loads tool schemas on demand.
 
 `./install.sh` installs it to `~/.codex/skills/`. Use `--skills-dir ~/.claude/skills` for Claude.
 
 ## Features
 
 - Hidden X11 or native Wayland workspaces on six backends, with window listing, screenshots, keyboard and mouse input, clipboard and per-app logs, all scoped to the workspace.
-- An optional, daemon-enforced permission ceiling (network, mounts, app allowlist).
-- bubblewrap mount and network isolation: `disabled`, `local_only`, `inherit_host`.
+- Apps that act as you: your files, network, keyring and SSH agent, with windows kept in the workspace.
+- Read-only, write and destructive marks on every tool, and an optional daemon-enforced app allowlist.
 - Workspace-owned browser control over loopback CDP: discover targets, read pages, navigate, extract results.
 - A native floating viewer with live pause, read-only and stop.
 - Saved profiles with setup and startup commands.
@@ -320,28 +315,10 @@ The MCP exposes about 86 tools. To keep them out of the agent's context, it ship
 
 - **Linux only.** The viewer is validated on X11 and XWayland; native Wayland support is still maturing.
 - **Pre-1.0.** Interfaces and tool schemas can change between versions.
-- **Single-user trust model.** The control socket is a same-uid Unix socket (mode 0600), with no cross-user protection by design. Run as a dedicated user for multi-user isolation.
-- **Mount and network enforcement needs bubblewrap.** Without it, those policies are declared but not enforced, and the runtime says so.
-- **Live viewer control is not the hard boundary.** The permission ceiling is. Unreadable live-control state fails closed for mutating daemon IPC.
-- **Supplementary groups are dropped only where the host allows it.** Groups such as `docker` or `lxd` are root-equivalent. Where any requirement below is missing, sandboxed apps keep your groups as before, and `doctor` reports why under `sandbox_group_drop`.
-
-<details>
-<summary><b>Requirements and effects of dropping groups</b></summary>
-
-<br>
-
-Dropping needs:
-
-- `uidmap` (`newuidmap`, `newgidmap`);
-- a subordinate id range for your user in `/etc/subuid` and `/etc/subgid` (Ubuntu's `adduser` creates one);
-- util-linux 2.40 or newer;
-- user namespaces that `unshare` may use, on a host without `no_new_privs`.
-
-Ubuntu 23.10 and newer restrict unprivileged user namespaces with AppArmor (`kernel.apparmor_restrict_unprivileged_userns=1`). To allow it, either give `/usr/bin/unshare` an AppArmor profile with `userns,` (like Ubuntu's own `lxc-usernsexec` profile; this lifts the restriction for every program that runs `unshare`), or set the sysctl to 0. Or remove the root-equivalent groups from your user.
-
-When dropping applies, every supplementary group goes, including `video`, `audio` or a shared project group. Files a sandboxed app could reach only through such a group become unreadable to it.
-
-</details>
+- **Not a sandbox.** Workspace apps run as you. Do not launch code you would not run yourself.
+- **One instance per profile.** An app that keeps one process per profile hands a second launch to the one already running, and the window opens there. A Chromium browser launched without `--user-data-dir` while it runs on your desktop is refused for that reason. Electron apps such as Slack can do the same: start them in the workspace only when they are not open on your desktop.
+- **Single-user trust model.** The control socket is a same-uid Unix socket (mode 0600), with no cross-user protection by design.
+- **Live viewer control is not the hard boundary.** The app allowlist is. Unreadable live-control state fails closed for mutating daemon IPC.
 
 ## Validation
 
@@ -349,14 +326,14 @@ Each native backend has a disposable Ubuntu 26.04 acceptance probe. Build the bi
 
 | Script | What it checks |
 |---|---|
-| `scripts/gnome_probe.sh` | Real GTK input at 100% and 150%, clipboard, window operations, physical screenshot sizes, MCP and viewer IPC, private-bus restrictions, managed terminal cleanup, native and XWayland apps under enforced mount and network isolation. No host display, input device, system bus or GPU. Override `GNOME_PROBE_BIN` and `GNOME_PROBE_ARTIFACT_DIR`. |
-| `scripts/kwin_probe.sh` | Actual 100% and 150% scaling, native Qt input and capture, MCP startup, viewer frames, denied desktop-service activation, a legacy terminal with enforced isolation. One DRM render node, no host display, input device or session runtime. |
+| `scripts/gnome_probe.sh` | Real GTK input at 100% and 150%, clipboard, window operations, physical screenshot sizes, MCP and viewer IPC, private-bus restrictions, managed terminal cleanup, native and XWayland apps. No host display, input device, system bus or GPU. Override `GNOME_PROBE_BIN` and `GNOME_PROBE_ARTIFACT_DIR`. |
+| `scripts/kwin_probe.sh` | Actual 100% and 150% scaling, native Qt input and capture, MCP startup, viewer frames, denied desktop-service activation, a managed terminal. One DRM render node, no host display, input device or session runtime. |
 | `scripts/kwin_cul_probe.sh` | computer-use-linux against the same KWin desktop: AT-SPI activation, global logical-coordinate clicks and client-local element fallback on a Qt window at 150%. Set `KWIN_PROBE_BIN` and `COMPUTER_USE_LINUX_BIN`. |
 | `scripts/hyprland_probe.sh` | See [the Hyprland guide](docs/hyprland.md). |
-| `scripts/cosmic_probe.sh` | See [COSMIC setup and isolation](docs/native-cosmic.md). |
-| `scripts/i3_smoke.py` | The real private i3 session and restricted apps. Set `AGENT_WORKSPACE_BIN`. |
+| `scripts/cosmic_probe.sh` | See [the COSMIC guide](docs/native-cosmic.md). |
+| `scripts/i3_smoke.py` | The real private i3 session and its apps. Set `AGENT_WORKSPACE_BIN`. |
 
-The KWin containers permit nested user namespaces so the bubblewrap checks can run. Portal consent in the computer-use-linux probe applies only to the disposable workspace.
+Portal consent in the computer-use-linux probe applies only to the disposable workspace.
 
 <details>
 <summary><b>Real-profile browser-session dogfood</b></summary>
@@ -378,13 +355,13 @@ The helper refuses obvious active-profile hazards, copies the approved profile t
 ## Docs
 
 - [Permission boundary](docs/permission-model.md): the authority model.
-- [Hyprland backend](docs/hyprland.md) and [COSMIC backend](docs/native-cosmic.md): dependencies, isolation and probes.
+- [Hyprland backend](docs/hyprland.md) and [COSMIC backend](docs/native-cosmic.md): dependencies, internals and probes.
 - [GPUI viewer direction](docs/gpui-viewer-direction.md): the visible control surface.
 - [SECURITY.md](SECURITY.md): trust model and vulnerability reports.
 
 ## Related
 
-[computer-use-linux](https://github.com/agent-sh/computer-use-linux) drives the **user's real** Linux desktop. It is the inverse of this project: it automates the desktop you are on, while `agent-workspace-linux` gives the agent a separate, isolated one. Use them together for host control and a sandboxed agent workspace.
+[computer-use-linux](https://github.com/agent-sh/computer-use-linux) drives the **user's real** Linux desktop. It is the inverse of this project: it automates the desktop you are on, while `agent-workspace-linux` gives the agent a separate one in the background. Use them together.
 
 ## Contributing
 

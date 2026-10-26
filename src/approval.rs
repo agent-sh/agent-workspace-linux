@@ -186,22 +186,6 @@ pub fn hidden_workspace_acknowledgement(acknowledged: bool) -> ApprovalRequireme
     }
 }
 
-pub fn unenforced_policy_acknowledgement(acknowledged: bool) -> ApprovalRequirement {
-    ApprovalRequirement {
-        id: "unenforced_policy".to_string(),
-        label: "Unenforced policy".to_string(),
-        description:
-            "User acknowledges that requested mount or network policy is not fully enforced by this runtime."
-                .to_string(),
-        acknowledged,
-        cli_flag: Some("--ack-unenforced-policy".to_string()),
-        mcp_parameter: Some(ApprovalMcpParameter {
-            name: "acknowledge_unenforced_policy".to_string(),
-            value: true,
-        }),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -209,20 +193,20 @@ mod tests {
     #[test]
     fn approval_bundle_deduplicates_missing_acknowledgements() {
         let bundle = ApprovalBundle::new("workspace_open_profile", "profile qa", false)
-            .require_acknowledgement(false, hidden_workspace_acknowledgement(false))
-            .require_acknowledgement(true, unenforced_policy_acknowledgement(false))
-            .require_acknowledgement(true, unenforced_policy_acknowledgement(false));
+            .require_acknowledgement(false, hidden_workspace_acknowledgement(true))
+            .require_acknowledgement(true, hidden_workspace_acknowledgement(false))
+            .require_acknowledgement(true, hidden_workspace_acknowledgement(false));
 
         assert!(!bundle.approved);
         assert!(bundle.requires_user_approval);
         assert_eq!(bundle.required_acknowledgements.len(), 1);
         assert_eq!(bundle.missing_acknowledgements.len(), 1);
-        assert_eq!(bundle.missing_acknowledgements[0].id, "unenforced_policy");
-        assert_eq!(bundle.approve_cli_flags, vec!["--ack-unenforced-policy"]);
+        assert_eq!(bundle.missing_acknowledgements[0].id, "hidden_workspace");
+        assert_eq!(bundle.approve_cli_flags, vec!["--ack-hidden-workspace"]);
         assert_eq!(bundle.approve_mcp_parameters.len(), 1);
         assert_eq!(
             bundle.approve_mcp_parameters[0].name,
-            "acknowledge_unenforced_policy"
+            "acknowledge_hidden_workspace"
         );
         assert!(bundle.approve_mcp_parameters[0].value);
     }

@@ -27,16 +27,9 @@ runtime and checks its peer PID before publishing the path. It never uses an
 inherited `HYPRLAND_INSTANCE_SIGNATURE`. A directory descriptor supplies a short
 private path for Hyprland IPC sockets, whose hash-based names would otherwise
 exceed Linux Unix socket path limits. App environments use the actual workspace
-paths, with no descriptor aliases. Restricted apps receive only the private
-display, authenticated XWayland socket, private session bus and accessibility
-bus. They cannot access the compositor control socket or its parent's display.
-Their Wayland socket is the daemon's filter, not Hyprland's main socket. Hyprland
-offers screencopy, toplevel export, virtual keyboard and pointer, input method,
-layer shell, session lock, output, gamma and data-control globals to every client
-of its main socket, and keeps virtual keyboard, pointer and input method even for
-`wp_security_context_v1` clients. The filter relays each sandboxed client over a
-security-context connection and forwards only globals an ordinary window needs.
-The private configuration has no application launch bindings, config includes,
+paths, with no descriptor aliases. Apps get the private display, the
+authenticated XWayland socket, the workspace session bus and the accessibility
+bus, and run as the user. The private configuration has no application launch bindings, config includes,
 portal activation, or arbitrary D-Bus service activation.
 
 Hyprland's XWayland launcher does not supply an authority file. A workspace-owned
@@ -55,7 +48,7 @@ Run `scripts/hyprland_probe.sh` after building the binary. The disposable probe
 uses only a DRM render node and verifies native 100% and 150% scale, delivered Qt
 pointer events, Unicode text, clipboard, window operations, read-only window
 capture, viewer frame metadata, private service restrictions, legacy XWayland
-apps inside a network and mount namespace, and process cleanup. The host must
+apps, and process cleanup. The host must
 provide its normal GPU lease before invoking the probe.
 
 Primary implementation references:
