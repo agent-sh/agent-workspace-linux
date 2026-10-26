@@ -59,9 +59,8 @@ pub(crate) fn scrub_host_session_environment(command: &mut Command) {
     }
 }
 
-/// The attach environment for trusted external controllers (the agent host,
-/// computer-use-linux). It keeps the compositor-facing session bus; only apps
-/// launched into the workspace are switched to the client bus.
+/// The attach environment for external controllers (the agent host,
+/// computer-use-linux): the workspace's display, buses and runtime directory.
 pub(crate) fn workspace_environment_variables(status: &WorkspaceStatus) -> Vec<EnvVar> {
     let mut variables = vec![
         EnvVar {

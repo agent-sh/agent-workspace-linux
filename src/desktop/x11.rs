@@ -654,7 +654,7 @@ impl X11DesktopControl<'_> {
             .to_string();
         let (wm_instance, wm_class) = self.window_class_from_xprop(&id);
         // XRes returns the PID seen by our X server, unlike _NET_WM_PID which
-        // may be a PID from the sandbox's private process namespace.
+        // an app may set to a PID from another process namespace.
         let pid = daemon_executable_path()
             .ok()
             .and_then(|exe| {

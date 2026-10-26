@@ -26,15 +26,11 @@ use std::{
 };
 use wayland_client::{
     delegate_noop,
-    globals::{registry_queue_init, GlobalListContents},
+    globals::registry_queue_init,
     protocol::{wl_buffer, wl_output, wl_pointer, wl_seat},
     Connection, Dispatch, Proxy, QueueHandle, WEnum,
 };
 use wayland_protocols::ext::foreign_toplevel_list::v1::client::ext_foreign_toplevel_handle_v1::ExtForeignToplevelHandleV1;
-use wayland_protocols::wp::security_context::v1::client::{
-    wp_security_context_manager_v1::WpSecurityContextManagerV1,
-    wp_security_context_v1::WpSecurityContextV1,
-};
 use wayland_protocols_wlr::output_management::v1::client::{
     zwlr_output_configuration_head_v1, zwlr_output_configuration_v1, zwlr_output_head_v1,
     zwlr_output_manager_v1, zwlr_output_mode_v1,
@@ -327,81 +323,11 @@ delegate_noop!(State: ignore wl_seat::WlSeat);
 delegate_noop!(State: ignore wl_pointer::WlPointer);
 delegate_noop!(State: ignore zwlr_output_configuration_head_v1::ZwlrOutputConfigurationHeadV1);
 
-/// Registers the restricted application socket with COSMIC.
-///
-/// COSMIC hides capture, toplevel management, output configuration, virtual
-/// keyboard, input method, layer shell, session lock, data control and
-/// keyboard layout globals from clients with a security context. The listener
-/// and close descriptors are inherited from the workspace daemon, which keeps
-/// the close descriptor's write end open for the session lifetime.
-struct SecurityContextClient;
-impl Dispatch<wayland_client::protocol::wl_registry::WlRegistry, GlobalListContents>
-    for SecurityContextClient
-{
-    fn event(
-        _: &mut Self,
-        _: &wayland_client::protocol::wl_registry::WlRegistry,
-        _: wayland_client::protocol::wl_registry::Event,
-        _: &GlobalListContents,
-        _: &Connection,
-        _: &QueueHandle<Self>,
-    ) {
-    }
-}
-delegate_noop!(SecurityContextClient: ignore WpSecurityContextManagerV1);
-delegate_noop!(SecurityContextClient: ignore WpSecurityContextV1);
-
-fn create_security_context(connection: &Connection, args: &Value) -> Result<Value> {
-    let descriptor = |name: &str| -> Result<std::os::fd::BorrowedFd<'static>> {
-        let fd = args[name]
-            .as_i64()
-            .and_then(|fd| i32::try_from(fd).ok())
-            .filter(|fd| *fd > 2)
-            .with_context(|| format!("COSMIC security context {name} missing"))?;
-        // The daemon passed these descriptors to this short-lived helper.
-        Ok(unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) })
-    };
-    let instance = args["instance_id"]
-        .as_str()
-        .context("COSMIC security context instance missing")?;
-    let (globals, mut queue) = registry_queue_init::<SecurityContextClient>(connection)?;
-    let qh = queue.handle();
-    let manager: WpSecurityContextManagerV1 = globals
-        .bind(&qh, 1..=1, ())
-        .context("COSMIC security context protocol unavailable")?;
-    let context =
-        manager.create_listener(descriptor("listen_fd")?, descriptor("close_fd")?, &qh, ());
-    context.set_sandbox_engine(SANDBOX_ENGINE.to_owned());
-    context.set_instance_id(instance.to_owned());
-    context.commit();
-    context.destroy();
-    manager.destroy();
-    queue.roundtrip(&mut SecurityContextClient)?;
-    Ok(json!({"sandbox_engine": SANDBOX_ENGINE, "instance_id": instance}))
-}
-
-pub(crate) const SANDBOX_ENGINE: &str = "agent-workspace-linux";
-
 /// Every invocation must run under a process deadline, including registry setup.
 pub(crate) fn run(socket: &Path, operation: &str, args: &Value) -> Result<Value> {
     let connection = Connection::from_socket(
         UnixStream::connect(socket).context("connect private COSMIC display")?,
     )?;
-    if operation == "security-context" {
-        return create_security_context(&connection, args);
-    }
-    if operation == "registry" {
-        let (globals, _queue) = registry_queue_init::<SecurityContextClient>(&connection)?;
-        let mut interfaces = globals
-            .contents()
-            .clone_list()
-            .into_iter()
-            .map(|global| global.interface)
-            .collect::<Vec<_>>();
-        interfaces.sort();
-        interfaces.dedup();
-        return Ok(json!({ "interfaces": interfaces }));
-    }
     let (globals, mut queue) = registry_queue_init(&connection)?;
     let qh = queue.handle();
     let registry = RegistryState::new(&globals);

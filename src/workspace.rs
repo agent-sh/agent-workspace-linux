@@ -3605,7 +3605,7 @@ fn create_owned_private_dir(path: &Path, what: &str) -> Result<()> {
 /// Terminals started before the client runtime split keep their tmux server at
 /// the runtime root. Attach there only while that server still accepts
 /// connections; a stale socket file must not steer new launches or lookups away
-/// from the sandbox-visible client directory.
+/// from the per-terminal client directory.
 fn terminal_socket_path(runtime: &Path, id: &str) -> PathBuf {
     let legacy = runtime.join(format!("terminal-{id}.tmux.sock"));
     if UnixStream::connect(&legacy).is_ok() {
