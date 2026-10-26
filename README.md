@@ -8,12 +8,12 @@
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT"></a>
 </p>
 
-<p align="center"><b>A hidden Linux desktop that an AI agent controls over MCP.<br>Your mouse, keyboard, focus and browser stay yours.</b></p>
+<p align="center"><b>A hidden Linux desktop that an AI agent controls over MCP.</b><br>Your mouse, keyboard, focus and browser stay yours.</p>
 
 <p align="center">
-  <img src="assets/viewer-website-qa.png" width="820" alt="The agent-workspace-linux floating viewer (right) shows a live website being QA'd inside the hidden workspace while a Claude Code session (left) drives it. The user's real desktop is untouched.">
+  <img src="assets/backends.png" width="900" alt="Six hidden workspaces side by side: X11, i3, KWin, GNOME, Hyprland and COSMIC, each running a text editor that the agent typed into.">
 </p>
-<p align="center"><sub>The floating viewer (right) shows the agent doing website QA inside the hidden workspace while Claude Code (left) drives it.</sub></p>
+<p align="center"><sub>One agent, six hidden desktops. Each tile is a real workspace on one machine, captured by the agent itself.</sub></p>
 
 <p align="center">
   <a href="#install">Install</a> ·
@@ -27,11 +27,11 @@
 
 > Running open models for your company? [**Tiyuvta**](https://tiyuvta.ai/services/) helps with model choice, deployment and optimization, and fine-tuning on your hardware or cloud account.
 
-Agents that "use a computer" usually take over *your* screen. They move your mouse, steal focus and drive your logged-in browser. `agent-workspace-linux` gives the agent its **own** desktop: a private X11 or native Wayland display with its own window manager or compositor, apps, clipboard and browser. The agent launches apps, types, clicks, takes screenshots and browses there. You watch, pause or stop it from a small floating viewer. It speaks [MCP](https://modelcontextprotocol.io) over stdio, so it works with Claude Code, Codex and other MCP hosts.
+Agents that "use a computer" usually take over *your* screen. They move your mouse, steal focus and drive your logged-in browser. `agent-workspace-linux` gives the agent its **own** desktop: a private X11 or native Wayland display with its own window manager or compositor, apps, clipboard and browser, on any of [six backends](#desktop-backends). The agent launches apps, types, clicks, takes screenshots and browses there. You watch, pause or stop it from a small floating viewer. It speaks [MCP](https://modelcontextprotocol.io) over stdio, so it works with Claude Code, Codex and other MCP hosts.
 
 ## Why this project
 
-| Use it when | |
+| Use case | When |
 |---|---|
 | **GUI and web QA** | An agent must test an app or website without hijacking your desktop or Chrome session. |
 | **Isolated browsing** | Web or shopping automation should run in a throwaway profile you can watch and stop. |
@@ -53,12 +53,18 @@ Other backends need [their own packages](#backend-packages).
 
 **2. The binary.** Pick one:
 
-| Method | Command | Notes |
-|---|---|---|
-| Install script | `./install.sh` | Builds the release binary into `~/.local/bin/` and installs the bundled skill. Safe to rerun. |
-| npm | `npm install -g @agent-sh/agent-workspace-linux` | Downloads the prebuilt binary from the matching GitHub Release and verifies its `.sha256` sidecar. |
-| cargo | `cargo install --git https://github.com/agent-sh/agent-workspace-linux` | Builds from git. Add `--tag v0.5.1` to pin a release. Installs only the binary. |
-| Prebuilt | [GitHub Releases](https://github.com/agent-sh/agent-workspace-linux/releases/latest) | `x86_64` and `aarch64` binaries with `.sha256` sidecars. Verify with `sha256sum -c`, `chmod +x`, put on your `PATH`. |
+```bash
+# From a clone: builds into ~/.local/bin/ and installs the bundled skill (safe to rerun)
+./install.sh
+
+# npm: downloads the prebuilt binary from the matching release and checks its sha256
+npm install -g @agent-sh/agent-workspace-linux
+
+# cargo: builds from git and installs only the binary (add --tag v0.5.1 to pin)
+cargo install --git https://github.com/agent-sh/agent-workspace-linux
+```
+
+Prebuilt `x86_64` and `aarch64` binaries with `.sha256` sidecars are on [GitHub Releases](https://github.com/agent-sh/agent-workspace-linux/releases/latest). Verify with `sha256sum -c`, `chmod +x`, and put the binary on your `PATH`.
 
 **3. Register the MCP server.** For hosts that read `.mcp.json`:
 
