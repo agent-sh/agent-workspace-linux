@@ -134,16 +134,7 @@ run_awl permissions template open --app sh > "$CLI_PERMISSIONS"
 run_awl permissions validate --json "$CLI_PERMISSIONS" > "$SMOKE_DIR/cli-permissions-validate.json"
 assert_json '.configured == true and .restricted == true and .ceiling.apps.allow == ["sh"] and (.ceiling | has("network") | not) and (.ceiling | has("mounts") | not)' "$SMOKE_DIR/cli-permissions-validate.json"
 expect_awl_failure "$SMOKE_DIR/cli-permissions-closed.err" permissions template closed --app sh
-grep -q "removed in 0.6.0" "$SMOKE_DIR/cli-permissions-closed.err"
-CLI_LEGACY_PERMISSIONS="$SMOKE_DIR/cli-legacy-permissions.json"
-cat > "$CLI_LEGACY_PERMISSIONS" <<'JSON'
-{
-  "network": { "mode": "disabled" },
-  "mounts": [{ "host_path": "/tmp", "workspace_path": "/workspace/tmp", "mode": "read_only" }]
-}
-JSON
-run_awl permissions validate --json "$CLI_LEGACY_PERMISSIONS" > "$SMOKE_DIR/cli-legacy-permissions-validate.json"
-assert_json '.configured == true and .restricted == false and .ceiling.network.mode == "disabled" and (.ceiling.mounts | length) == 1 and ([.advisories[] | select(contains("is not enforced"))] | length) == 2' "$SMOKE_DIR/cli-legacy-permissions-validate.json"
+grep -q "unknown permissions template" "$SMOKE_DIR/cli-permissions-closed.err"
 cat > "$CLI_OPEN_PROFILE" <<'JSON'
 {
   "id": "cli-too-open",
@@ -188,15 +179,6 @@ if run_awl profile validate --json "$INVALID_PROFILE" > "$SMOKE_DIR/invalid-vali
   exit 1
 fi
 grep -q "must be absolute" "$SMOKE_DIR/invalid-validate.err"
-LEGACY_PROFILE="$SMOKE_DIR/legacy-profile.json"
-jq -n '{
-  id: "legacy-sandbox-fields",
-  network: {mode:"disabled"},
-  mounts: [{host_path:"/tmp", workspace_path:"/workspace/tmp", mode:"read_only"}],
-  require_enforced_policy: true
-}' > "$LEGACY_PROFILE"
-run_awl profile validate --json "$LEGACY_PROFILE" > "$SMOKE_DIR/legacy-validate.json"
-assert_json '.ok == true and (.profile | has("network") | not) and (.profile | has("mounts") | not) and (.profile | has("require_enforced_policy") | not) and ([.check.warnings[] | select(contains("is ignored"))] | length) == 3' "$SMOKE_DIR/legacy-validate.json"
 run_awl profile import --json "$IMPORT_PROFILE" --dry-run > "$SMOKE_DIR/import-dry.json"
 assert_json '.dry_run == true and .would_create == true and .saved == false' "$SMOKE_DIR/import-dry.json"
 run_awl profile import --json "$IMPORT_PROFILE" > "$SMOKE_DIR/import.json"
@@ -271,7 +253,7 @@ run_awl workspace open-profile --dry-run --profile open-preview --id "$OPEN_ID" 
 assert_json '.would_open == false and .approval.missing_acknowledgements[0].id == "hidden_workspace"' "$SMOKE_DIR/open-noack.json"
 run_awl workspace open-profile --dry-run --ack-hidden-workspace --profile open-preview --id "$OPEN_ID" --setup --startup-wait-window > "$SMOKE_DIR/open-ack.json"
 assert_json '.would_open == true and .setup.command_count == 1 and .startup.app_count == 1 and .approval.approved == true' "$SMOKE_DIR/open-ack.json"
-# Removed in 0.6.0; still accepted so older callers keep working.
+# Codex Desktop still passes it; accepted and ignored.
 run_awl workspace open-profile --dry-run --ack-hidden-workspace --ack-unenforced-policy --profile open-preview --id "$OPEN_ID" > "$SMOKE_DIR/open-ack-legacy.json"
 assert_json '.would_open == true and .approval.approved == true' "$SMOKE_DIR/open-ack-legacy.json"
 test ! -d "$RUNTIME_DIR/agent-workspace-linux/$OPEN_ID"

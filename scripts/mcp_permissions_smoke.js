@@ -271,7 +271,6 @@ async function main() {
   assert(
     /configured=true/.test(permissionsDescription) &&
       /immutable ceiling/.test(permissionsDescription) &&
-      /not enforced/.test(permissionsDescription) &&
       /configured=false/.test(permissionsDescription) &&
       /imposes no ceiling/.test(permissionsDescription),
     `mcp_permissions description should distinguish explicit ceilings from clean/default MCP: ${permissionsDescription}`,

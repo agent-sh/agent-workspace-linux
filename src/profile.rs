@@ -30,55 +30,6 @@ pub struct WorkspaceProfile {
     pub setup_commands: Vec<ProfileSetupCommand>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub startup_apps: Vec<ProfileStartupApp>,
-    /// Sandbox fields of profiles written before 0.6.0, read so they can be
-    /// reported and dropped on the next save. Apps run as the user.
-    #[serde(flatten, skip_serializing)]
-    #[schemars(skip)]
-    pub legacy: LegacyProfileFields,
-}
-
-#[derive(Debug, Clone, Default, Deserialize)]
-pub struct LegacyProfileFields {
-    #[serde(default)]
-    mounts: Option<serde_json::Value>,
-    #[serde(default)]
-    network: Option<serde_json::Value>,
-    #[serde(default)]
-    require_enforced_policy: Option<serde_json::Value>,
-}
-
-/// Whether a pre-0.6.0 sandbox field asked for a restriction. Codex Desktop
-/// writes the open values (`mounts: []`, `network.mode: inherit_host`,
-/// `require_enforced_policy: false`) into every file; those ask for nothing.
-pub(crate) fn legacy_field_restricts(field: &str, value: &serde_json::Value) -> bool {
-    match field {
-        "mounts" => value.as_array().is_some_and(|mounts| !mounts.is_empty()),
-        "network" => value["mode"]
-            .as_str()
-            .is_some_and(|mode| mode != "inherit_host"),
-        _ => value.as_bool() == Some(true),
-    }
-}
-
-impl LegacyProfileFields {
-    /// One warning per sandbox field that asked for a restriction.
-    pub fn warnings(&self) -> Vec<String> {
-        [
-            ("mounts", &self.mounts),
-            ("network", &self.network),
-            ("require_enforced_policy", &self.require_enforced_policy),
-        ]
-        .into_iter()
-        .filter(|(field, value)| {
-            value
-                .as_ref()
-                .is_some_and(|value| legacy_field_restricts(field, value))
-        })
-        .map(|(field, _)| {
-            format!("profile field {field} is ignored: workspaces are not sandboxes, apps run as you with your files and network")
-        })
-        .collect()
-    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -221,8 +172,6 @@ impl ProfilePutResult {
 pub struct ProfileCheck {
     pub profile: WorkspaceProfile,
     pub requires_hidden_workspace_ack: bool,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -463,7 +412,6 @@ pub fn template_profile(
                 env: Vec::new(),
                 setup_commands: Vec::new(),
                 startup_apps: Vec::new(),
-                legacy: LegacyProfileFields::default(),
             }
         }
         // restricted-chrome and chrome-disabled-network are the names this
@@ -494,7 +442,6 @@ pub fn template_profile(
                     cwd: Some(PathBuf::from("/tmp")),
                     env: Vec::new(),
                 }],
-                legacy: LegacyProfileFields::default(),
             }
         }
         "browser-session" | "browser_session" | "authenticated-chrome" | "authenticated_chrome" => {
@@ -523,7 +470,6 @@ pub fn template_profile(
                     cwd: Some(PathBuf::from("/tmp")),
                     env: Vec::new(),
                 }],
-                legacy: LegacyProfileFields::default(),
             }
         }
         _ => bail!(
@@ -553,11 +499,9 @@ pub fn check_profile(id: &str) -> Result<ProfileCheck> {
 }
 
 fn check_workspace_profile(profile: WorkspaceProfile) -> ProfileCheck {
-    let warnings = profile.legacy.warnings();
     ProfileCheck {
         profile,
         requires_hidden_workspace_ack: true,
-        warnings,
     }
 }
 
@@ -1251,7 +1195,6 @@ mod tests {
             env: Vec::new(),
             setup_commands: Vec::new(),
             startup_apps: Vec::new(),
-            legacy: LegacyProfileFields::default(),
         }
     }
 
@@ -1332,7 +1275,6 @@ mod tests {
         assert_eq!(validation.profile.id, "validate-smoke");
         assert_eq!(validation.check.profile.id, "validate-smoke");
         assert!(validation.check.requires_hidden_workspace_ack);
-        assert_eq!(validation.check.warnings.len(), 2);
         let _ = fs::remove_file(validation.json_path);
     }
 
@@ -1348,32 +1290,6 @@ mod tests {
         .expect_err("browser session template should require user-data dir");
 
         assert!(error.to_string().contains("--user-data-dir"));
-    }
-
-    #[test]
-    fn a_pre_0_6_profile_with_sandbox_fields_loads_warns_and_saves_without_them() {
-        let profile: WorkspaceProfile = serde_json::from_str(
-            r#"{"id":"old","mounts":[{"host_path":"/srv","workspace_path":"/workspace/srv"}],"network":{"mode":"disabled"},"require_enforced_policy":true}"#,
-        )
-        .expect("a pre-0.6 profile should still parse");
-
-        let warnings = check_workspace_profile(profile.clone()).warnings;
-        assert_eq!(warnings.len(), 3, "{warnings:?}");
-        assert!(warnings.iter().all(|w| w.contains("ignored")));
-        let saved = serde_json::to_value(&profile).expect("serialize profile");
-        for field in ["mounts", "network", "require_enforced_policy"] {
-            assert!(
-                saved.get(field).is_none(),
-                "{field} survived a save: {saved}"
-            );
-        }
-
-        // What Codex Desktop writes asks for nothing, so it warns about nothing.
-        let open: WorkspaceProfile = serde_json::from_str(
-            r#"{"id":"codex","mounts":[],"network":{"mode":"inherit_host"},"require_enforced_policy":false}"#,
-        )
-        .expect("a Codex-written profile parses");
-        assert!(check_workspace_profile(open).warnings.is_empty());
     }
 
     #[test]

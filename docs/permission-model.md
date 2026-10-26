@@ -62,9 +62,6 @@ Spawn the server with a ceiling file to limit launches:
   interpreter, package manager or browser allows what that program goes on to
   do. `mcp_permissions` lists such entries under `advisories`.
 - An empty or missing `apps.allow` means no ceiling on launches.
-- `network` and `mounts` in ceiling files written before 0.6.0 are kept in the
-  reported ceiling so a client can show what was saved, and are not enforced.
-  Each one adds an advisory that says so.
 
 The CLI writes and checks ceiling files:
 
@@ -107,10 +104,9 @@ and an `approval_summary`, so a host can show the next approval without
 parsing prose. Shopping plans keep cart changes and checkout or account
 changes as separate approvals.
 
-## Old profiles
+## Codex Desktop
 
-Profiles written before 0.6.0 may carry `mounts`, `network` and
-`require_enforced_policy`. They still load; `profile check` and `profile
-validate` report one warning per field, and the next save drops them.
-`--ack-unenforced-policy` and `acknowledge_unenforced_policy` are accepted
-and ignored.
+Codex Desktop's Agent Workspaces page still passes `--ack-unenforced-policy`
+and asks for the `restricted-chrome` template. Both are accepted until the
+page stops using them: the flag does nothing, and the template name gives the
+`chrome` template.

@@ -307,7 +307,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "mcp_permissions",
-        description = "Return the spawn-time MCP permission state for this server process. If configured=true, a populated app allowlist is an immutable ceiling that clients may only narrow; network and mount fields from older ceilings are reported as advisories and not enforced. If configured=false, this MCP imposes no ceiling and only reports the host/client harness boundary.",
+        description = "Return the spawn-time MCP permission state for this server process. If configured=true, a populated app allowlist is an immutable ceiling that clients may only narrow. If configured=false, this MCP imposes no ceiling and only reports the host/client harness boundary.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,
@@ -494,7 +494,6 @@ impl AgentWorkspaceLinux {
                     env: Vec::new(),
                     setup_commands: Vec::new(),
                     startup_apps: Vec::new(),
-                    legacy: Default::default(),
                 }],
             }),
         )
@@ -643,7 +642,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "profile_put",
-        description = "Create an agent workspace profile. Existing profile ids are rejected unless replace=true is set explicitly. Set dry_run=true to preview whether the profile would be created, replaced, or rejected without writing. Session, display size, cwd, env, setup commands and startup apps are saved; mounts, network and require_enforced_policy from older profiles are ignored and dropped.",
+        description = "Create an agent workspace profile. Existing profile ids are rejected unless replace=true is set explicitly. Set dry_run=true to preview whether the profile would be created, replaced, or rejected without writing. Session, display size, cwd, env, setup commands and startup apps are saved.",
         annotations(
             read_only_hint = false,
             destructive_hint = false,

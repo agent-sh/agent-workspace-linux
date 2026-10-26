@@ -6343,7 +6343,6 @@ mod tests {
                 cwd: None,
                 env: Vec::new(),
             }],
-            legacy: Default::default(),
         }
     }
 
@@ -6440,7 +6439,6 @@ mod tests {
                 apps: crate::permissions::AppPermissionCeiling {
                     allow: vec![PathBuf::from("xterm")],
                 },
-                ..Default::default()
             },
         );
 
@@ -6765,7 +6763,6 @@ mod tests {
                 apps: crate::permissions::AppPermissionCeiling {
                     allow: vec![PathBuf::from("/bin/sh")],
                 },
-                ..Default::default()
             },
         );
 

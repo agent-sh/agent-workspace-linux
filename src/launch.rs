@@ -208,24 +208,29 @@ pub(crate) fn desktop_handoff(
     let (_, profile) = CHROMIUM_PROFILES
         .iter()
         .find(|(name, _)| *name == program)?;
-    if command[1..]
-        .iter()
-        .any(|arg| arg.starts_with("--user-data-dir"))
-    {
-        return None;
-    }
-    let config = user("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| Some(PathBuf::from(user("HOME")?).join(".config")))?;
-    let lock = config.join(profile).join("SingletonLock");
+    let args = &command[1..];
+    let explicit = args.iter().enumerate().find_map(|(i, arg)| {
+        if arg == "--user-data-dir" {
+            return args.get(i + 1).map(PathBuf::from);
+        }
+        arg.strip_prefix("--user-data-dir=").map(PathBuf::from)
+    });
+    let profile_dir = match explicit {
+        Some(dir) => dir,
+        None => user("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| Some(PathBuf::from(user("HOME")?).join(".config")))?
+            .join(profile),
+    };
+    let lock = profile_dir.join("SingletonLock");
     // The lock is a symlink to "HOST-PID" for the browser holding the profile.
     let owner = fs::read_link(&lock).ok()?;
     let pid = owner.to_str()?.rsplit('-').next()?.parse::<u32>().ok()?;
     // A browser the workspace itself launched opens new windows in it.
     (Path::new(&format!("/proc/{pid}")).exists() && !workspace_pid(pid)).then(|| {
         format!(
-            "{program} is already running on your desktop with the profile in {}; this launch would open its window there, not in the workspace. Pass --user-data-dir=DIR (a copy of the profile keeps its logins) or use workspace_open_browser",
-            lock.parent().unwrap_or(&config).display()
+            "{program} is already running on your desktop with the profile in {}; this launch would open its window there, not in the workspace. Pass a --user-data-dir the desktop browser does not hold (a copy of the profile keeps its logins) or use workspace_open_browser",
+            profile_dir.display()
         )
     })
 }
@@ -405,6 +410,18 @@ mod tests {
             None
         );
         assert_eq!(desktop_handoff(&command(&["xterm"]), user, |_| false), None);
+        // Naming the profile the desktop browser holds hands off just the same.
+        let held = profile.display().to_string();
+        let explicit = format!("--user-data-dir={held}");
+        for args in [
+            vec!["google-chrome", explicit.as_str()],
+            vec!["google-chrome", "--user-data-dir", &held],
+        ] {
+            assert!(
+                desktop_handoff(&command(&args), user, |_| false).is_some(),
+                "{args:?}"
+            );
+        }
 
         let ours = std::process::id();
         assert_eq!(

@@ -9784,7 +9784,6 @@ mod tests {
             apps: crate::permissions::AppPermissionCeiling {
                 allow: vec![PathBuf::from("xterm")],
             },
-            ..Default::default()
         };
         let permissions = McpPermissionState::from_ceiling(
             Some(PathBuf::from("/tmp/daemon-ceiling-test.json")),

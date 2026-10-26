@@ -16,12 +16,6 @@ use std::{
 pub struct McpPermissionCeiling {
     #[serde(default)]
     pub apps: AppPermissionCeiling,
-    /// `network` and `mounts` of ceilings written before 0.6.0. They are kept
-    /// so clients can show what was saved, and are not enforced.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub network: Option<serde_json::Value>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub mounts: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
@@ -39,10 +33,9 @@ pub struct McpPermissionState {
     #[serde(default)]
     pub ceiling: McpPermissionCeiling,
     pub message: String,
-    /// Non-blocking advisories: allowlist entries whose enforcement is weaker
-    /// than it appears (shell/interpreter entries, bare command names) and
-    /// ceiling fields this version does not enforce. They do not narrow or
-    /// widen the ceiling.
+    /// Non-blocking advisories about allowlist entries whose enforcement is
+    /// weaker than it appears (shell/interpreter entries, bare command names).
+    /// They do not narrow or widen the ceiling.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub advisories: Vec<String>,
 }
@@ -62,7 +55,7 @@ impl McpPermissionState {
             McpPermissionCeiling::default()
         };
         let restricted = ceiling.is_restricted();
-        let advisories = ceiling.advisories();
+        let advisories = ceiling.allowlist_advisories();
         let message = match (configured, restricted) {
             (false, _) => {
                 "No MCP permission ceiling is configured; the host/client session controls workspace permissions, including full-access sessions after hidden-workspace approval."
@@ -104,21 +97,6 @@ impl McpPermissionState {
 impl McpPermissionCeiling {
     fn is_restricted(&self) -> bool {
         !self.apps.allow.is_empty()
-    }
-
-    fn advisories(&self) -> Vec<String> {
-        let mut advisories = self.allowlist_advisories();
-        for (field, value) in [("network", &self.network), ("mounts", &self.mounts)] {
-            if value
-                .as_ref()
-                .is_some_and(|value| crate::profile::legacy_field_restricts(field, value))
-            {
-                advisories.push(format!(
-                    "Ceiling field {field} is not enforced: workspaces are not sandboxes, and their apps run as you with your files and network. Only apps.allow limits what agents launch."
-                ));
-            }
-        }
-        advisories
     }
 
     /// Surface non-blocking caveats about app allowlist entries. The app
@@ -197,19 +175,13 @@ pub fn load_mcp_permission_state(path: PathBuf) -> Result<McpPermissionState> {
     Ok(McpPermissionState::from_ceiling(Some(path), ceiling))
 }
 
-/// A starter ceiling. `open` is the only kind: `closed` and `local` limited
-/// the network of sandboxed launches, which 0.6.0 removed.
+/// A starter ceiling: `open`, with an optional app allowlist.
 pub fn template_permission_ceiling(kind: &str, apps: Vec<PathBuf>) -> Result<McpPermissionCeiling> {
-    match kind {
-        "open" => {}
-        "closed" | "disabled" | "local" | "local-only" | "local_only" => bail!(
-            "permissions template {kind} was removed in 0.6.0: workspaces are not sandboxes and do not limit the network. Use open, with --app PROGRAM to limit launches"
-        ),
-        unknown => bail!("unknown permissions template {unknown:?}. Expected: open"),
+    if kind != "open" {
+        bail!("unknown permissions template {kind:?}. Expected: open");
     }
     let ceiling = McpPermissionCeiling {
         apps: AppPermissionCeiling { allow: apps },
-        ..McpPermissionCeiling::default()
     };
     ceiling.validate_config()?;
     Ok(ceiling)
@@ -323,57 +295,12 @@ mod tests {
     }
 
     #[test]
-    fn the_open_template_is_the_only_one_and_carries_the_app_allowlist() {
+    fn the_open_template_carries_the_app_allowlist() {
         let open =
             template_permission_ceiling("open", vec![PathBuf::from("/usr/bin/xterm")]).unwrap();
         assert_eq!(open.apps.allow, vec![PathBuf::from("/usr/bin/xterm")]);
         assert!(open.is_restricted());
-        for kind in ["closed", "local"] {
-            let error = template_permission_ceiling(kind, Vec::new())
-                .unwrap_err()
-                .to_string();
-            assert!(error.contains("removed in 0.6.0"), "{error}");
-        }
-    }
-
-    #[test]
-    fn the_open_ceiling_codex_desktop_writes_has_no_advisories() {
-        let ceiling: McpPermissionCeiling = serde_json::from_str(
-            r#"{"network":{"mode":"inherit_host"},"mounts":[],"apps":{"allow":[]}}"#,
-        )
-        .unwrap();
-        let state = configured_state(ceiling);
-        assert!(!state.restricted);
-        assert!(state.advisories.is_empty(), "{:?}", state.advisories);
-    }
-
-    // Codex Desktop's settings page saved network and mounts before 0.6.0.
-    #[test]
-    fn a_pre_0_6_ceiling_with_network_and_mounts_loads_and_says_they_are_not_enforced() {
-        let ceiling: McpPermissionCeiling = serde_json::from_str(
-            r#"{"network":{"mode":"local_only","allow_hosts":["localhost:3000"]},"mounts":[{"host_path":"/srv","workspace_path":"/workspace/srv","mode":"read_only"}],"apps":{"allow":["/usr/bin/xterm"]}}"#,
-        )
-        .unwrap();
-        let state = configured_state(ceiling);
-
-        assert!(state.restricted);
-        assert_eq!(
-            state.ceiling.network.as_ref().unwrap()["mode"],
-            "local_only"
-        );
-        for field in ["network", "mounts"] {
-            assert!(
-                state
-                    .advisories
-                    .iter()
-                    .any(|a| a.contains(&format!("{field} is not enforced"))),
-                "{:?}",
-                state.advisories
-            );
-        }
-        state
-            .validate_launch_spec(&launch_spec(&["/usr/bin/xterm"], None))
-            .expect("the allowlisted app launches with no mount or network request");
+        assert!(template_permission_ceiling("closed", Vec::new()).is_err());
     }
 
     #[test]
@@ -402,7 +329,6 @@ mod tests {
             apps: AppPermissionCeiling {
                 allow: vec![PathBuf::from("xterm")],
             },
-            ..Default::default()
         });
 
         state
@@ -419,7 +345,6 @@ mod tests {
             apps: AppPermissionCeiling {
                 allow: vec![PathBuf::from("/bin/sh")],
             },
-            ..Default::default()
         });
         absolute
             .validate_launch_spec(&launch_spec(&["/bin/sh"], None))
@@ -432,7 +357,6 @@ mod tests {
             apps: AppPermissionCeiling {
                 allow: vec![PathBuf::from("sh")],
             },
-            ..Default::default()
         });
         bare.validate_launch_spec(&launch_spec(&["sh"], None))
             .expect("bare command should match the same bare allow entry");
@@ -449,7 +373,6 @@ mod tests {
             apps: AppPermissionCeiling {
                 allow: vec![PathBuf::from("bash")],
             },
-            ..Default::default()
         });
 
         assert!(
@@ -474,7 +397,6 @@ mod tests {
             apps: AppPermissionCeiling {
                 allow: vec![PathBuf::from("xterm")],
             },
-            ..Default::default()
         });
 
         assert!(
@@ -491,7 +413,6 @@ mod tests {
             apps: AppPermissionCeiling {
                 allow: vec![PathBuf::from("/usr/bin/xterm")],
             },
-            ..Default::default()
         });
         assert!(
             absolute.advisories.is_empty(),

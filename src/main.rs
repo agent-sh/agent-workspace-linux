@@ -1122,8 +1122,7 @@ fn parse_start_options(args: &[String]) -> Result<ParsedStartOptions> {
                 options.user_acknowledged_hidden_workspace = true;
                 index += 1;
             }
-            // Accepted and ignored since 0.6.0, which removed sandbox policy:
-            // Codex Desktop still passes it.
+            // Codex Desktop still passes it; accepted and ignored.
             "--ack-unenforced-policy" => {
                 index += 1;
             }
@@ -1210,8 +1209,7 @@ fn parse_open_profile_options(
                 options.user_acknowledged_hidden_workspace = true;
                 index += 1;
             }
-            // Accepted and ignored since 0.6.0, which removed sandbox policy:
-            // Codex Desktop still passes it.
+            // Codex Desktop still passes it; accepted and ignored.
             "--ack-unenforced-policy" => {
                 index += 1;
             }
@@ -1976,11 +1974,9 @@ fn parse_permissions_template_options(args: &[String]) -> Result<(String, Vec<Pa
                 apps.push(PathBuf::from(value_after(args, index, "--app")?));
                 index += 2;
             }
-            "--allow-host" | "--mount" => bail!(
-                "permissions template option '{}' was removed in 0.6.0: workspaces are not sandboxes. Expected: [--app PROGRAM]",
-                args[index]
-            ),
-            flag => bail!("unknown permissions template option '{flag}'. Expected: [--app PROGRAM]"),
+            flag => {
+                bail!("unknown permissions template option '{flag}'. Expected: [--app PROGRAM]")
+            }
         }
     }
     Ok((kind, apps))
@@ -2196,11 +2192,6 @@ fn parse_launch_options(args: &[String]) -> Result<LaunchOptions> {
                 env.push(parse_env_assignment(value_after(args, index, "--env")?)?);
                 index += 2;
             }
-            // Accepted and ignored since 0.6.0, which removed sandbox policy:
-            // Codex Desktop still passes it.
-            "--ack-unenforced-policy" => {
-                index += 1;
-            }
             "--dry-run" => {
                 dry_run = true;
                 index += 1;
@@ -2319,11 +2310,6 @@ fn parse_run_options(args: &[String]) -> Result<RunOptions> {
             "--env" => {
                 env.push(parse_env_assignment(value_after(args, index, "--env")?)?);
                 index += 2;
-            }
-            // Accepted and ignored since 0.6.0, which removed sandbox policy:
-            // Codex Desktop still passes it.
-            "--ack-unenforced-policy" => {
-                index += 1;
             }
             "--dry-run" => {
                 dry_run = true;
@@ -4127,11 +4113,6 @@ fn parse_workspace_setup_options(
                 options.dry_run = true;
                 index += 1;
             }
-            // Accepted and ignored since 0.6.0, which removed sandbox policy:
-            // Codex Desktop still passes it.
-            "--ack-unenforced-policy" => {
-                index += 1;
-            }
             "--timeout-ms" => {
                 options.wait = true;
                 options.timeout_ms = Some(
@@ -4172,11 +4153,6 @@ fn parse_profile_launch_options(
             "--profile" => {
                 profile_id = Some(value_after(args, index, "--profile")?.to_string());
                 index += 2;
-            }
-            // Accepted and ignored since 0.6.0, which removed sandbox policy:
-            // Codex Desktop still passes it.
-            "--ack-unenforced-policy" => {
-                index += 1;
             }
             "--dry-run" => {
                 options.dry_run = true;
@@ -4319,12 +4295,6 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
                 xauthority_path = Some(PathBuf::from(value_after(&args, index, "--xauthority")?));
                 index += 2;
             }
-            // An MCP server started before 0.6.0 still passes the applied
-            // policy file to the daemons it spawns from the new binary.
-            "--policy" => {
-                value_after(&args, index, "--policy")?;
-                index += 2;
-            }
             "--permissions" => {
                 permissions_source =
                     Some(PathBuf::from(value_after(&args, index, "--permissions")?));
@@ -4332,11 +4302,6 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
             }
             "--ack-hidden-workspace" => {
                 user_acknowledged_hidden_workspace = true;
-                index += 1;
-            }
-            // Accepted and ignored since 0.6.0, which removed sandbox policy:
-            // Codex Desktop still passes it.
-            "--ack-unenforced-policy" => {
                 index += 1;
             }
             flag => bail!("unknown daemon option '{flag}'"),
@@ -4564,32 +4529,6 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
-    }
-
-    // An MCP server from before 0.6.0 spawns daemons with these flags.
-    #[test]
-    fn daemon_accepts_the_flags_older_servers_pass() {
-        let options = parse_daemon_options(args(&[
-            "--id",
-            "old",
-            "--display",
-            ":91",
-            "--width",
-            "800",
-            "--height",
-            "600",
-            "--runtime-dir",
-            "/tmp/old",
-            "--socket",
-            "/tmp/old/control.sock",
-            "--xauthority",
-            "/tmp/old/Xauthority",
-            "--policy",
-            "/tmp/old/applied_policy.json",
-            "--ack-unenforced-policy",
-        ]))
-        .expect("old daemon flags parse");
-        assert_eq!(options.id, "old");
     }
 
     #[test]
