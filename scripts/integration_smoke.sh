@@ -159,6 +159,8 @@ run_awl --permissions "$CLI_PERMISSIONS" profile put --json "$CLI_LOCKED_PROFILE
 assert_json '.ok == true and .dry_run == true and .would_create == true' "$SMOKE_DIR/cli-locked-profile-put.json"
 
 echo "== doctor =="
+CRATE_VERSION="$(sed -n 's/^version = "\(.*\)"$/\1/p' "$ROOT_DIR/Cargo.toml" | head -n 1)"
+test "$(run_awl --version)" = "agent-workspace-linux $CRATE_VERSION"
 run_awl doctor > "$SMOKE_DIR/doctor.json"
 assert_json '.ready_for_x11_workspace == true' "$SMOKE_DIR/doctor.json"
 
