@@ -4218,6 +4218,7 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
     let mut socket_path = None;
     let mut xauthority_path = None;
     let mut permissions_source = None;
+    let mut protocol = None;
     let mut user_acknowledged_hidden_workspace = false;
     let mut index = 0;
 
@@ -4295,6 +4296,10 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
                 xauthority_path = Some(PathBuf::from(value_after(&args, index, "--xauthority")?));
                 index += 2;
             }
+            "--protocol" => {
+                protocol = Some(value_after(&args, index, "--protocol")?.to_string());
+                index += 2;
+            }
             "--permissions" => {
                 permissions_source =
                     Some(PathBuf::from(value_after(&args, index, "--permissions")?));
@@ -4308,6 +4313,12 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
         }
     }
 
+    if protocol.as_deref() != Some(workspace::IPC_PROTOCOL_VERSION.to_string().as_str()) {
+        bail!(
+            "this workspace daemon speaks protocol {}, and the MCP server that started it is older; restart or reconnect the MCP server",
+            workspace::IPC_PROTOCOL_VERSION
+        );
+    }
     let id = id.context("daemon missing --id")?;
     let session_id = session_id.unwrap_or_else(|| workspace::new_session_id(&id));
 
@@ -4529,6 +4540,37 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    // An MCP server older than the binary would spawn a daemon whose replies
+    // it cannot read; the daemon refuses before creating anything.
+    #[test]
+    fn a_daemon_from_an_older_spawner_is_refused() {
+        let base = [
+            "--id",
+            "w",
+            "--display",
+            ":91",
+            "--width",
+            "800",
+            "--height",
+            "600",
+            "--runtime-dir",
+            "/tmp/w",
+            "--socket",
+            "/tmp/w/control.sock",
+            "--xauthority",
+            "/tmp/w/Xauthority",
+        ];
+        let error = parse_daemon_options(args(&base)).unwrap_err().to_string();
+        assert!(
+            error.contains("restart or reconnect the MCP server"),
+            "{error}"
+        );
+        let version = workspace::IPC_PROTOCOL_VERSION.to_string();
+        let mut current = vec!["--protocol", version.as_str()];
+        current.extend(base);
+        assert_eq!(parse_daemon_options(args(&current)).unwrap().id, "w");
     }
 
     #[test]

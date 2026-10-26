@@ -29,7 +29,10 @@ use std::{
 
 pub const DEFAULT_WORKSPACE_ID: &str = "default";
 const IPC_PROTOCOL_NAME: &str = "agent-workspace-linux.ipc";
-const IPC_PROTOCOL_VERSION: u32 = 1;
+/// Bumped when daemon replies change shape. A daemon starts only for a
+/// spawner of the same version: an MCP server older than the binary cannot
+/// read its replies.
+pub(crate) const IPC_PROTOCOL_VERSION: u32 = 2;
 const DEFAULT_APP_WAIT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_STOP_WAIT_TIMEOUT_MS: u64 = 30_000;
 const DEFAULT_CLICK_BUTTON: u8 = 1;
@@ -3508,6 +3511,8 @@ fn spawn_detached_daemon(options: &DaemonOptions) -> Result<()> {
         .arg("--fork")
         .arg(exe)
         .arg("daemon")
+        .arg("--protocol")
+        .arg(IPC_PROTOCOL_VERSION.to_string())
         .arg("--id")
         .arg(&options.id);
     daemon.arg("--session-id").arg(&options.session_id);
@@ -6809,6 +6814,7 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
         .validate_launch_spec(&spec)
         .context("workspace launch exceeds the MCP permission ceiling")?;
     if let Some(why) = crate::launch::desktop_handoff(
+        spec.cwd.as_deref(),
         &spec.command,
         |name| {
             spec.env

@@ -200,6 +200,7 @@ const CHROMIUM_PROFILES: &[(&str, &str)] = &[
 /// its command line to that browser, and the window opens wherever that one
 /// runs. A browser of the user's desktop holds its default profile.
 pub(crate) fn desktop_handoff(
+    cwd: Option<&Path>,
     command: &[String],
     user: impl Fn(&str) -> Option<OsString>,
     workspace_pid: impl Fn(u32) -> bool,
@@ -216,6 +217,11 @@ pub(crate) fn desktop_handoff(
         arg.strip_prefix("--user-data-dir=").map(PathBuf::from)
     });
     let profile_dir = match explicit {
+        // The browser resolves a relative profile against its own cwd.
+        Some(dir) if dir.is_relative() => cwd
+            .map(Path::to_path_buf)
+            .or_else(|| env::current_dir().ok())?
+            .join(dir),
         Some(dir) => dir,
         None => user("XDG_CONFIG_HOME")
             .map(PathBuf::from)
@@ -395,6 +401,7 @@ mod tests {
         let command = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
 
         let why = desktop_handoff(
+            None,
             &command(&["/usr/bin/google-chrome", "https://example.com"]),
             user,
             |_| false,
@@ -403,13 +410,25 @@ mod tests {
         assert!(why.contains("--user-data-dir"), "{why}");
         assert_eq!(
             desktop_handoff(
+                None,
                 &command(&["google-chrome", "--user-data-dir=/tmp/x"]),
                 user,
                 |_| false
             ),
             None
         );
-        assert_eq!(desktop_handoff(&command(&["xterm"]), user, |_| false), None);
+        assert_eq!(
+            desktop_handoff(None, &command(&["xterm"]), user, |_| false),
+            None
+        );
+        // A relative profile is the one under the browser's own cwd.
+        assert!(desktop_handoff(
+            Some(&home),
+            &command(&["google-chrome", "--user-data-dir=.config/google-chrome"]),
+            user,
+            |_| false
+        )
+        .is_some());
         // Naming the profile the desktop browser holds hands off just the same.
         let held = profile.display().to_string();
         let explicit = format!("--user-data-dir={held}");
@@ -418,21 +437,21 @@ mod tests {
             vec!["google-chrome", "--user-data-dir", &held],
         ] {
             assert!(
-                desktop_handoff(&command(&args), user, |_| false).is_some(),
+                desktop_handoff(None, &command(&args), user, |_| false).is_some(),
                 "{args:?}"
             );
         }
 
         let ours = std::process::id();
         assert_eq!(
-            desktop_handoff(&command(&["google-chrome"]), user, |pid| pid == ours),
+            desktop_handoff(None, &command(&["google-chrome"]), user, |pid| pid == ours),
             None,
             "a browser the workspace launched keeps its windows there"
         );
         fs::remove_file(profile.join("SingletonLock")).unwrap();
         std::os::unix::fs::symlink("host-999999999", profile.join("SingletonLock")).unwrap();
         assert_eq!(
-            desktop_handoff(&command(&["google-chrome"]), user, |_| false),
+            desktop_handoff(None, &command(&["google-chrome"]), user, |_| false),
             None,
             "a stale lock holds nothing"
         );
