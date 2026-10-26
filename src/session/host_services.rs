@@ -10,8 +10,10 @@
 use anyhow::{Context, Result};
 use std::{
     collections::HashMap,
+    ffi::OsString,
     num::NonZeroU32,
-    sync::{Arc, Mutex},
+    path::PathBuf,
+    sync::{Arc, Mutex, OnceLock},
     thread::{self, JoinHandle},
     time::Duration,
 };
@@ -21,20 +23,79 @@ use zbus::{
     Message,
 };
 
-/// Keyring services forwarded when the user's session bus has them.
+/// The user's services forwarded when the user's session bus has them: the
+/// keyring, and dconf so GSettings changes an app makes are the user's own.
 pub(crate) const SERVICES: &[&str] = &[
     "org.freedesktop.secrets",
     "org.kde.kwalletd6",
     "org.kde.kwalletd5",
+    "ca.desrt.dconf",
 ];
 
-/// Start a relay for each keyring service the user's session offers. None
-/// when the daemon has no user session bus, as under a bare test runner.
+/// The user's session bus. MCP hosts may start the server with a bare
+/// environment, so the standard socket paths stand in for the variable.
+pub(crate) fn user_bus_address() -> Option<String> {
+    if let Some(address) = std::env::var_os("DBUS_SESSION_BUS_ADDRESS") {
+        return Some(address.to_string_lossy().into_owned());
+    }
+    let uid = unsafe { libc::getuid() };
+    [
+        std::env::var_os("XDG_RUNTIME_DIR").map(|dir| PathBuf::from(dir).join("bus")),
+        Some(PathBuf::from(format!("/run/user/{uid}/bus"))),
+    ]
+    .into_iter()
+    .flatten()
+    .find(|socket| socket.exists())
+    .map(|socket| crate::session::private::socket_address(&socket))
+}
+
+/// A variable of the user's session: the server's own environment, else the
+/// systemd user manager's, which login sessions export (SSH_AUTH_SOCK from
+/// gcr or ssh-agent, XDG_RUNTIME_DIR) and bare MCP hosts drop.
+pub(crate) fn user_session_var(name: &str) -> Option<OsString> {
+    if let Some(value) = std::env::var_os(name) {
+        return Some(value);
+    }
+    if let Some(value) = user_manager_environment().get(name) {
+        return Some(value.into());
+    }
+    (name == "XDG_RUNTIME_DIR")
+        .then(|| OsString::from(format!("/run/user/{}", unsafe { libc::getuid() })))
+}
+
+fn user_manager_environment() -> &'static HashMap<String, String> {
+    static ENVIRONMENT: OnceLock<HashMap<String, String>> = OnceLock::new();
+    ENVIRONMENT.get_or_init(|| {
+        let read = || -> Result<Vec<String>> {
+            let bus = connect(&user_bus_address().context("no user session bus")?)?;
+            let reply = bus.call_method(
+                Some("org.freedesktop.systemd1"),
+                "/org/freedesktop/systemd1",
+                Some("org.freedesktop.DBus.Properties"),
+                "Get",
+                &("org.freedesktop.systemd1.Manager", "Environment"),
+            )?;
+            let value: zbus::zvariant::OwnedValue = reply.body().deserialize()?;
+            Ok(Vec::<String>::try_from(value)?)
+        };
+        read()
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|entry| {
+                let (name, value) = entry.split_once('=')?;
+                Some((name.to_string(), value.to_string()))
+            })
+            .collect()
+    })
+}
+
+/// Start a relay for each keyring service the user's session offers. A
+/// service that fails to relay is logged and the others still start.
 pub(crate) fn start(workspace_bus: &str) -> Result<Vec<Relay>> {
-    let Some(user_bus) = std::env::var_os("DBUS_SESSION_BUS_ADDRESS") else {
+    let Some(user_bus) = user_bus_address() else {
+        eprintln!("agent workspace: no user session bus found; the keyring is not relayed");
         return Ok(Vec::new());
     };
-    let user_bus = user_bus.to_string_lossy().into_owned();
     let probe = connect(&user_bus).context("connect to the user's session bus")?;
     let dbus = DBusProxy::new(&probe)?;
     let activatable = dbus.list_activatable_names().unwrap_or_default();
@@ -44,11 +105,12 @@ pub(crate) fn start(workspace_bus: &str) -> Result<Vec<Relay>> {
             .name_has_owner(zbus::names::BusName::try_from(*name)?)
             .unwrap_or(false)
             || activatable.iter().any(|n| n.as_str() == *name);
-        if offered {
-            relays.push(
-                Relay::start(name, &user_bus, workspace_bus)
-                    .with_context(|| format!("relay {name} into the workspace"))?,
-            );
+        if !offered {
+            continue;
+        }
+        match Relay::start(name, &user_bus, workspace_bus) {
+            Ok(relay) => relays.push(relay),
+            Err(error) => eprintln!("agent workspace: {name} not relayed: {error:#}"),
         }
     }
     Ok(relays)
@@ -161,7 +223,8 @@ fn forward_answers(
     for message in MessageIterator::from(user) {
         let Ok(answer) = message else { break };
         let header = answer.header();
-        let sent = match header.message_type() {
+        // A reply for an app that has gone is dropped; the loop ends with the bus.
+        let _ = match header.message_type() {
             Type::MethodReturn | Type::Error => {
                 let Some(call) = header.reply_serial().and_then(|serial| {
                     pending.lock().expect("relay pending calls").remove(&serial)
@@ -173,9 +236,6 @@ fn forward_answers(
             Type::Signal => signal(&answer).and_then(|signal| Ok(workspace.send(&signal)?)),
             Type::MethodCall => continue,
         };
-        if sent.is_err() && workspace.unique_name().is_none() {
-            break;
-        }
     }
 }
 
@@ -192,6 +252,13 @@ fn forwarded_call(name: &str, call: &Message) -> Result<Message> {
             .to_owned(),
     )?
     .destination(name)?;
+    if call
+        .primary_header()
+        .flags()
+        .contains(Flags::NoReplyExpected)
+    {
+        builder = builder.with_flags(Flags::NoReplyExpected)?;
+    }
     if let Some(interface) = header.interface() {
         builder = builder.interface(interface.to_owned())?;
     }

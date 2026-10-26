@@ -4319,6 +4319,12 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
                 xauthority_path = Some(PathBuf::from(value_after(&args, index, "--xauthority")?));
                 index += 2;
             }
+            // An MCP server started before 0.6.0 still passes the applied
+            // policy file to the daemons it spawns from the new binary.
+            "--policy" => {
+                value_after(&args, index, "--policy")?;
+                index += 2;
+            }
             "--permissions" => {
                 permissions_source =
                     Some(PathBuf::from(value_after(&args, index, "--permissions")?));
@@ -4558,6 +4564,32 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    // An MCP server from before 0.6.0 spawns daemons with these flags.
+    #[test]
+    fn daemon_accepts_the_flags_older_servers_pass() {
+        let options = parse_daemon_options(args(&[
+            "--id",
+            "old",
+            "--display",
+            ":91",
+            "--width",
+            "800",
+            "--height",
+            "600",
+            "--runtime-dir",
+            "/tmp/old",
+            "--socket",
+            "/tmp/old/control.sock",
+            "--xauthority",
+            "/tmp/old/Xauthority",
+            "--policy",
+            "/tmp/old/applied_policy.json",
+            "--ack-unenforced-policy",
+        ]))
+        .expect("old daemon flags parse");
+        assert_eq!(options.id, "old");
     }
 
     #[test]

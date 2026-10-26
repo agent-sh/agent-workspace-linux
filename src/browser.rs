@@ -2209,7 +2209,6 @@ fn workspace_browser_command(
     vec![
         browser_path.display().to_string(),
         format!("--user-data-dir={}", user_data_dir.display()),
-        "--no-sandbox".to_string(),
         "--disable-dev-shm-usage".to_string(),
         "--remote-debugging-address=127.0.0.1".to_string(),
         "--remote-debugging-port=0".to_string(),

@@ -109,7 +109,10 @@ impl McpPermissionCeiling {
     fn advisories(&self) -> Vec<String> {
         let mut advisories = self.allowlist_advisories();
         for (field, value) in [("network", &self.network), ("mounts", &self.mounts)] {
-            if value.is_some() {
+            if value
+                .as_ref()
+                .is_some_and(|value| crate::profile::legacy_field_restricts(field, value))
+            {
                 advisories.push(format!(
                     "Ceiling field {field} is not enforced: workspaces are not sandboxes, and their apps run as you with your files and network. Only apps.allow limits what agents launch."
                 ));
@@ -331,6 +334,17 @@ mod tests {
                 .to_string();
             assert!(error.contains("removed in 0.6.0"), "{error}");
         }
+    }
+
+    #[test]
+    fn the_open_ceiling_codex_desktop_writes_has_no_advisories() {
+        let ceiling: McpPermissionCeiling = serde_json::from_str(
+            r#"{"network":{"mode":"inherit_host"},"mounts":[],"apps":{"allow":[]}}"#,
+        )
+        .unwrap();
+        let state = configured_state(ceiling);
+        assert!(!state.restricted);
+        assert!(state.advisories.is_empty(), "{:?}", state.advisories);
     }
 
     // Codex Desktop's settings page saved network and mounts before 0.6.0.

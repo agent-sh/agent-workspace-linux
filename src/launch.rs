@@ -130,7 +130,7 @@ pub(crate) fn configure_launch_environment(
         &status.xauthority_path,
         &status.runtime_dir,
     );
-    use_the_users_session(command, |name| env::var_os(name));
+    use_the_users_session(command, crate::session::host_services::user_session_var);
     for env_var in launch_env {
         if is_user_session_var(&env_var.name) {
             command.env(&env_var.name, &env_var.value);
@@ -139,12 +139,14 @@ pub(crate) fn configure_launch_environment(
 }
 
 /// What a workspace app keeps of the user's own session. Native compositors
-/// keep their settings in private XDG directories; apps read the user's.
+/// keep their settings in private XDG directories and a private GSettings
+/// backend; apps use the user's (dconf reaches them through the relay).
 const USER_DIRECTORY_ENV_VARS: &[&str] = &[
     "XDG_CONFIG_HOME",
     "XDG_DATA_HOME",
     "XDG_CACHE_HOME",
     "XDG_STATE_HOME",
+    "GSETTINGS_BACKEND",
 ];
 const USER_AGENT_ENV_VARS: &[&str] = &["SSH_AUTH_SOCK", "SSH_AGENT_PID", "GPG_AGENT_INFO"];
 
@@ -178,6 +180,54 @@ fn use_the_users_session(command: &mut Command, user: impl Fn(&str) -> Option<Os
     if let Some(pulse) = pulse {
         command.env("PULSE_SERVER", pulse);
     }
+}
+
+/// Chromium browsers and the profile directory each uses by default, under
+/// the user's config directory.
+const CHROMIUM_PROFILES: &[(&str, &str)] = &[
+    ("google-chrome", "google-chrome"),
+    ("google-chrome-stable", "google-chrome"),
+    ("google-chrome-beta", "google-chrome-beta"),
+    ("google-chrome-unstable", "google-chrome-unstable"),
+    ("chromium", "chromium"),
+    ("chromium-browser", "chromium"),
+    ("brave-browser", "BraveSoftware/Brave-Browser"),
+    ("microsoft-edge", "microsoft-edge"),
+];
+
+/// Why a launch would open its window on the user's desktop, if it would. A
+/// Chromium browser started on a profile that a running browser holds hands
+/// its command line to that browser, and the window opens wherever that one
+/// runs. A browser of the user's desktop holds its default profile.
+pub(crate) fn desktop_handoff(
+    command: &[String],
+    user: impl Fn(&str) -> Option<OsString>,
+    workspace_pid: impl Fn(u32) -> bool,
+) -> Option<String> {
+    let program = Path::new(command.first()?).file_name()?.to_str()?;
+    let (_, profile) = CHROMIUM_PROFILES
+        .iter()
+        .find(|(name, _)| *name == program)?;
+    if command[1..]
+        .iter()
+        .any(|arg| arg.starts_with("--user-data-dir"))
+    {
+        return None;
+    }
+    let config = user("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| Some(PathBuf::from(user("HOME")?).join(".config")))?;
+    let lock = config.join(profile).join("SingletonLock");
+    // The lock is a symlink to "HOST-PID" for the browser holding the profile.
+    let owner = fs::read_link(&lock).ok()?;
+    let pid = owner.to_str()?.rsplit('-').next()?.parse::<u32>().ok()?;
+    // A browser the workspace itself launched opens new windows in it.
+    (Path::new(&format!("/proc/{pid}")).exists() && !workspace_pid(pid)).then(|| {
+        format!(
+            "{program} is already running on your desktop with the profile in {}; this launch would open its window there, not in the workspace. Pass --user-data-dir=DIR (a copy of the profile keeps its logins) or use workspace_open_browser",
+            lock.parent().unwrap_or(&config).display()
+        )
+    })
 }
 
 pub(crate) fn resolve_command_path(program: &str) -> Option<PathBuf> {
@@ -324,5 +374,51 @@ mod tests {
             Some(format!("unix:{}/pulse/native", runtime.display()).as_str())
         );
         fs::remove_dir_all(runtime).ok();
+    }
+
+    #[test]
+    fn a_browser_on_a_profile_the_desktop_holds_is_refused() {
+        let home = env::temp_dir().join(format!("agent-workspace-handoff-{}", std::process::id()));
+        let profile = home.join(".config/google-chrome");
+        fs::create_dir_all(&profile).expect("profile dir");
+        std::os::unix::fs::symlink(
+            format!("host-{}", std::process::id()),
+            profile.join("SingletonLock"),
+        )
+        .expect("lock");
+        let user = |name: &str| (name == "HOME").then(|| home.clone().into_os_string());
+        let command = |args: &[&str]| args.iter().map(|a| a.to_string()).collect::<Vec<_>>();
+
+        let why = desktop_handoff(
+            &command(&["/usr/bin/google-chrome", "https://example.com"]),
+            user,
+            |_| false,
+        )
+        .expect("the desktop browser holds the profile");
+        assert!(why.contains("--user-data-dir"), "{why}");
+        assert_eq!(
+            desktop_handoff(
+                &command(&["google-chrome", "--user-data-dir=/tmp/x"]),
+                user,
+                |_| false
+            ),
+            None
+        );
+        assert_eq!(desktop_handoff(&command(&["xterm"]), user, |_| false), None);
+
+        let ours = std::process::id();
+        assert_eq!(
+            desktop_handoff(&command(&["google-chrome"]), user, |pid| pid == ours),
+            None,
+            "a browser the workspace launched keeps its windows there"
+        );
+        fs::remove_file(profile.join("SingletonLock")).unwrap();
+        std::os::unix::fs::symlink("host-999999999", profile.join("SingletonLock")).unwrap();
+        assert_eq!(
+            desktop_handoff(&command(&["google-chrome"]), user, |_| false),
+            None,
+            "a stale lock holds nothing"
+        );
+        fs::remove_dir_all(home).ok();
     }
 }

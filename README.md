@@ -276,7 +276,7 @@ The workspace is not a sandbox. Apps launched in it run as you, with your files,
 
 ### What a workspace app gets
 
-- **Your session.** Your home, config and data directories, network, SSH and GPG agents, sound, and your keyring: the workspace relays the Secret Service and KWallet from your session bus, so Chrome on your profile has your saved logins.
+- **Your session.** Your home, config and data directories, network, SSH and GPG agents, sound, your settings (dconf) and your keyring: the workspace relays the Secret Service, KWallet and dconf from your session bus, so Chrome on your profile has your saved logins.
 - **The workspace's display and bus.** A private display and its own session bus, so a single-instance app opens its window in the workspace, not on your desktop.
 
 See [docs/permission-model.md](docs/permission-model.md) and [SECURITY.md](SECURITY.md).
@@ -316,6 +316,7 @@ The MCP exposes about 86 tools. To keep them out of the agent's context, it ship
 - **Linux only.** The viewer is validated on X11 and XWayland; native Wayland support is still maturing.
 - **Pre-1.0.** Interfaces and tool schemas can change between versions.
 - **Not a sandbox.** Workspace apps run as you. Do not launch code you would not run yourself.
+- **One instance per profile.** An app that keeps one process per profile hands a second launch to the one already running, and the window opens there. A Chromium browser launched without `--user-data-dir` while it runs on your desktop is refused for that reason. Electron apps such as Slack can do the same: start them in the workspace only when they are not open on your desktop.
 - **Single-user trust model.** The control socket is a same-uid Unix socket (mode 0600), with no cross-user protection by design.
 - **Live viewer control is not the hard boundary.** The app allowlist is. Unreadable live-control state fails closed for mutating daemon IPC.
 

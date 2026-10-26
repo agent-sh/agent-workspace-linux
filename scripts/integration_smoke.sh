@@ -472,7 +472,7 @@ PY
 )"
   WORKSPACE_IDS+=("$NATIVE_BROWSER_ID")
   run_awl workspace start --ack-hidden-workspace --id "$NATIVE_BROWSER_ID" --purpose "Browser native input smoke" > "$SMOKE_DIR/native-browser-start.json"
-  run_awl workspace launch --id "$NATIVE_BROWSER_ID" --name browser-native-input --wait-window --screenshot-window --window-timeout-ms 15000 -- "$BROWSER_BIN" "--user-data-dir=$SMOKE_DIR/native-browser-profile" --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --ozone-platform=x11 --new-window about:blank > "$SMOKE_DIR/native-browser-launch.json"
+  run_awl workspace launch --id "$NATIVE_BROWSER_ID" --name browser-native-input --wait-window --screenshot-window --window-timeout-ms 15000 -- "$BROWSER_BIN" "--user-data-dir=$SMOKE_DIR/native-browser-profile" --disable-dev-shm-usage --no-first-run --no-default-browser-check --ozone-platform=x11 --new-window about:blank > "$SMOKE_DIR/native-browser-launch.json"
   assert_json '.ok == true and (.screenshot.bytes > 0) and ((.windows | length) > 0) and .apps[0].running == true' "$SMOKE_DIR/native-browser-launch.json"
   NATIVE_BROWSER_APP_ID="$(jq -r '.apps[0].id' "$SMOKE_DIR/native-browser-launch.json")"
   run_awl workspace key-window --id "$NATIVE_BROWSER_ID" --app "$NATIVE_BROWSER_APP_ID" --timeout-ms 5000 ctrl+l > "$SMOKE_DIR/native-browser-key-address.json"

@@ -6808,6 +6808,25 @@ fn spawn_app(state: &mut DaemonState, spec: LaunchSpec) -> Result<WorkspaceApp> 
         .permissions
         .validate_launch_spec(&spec)
         .context("workspace launch exceeds the MCP permission ceiling")?;
+    if let Some(why) = crate::launch::desktop_handoff(
+        &spec.command,
+        |name| {
+            spec.env
+                .iter()
+                .find(|var| var.name == name)
+                .map(|var| var.value.clone().into())
+                .or_else(|| crate::session::host_services::user_session_var(name))
+        },
+        |pid| {
+            state
+                .status
+                .apps
+                .iter()
+                .any(|app| app.running && app.pid == pid)
+        },
+    ) {
+        bail!("{why}");
+    }
     create_client_runtime(&state.status.runtime_dir)?;
     let terminal_dir =
         terminal_cleanup::managed_terminal_client_dir(&state.status.runtime_dir, &spec.command);

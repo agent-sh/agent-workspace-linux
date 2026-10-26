@@ -47,8 +47,21 @@ pub struct LegacyProfileFields {
     require_enforced_policy: Option<serde_json::Value>,
 }
 
+/// Whether a pre-0.6.0 sandbox field asked for a restriction. Codex Desktop
+/// writes the open values (`mounts: []`, `network.mode: inherit_host`,
+/// `require_enforced_policy: false`) into every file; those ask for nothing.
+pub(crate) fn legacy_field_restricts(field: &str, value: &serde_json::Value) -> bool {
+    match field {
+        "mounts" => value.as_array().is_some_and(|mounts| !mounts.is_empty()),
+        "network" => value["mode"]
+            .as_str()
+            .is_some_and(|mode| mode != "inherit_host"),
+        _ => value.as_bool() == Some(true),
+    }
+}
+
 impl LegacyProfileFields {
-    /// One warning per sandbox field the profile still carries.
+    /// One warning per sandbox field that asked for a restriction.
     pub fn warnings(&self) -> Vec<String> {
         [
             ("mounts", &self.mounts),
@@ -56,7 +69,11 @@ impl LegacyProfileFields {
             ("require_enforced_policy", &self.require_enforced_policy),
         ]
         .into_iter()
-        .filter(|(_, value)| value.is_some())
+        .filter(|(field, value)| {
+            value
+                .as_ref()
+                .is_some_and(|value| legacy_field_restricts(field, value))
+        })
         .map(|(field, _)| {
             format!("profile field {field} is ignored: workspaces are not sandboxes, apps run as you with your files and network")
         })
@@ -1350,6 +1367,13 @@ mod tests {
                 "{field} survived a save: {saved}"
             );
         }
+
+        // What Codex Desktop writes asks for nothing, so it warns about nothing.
+        let open: WorkspaceProfile = serde_json::from_str(
+            r#"{"id":"codex","mounts":[],"network":{"mode":"inherit_host"},"require_enforced_policy":false}"#,
+        )
+        .expect("a Codex-written profile parses");
+        assert!(check_workspace_profile(open).warnings.is_empty());
     }
 
     #[test]
