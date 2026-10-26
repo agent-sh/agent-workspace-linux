@@ -414,13 +414,7 @@ pub fn template_profile(
                 startup_apps: Vec::new(),
             }
         }
-        // restricted-chrome and chrome-disabled-network are the names this
-        // template had before 0.6.0; Codex Desktop still asks for them.
-        "chrome"
-        | "restricted-chrome"
-        | "restricted_chrome"
-        | "chrome-disabled-network"
-        | "chrome_disabled_network" => {
+        "chrome" => {
             let id = id.unwrap_or_else(|| "chrome".to_string());
             let browser = browser_path
                 .map(|path| path.display().to_string())
@@ -1304,8 +1298,7 @@ mod tests {
         .expect("project template");
         assert_eq!(project.cwd, Some(PathBuf::from("/home/me/src/app")));
 
-        // Codex Desktop asks for the pre-0.6 name.
-        let chrome = template_profile("restricted-chrome", Some("c".to_string()), None, None, None)
+        let chrome = template_profile("chrome", Some("c".to_string()), None, None, None)
             .expect("chrome template");
         let command = &chrome.startup_apps[0].command;
         assert!(command.iter().any(|arg| arg == "--remote-debugging-port=0"));

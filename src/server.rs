@@ -599,7 +599,7 @@ impl AgentWorkspaceLinux {
 
     #[tool(
         name = "profile_template",
-        description = "Generate a starter profile without saving it. Workspace apps run as the user, with the user's files and network. The project-dev template starts apps in the project directory. The chrome template (also named restricted-chrome) starts Chrome on a fresh profile in /tmp/agent-workspace-chrome. The browser-session template requires user_data_dir and starts Chrome on that profile, with its logins; close the host browser or use a copied profile first.",
+        description = "Generate a starter profile without saving it. Workspace apps run as the user, with the user's files and network. The project-dev template starts apps in the project directory. The chrome template starts Chrome on a fresh profile in /tmp/agent-workspace-chrome. The browser-session template requires user_data_dir and starts Chrome on that profile, with its logins; close the host browser or use a copied profile first.",
         annotations(
             read_only_hint = true,
             destructive_hint = false,

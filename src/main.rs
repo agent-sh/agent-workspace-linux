@@ -1122,10 +1122,6 @@ fn parse_start_options(args: &[String]) -> Result<ParsedStartOptions> {
                 options.user_acknowledged_hidden_workspace = true;
                 index += 1;
             }
-            // Codex Desktop still passes it; accepted and ignored.
-            "--ack-unenforced-policy" => {
-                index += 1;
-            }
             "--profile" => {
                 profile_id = Some(value_after(args, index, "--profile")?.to_string());
                 index += 2;
@@ -1207,10 +1203,6 @@ fn parse_open_profile_options(
         match args[index].as_str() {
             "--ack-hidden-workspace" => {
                 options.user_acknowledged_hidden_workspace = true;
-                index += 1;
-            }
-            // Codex Desktop still passes it; accepted and ignored.
-            "--ack-unenforced-policy" => {
                 index += 1;
             }
             "--dry-run" => {
@@ -2026,7 +2018,7 @@ fn parse_profile_template_options(
     let kind = args
         .first()
         .context(
-            "profile template requires a kind, for example project-dev, restricted-chrome, or browser-session",
+            "profile template requires a kind, for example project-dev, chrome, or browser-session",
         )?
         .to_string();
     let mut id = None;
@@ -4393,7 +4385,7 @@ Usage:
   agent-workspace-linux profile export ID [--output PATH] [--replace]
   agent-workspace-linux profile delete [--dry-run] ID
   agent-workspace-linux profile template project-dev [--id ID] [--host-path PATH]
-  agent-workspace-linux profile template restricted-chrome [--id ID] [--browser-path PATH]
+  agent-workspace-linux profile template chrome [--id ID] [--browser-path PATH]
   agent-workspace-linux profile template browser-session [--id ID] [--browser-path PATH] --user-data-dir PATH
   agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland|cosmic] [--scale N] [--width PX] [--height PX]
   agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland|cosmic] [--scale N] [--width PX] [--height PX]

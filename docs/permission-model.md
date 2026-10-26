@@ -103,10 +103,3 @@ observe, cleanup) into a preview-first sequence with `approval_checkpoints`
 and an `approval_summary`, so a host can show the next approval without
 parsing prose. Shopping plans keep cart changes and checkout or account
 changes as separate approvals.
-
-## Codex Desktop
-
-Codex Desktop's Agent Workspaces page still passes `--ack-unenforced-policy`
-and asks for the `restricted-chrome` template. Both are accepted until the
-page stops using them: the flag does nothing, and the template name gives the
-`chrome` template.

@@ -198,7 +198,7 @@ run_awl profile delete import-smoke > "$SMOKE_DIR/profile-delete.json"
 assert_json '.dry_run == false and .would_delete == true and .deleted == true and .profile.id == "import-smoke"' "$SMOKE_DIR/profile-delete.json"
 run_awl profile list > "$SMOKE_DIR/profile-list-after-delete.json"
 assert_json 'all(.profiles[]; .id != "import-smoke")' "$SMOKE_DIR/profile-list-after-delete.json"
-CHROME_TEMPLATE_ARGS=(restricted-chrome --id chrome-smoke)
+CHROME_TEMPLATE_ARGS=(chrome --id chrome-smoke)
 EXPECTED_BROWSER_BIN="${BROWSER_BIN:-google-chrome}"
 if [[ -n "$BROWSER_BIN" ]]; then
   CHROME_TEMPLATE_ARGS+=(--browser-path "$BROWSER_BIN")
@@ -253,9 +253,6 @@ run_awl workspace open-profile --dry-run --profile open-preview --id "$OPEN_ID" 
 assert_json '.would_open == false and .approval.missing_acknowledgements[0].id == "hidden_workspace"' "$SMOKE_DIR/open-noack.json"
 run_awl workspace open-profile --dry-run --ack-hidden-workspace --profile open-preview --id "$OPEN_ID" --setup --startup-wait-window > "$SMOKE_DIR/open-ack.json"
 assert_json '.would_open == true and .setup.command_count == 1 and .startup.app_count == 1 and .approval.approved == true' "$SMOKE_DIR/open-ack.json"
-# Codex Desktop still passes it; accepted and ignored.
-run_awl workspace open-profile --dry-run --ack-hidden-workspace --ack-unenforced-policy --profile open-preview --id "$OPEN_ID" > "$SMOKE_DIR/open-ack-legacy.json"
-assert_json '.would_open == true and .approval.approved == true' "$SMOKE_DIR/open-ack-legacy.json"
 test ! -d "$RUNTIME_DIR/agent-workspace-linux/$OPEN_ID"
 
 echo "== open-profile setup and startup =="
