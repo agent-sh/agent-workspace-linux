@@ -4377,7 +4377,7 @@ Usage:
   agent-workspace-linux mcp [--permissions PATH] [--headless]
   agent-workspace-linux viewer [--id ID] [--always-on-top] [--exit-when-workspace-gone]
   agent-workspace-linux permissions validate --json PATH
-  agent-workspace-linux permissions template open|closed|local [--allow-host HOST] [--mount HOST:WORKSPACE[:read_only|read_write]] [--app PROGRAM]
+  agent-workspace-linux permissions template open [--app PROGRAM]
   agent-workspace-linux profile path|list|get|check|validate|template|put|import|export|delete
   agent-workspace-linux profile validate --json PATH
   agent-workspace-linux profile put --json PATH [--replace] [--dry-run]
@@ -4466,7 +4466,7 @@ Usage:
   agent-workspace-linux mcp [--permissions PATH] [--headless]
 
 Options:
-  --permissions PATH  Load a spawn-time MCP permission ceiling JSON file. If omitted, the MCP adds no ceiling and respects the host/client harness boundary. Empty fields in a file leave that dimension open; populated network, mounts, or app allowlist fields cap every MCP tool for this process.
+  --permissions PATH  Load a spawn-time MCP permission ceiling JSON file. If omitted, the MCP adds no ceiling and respects the host/client harness boundary. A populated apps.allow limits which programs every MCP tool may launch for this process; an empty one leaves launches open.
   --headless          Disable host-visible GPUI viewer launches from this MCP process. Without this flag, workspace_open_viewer may open the live monitor when the agent/user asks for it.
 "#
     );
