@@ -1,5 +1,6 @@
 pub(crate) mod cosmic;
 pub(crate) mod gnome;
+pub(crate) mod host_services;
 pub(crate) mod hyprland;
 pub(crate) mod i3;
 pub(crate) mod kwin;

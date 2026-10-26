@@ -1,6 +1,8 @@
 use crate::workspace::{EnvVar, WorkspaceStatus};
 use std::{
-    env, fs,
+    env,
+    ffi::OsString,
+    fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::Command,
@@ -20,13 +22,12 @@ pub(crate) fn merged_env(mut base: Vec<EnvVar>, overrides: Vec<EnvVar>) -> Vec<E
     base
 }
 
-/// Host-session environment variables that must not leak from the launching
-/// process into apps started inside the workspace. These point at the
-/// host user's live desktop session services (D-Bus, accessibility, input,
-/// PulseAudio, SSH/GPG agents, keyring, login session) and would let a workspace
-/// app reach back into the host session. We remove them with targeted
-/// `env_remove` only; PATH/HOME and the session-specific display handling
-/// applied afterward are deliberately left intact.
+/// Variables of the user's desktop session that would make a workspace
+/// process use the user's desktop instead of the workspace: its buses,
+/// accessibility, input, sound and login session. Compositors and helpers run
+/// without them. Apps then get the workspace's display and buses, and back
+/// from the user's session what acts for the user: agents, sound and the
+/// XDG directories (`use_the_users_session`). PATH and HOME are left intact.
 const HOST_SESSION_ENV_VARS: &[&str] = &[
     "DBUS_SESSION_BUS_ADDRESS",
     "DBUS_STARTER_ADDRESS",
@@ -108,8 +109,9 @@ pub(crate) fn workspace_environment_variables(status: &WorkspaceStatus) -> Vec<E
     variables
 }
 
-/// The environment of an app launched into the workspace: its display, buses
-/// and runtime directory, then the launch's own variables.
+/// The environment of an app launched into the workspace: the workspace's
+/// display, buses and runtime directory, the user's own session, then the
+/// launch's own variables.
 pub(crate) fn configure_launch_environment(
     command: &mut Command,
     status: &WorkspaceStatus,
@@ -129,6 +131,54 @@ pub(crate) fn configure_launch_environment(
         &status.xauthority_path,
         &status.runtime_dir,
     );
+    use_the_users_session(command, |name| env::var_os(name));
+    for env_var in launch_env {
+        if is_user_session_var(&env_var.name) {
+            command.env(&env_var.name, &env_var.value);
+        }
+    }
+}
+
+/// What a workspace app keeps of the user's own session. Native compositors
+/// keep their settings in private XDG directories; apps read the user's.
+const USER_DIRECTORY_ENV_VARS: &[&str] = &[
+    "XDG_CONFIG_HOME",
+    "XDG_DATA_HOME",
+    "XDG_CACHE_HOME",
+    "XDG_STATE_HOME",
+];
+const USER_AGENT_ENV_VARS: &[&str] = &["SSH_AUTH_SOCK", "SSH_AGENT_PID", "GPG_AGENT_INFO"];
+
+fn is_user_session_var(name: &str) -> bool {
+    USER_DIRECTORY_ENV_VARS.contains(&name)
+        || USER_AGENT_ENV_VARS.contains(&name)
+        || name == "PULSE_SERVER"
+}
+
+/// Apps act for the user: their config and data, SSH and GPG agents and
+/// audio. The keyring reaches them through the workspace bus instead.
+fn use_the_users_session(command: &mut Command, user: impl Fn(&str) -> Option<OsString>) {
+    for name in USER_DIRECTORY_ENV_VARS {
+        match user(name) {
+            Some(value) => command.env(name, value),
+            None => command.env_remove(name),
+        };
+    }
+    for name in USER_AGENT_ENV_VARS {
+        if let Some(value) = user(name) {
+            command.env(name, value);
+        }
+    }
+    // The workspace's runtime directory hides the user's sound server socket.
+    let pulse = user("PULSE_SERVER").or_else(|| {
+        let socket = PathBuf::from(user("XDG_RUNTIME_DIR")?).join("pulse/native");
+        socket
+            .exists()
+            .then(|| OsString::from(format!("unix:{}", socket.display())))
+    });
+    if let Some(pulse) = pulse {
+        command.env("PULSE_SERVER", pulse);
+    }
 }
 
 pub(crate) fn resolve_command_path(program: &str) -> Option<PathBuf> {
@@ -228,5 +278,52 @@ mod tests {
         assert!(resolve_command_path("sh").is_some());
 
         fs::remove_file(path).expect("remove non-executable file");
+    }
+
+    #[test]
+    fn apps_get_the_users_directories_agents_and_sound() {
+        let runtime = env::temp_dir().join(format!(
+            "agent-workspace-user-session-{}",
+            std::process::id()
+        ));
+        fs::create_dir_all(runtime.join("pulse")).expect("runtime dir");
+        fs::write(runtime.join("pulse/native"), "").expect("pulse socket stand-in");
+        let user = |name: &str| match name {
+            "XDG_DATA_HOME" => Some(OsString::from("/home/me/.local/share")),
+            "SSH_AUTH_SOCK" => Some(OsString::from("/run/user/1000/ssh-agent.socket")),
+            "XDG_RUNTIME_DIR" => Some(runtime.clone().into_os_string()),
+            _ => None,
+        };
+        let mut command = Command::new("true");
+        command
+            .env("XDG_CONFIG_HOME", "/run/workspace/session-config")
+            .env("XDG_DATA_HOME", "/run/workspace/session-data");
+
+        use_the_users_session(&mut command, user);
+
+        let envs = command
+            .get_envs()
+            .map(|(k, v)| {
+                (
+                    k.to_string_lossy().into_owned(),
+                    v.map(|v| v.to_string_lossy().into_owned()),
+                )
+            })
+            .collect::<std::collections::BTreeMap<_, _>>();
+        // The compositor's private config is gone; the user's default applies.
+        assert_eq!(envs["XDG_CONFIG_HOME"], None);
+        assert_eq!(
+            envs["XDG_DATA_HOME"].as_deref(),
+            Some("/home/me/.local/share")
+        );
+        assert_eq!(
+            envs["SSH_AUTH_SOCK"].as_deref(),
+            Some("/run/user/1000/ssh-agent.socket")
+        );
+        assert_eq!(
+            envs["PULSE_SERVER"].as_deref(),
+            Some(format!("unix:{}/pulse/native", runtime.display()).as_str())
+        );
+        fs::remove_dir_all(runtime).ok();
     }
 }

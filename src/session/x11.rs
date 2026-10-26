@@ -12,6 +12,8 @@ pub(crate) const CHROME_OZONE_PLATFORM: &str = "x11";
 pub(crate) struct X11Session {
     x_server: Option<Child>,
     window_manager: Option<Child>,
+    bus: Option<Child>,
+    user_services: Vec<super::host_services::Relay>,
 }
 
 impl X11Session {
@@ -19,6 +21,8 @@ impl X11Session {
         let mut session = Self {
             x_server: None,
             window_manager: None,
+            bus: None,
+            user_services: Vec::new(),
         };
         // The display is picked before the daemon starts, so a concurrent start
         // can take it first. Our Xvfb then exits; move to the next free display
@@ -40,6 +44,16 @@ impl X11Session {
                 }
             }
         }
+        // Apps get a workspace session bus, so single-instance apps open here
+        // and not on the user's desktop, with the user's keyring relayed in.
+        session.bus = Some(super::private::start_session_bus(
+            &options.runtime_dir,
+            |command| {
+                crate::launch::scrub_host_session_environment(command);
+                configure_process_environment(command, &options.display, &options.xauthority_path);
+            },
+        )?);
+        session.user_services = super::private::user_services(&options.runtime_dir);
         session.window_manager = if options.session.backend == crate::session::SessionBackend::I3 {
             Some(super::i3::spawn(options)?)
         } else {
@@ -57,7 +71,8 @@ impl X11Session {
     }
 
     pub(crate) fn shutdown(&mut self) {
-        for slot in [&mut self.window_manager, &mut self.x_server] {
+        self.user_services.clear();
+        for slot in [&mut self.window_manager, &mut self.x_server, &mut self.bus] {
             if let Some(mut child) = slot.take() {
                 // Let i3/Xvfb unlink private sockets on normal shutdown. The child
                 // remains unreaped until try_wait, so its PID cannot be reused here.
@@ -103,6 +118,12 @@ pub(crate) fn configure_process_environment(
         .filter(|parent| !parent.as_os_str().is_empty())
     {
         configure_runtime_environment(command, runtime_dir);
+        if runtime_dir.join("session-bus").exists() {
+            command.env(
+                "DBUS_SESSION_BUS_ADDRESS",
+                super::private::bus_address(runtime_dir),
+            );
+        }
     } else {
         command.env_remove("XDG_RUNTIME_DIR");
     }
@@ -283,6 +304,8 @@ mod tests {
         let session = X11Session {
             x_server: Some(x_server),
             window_manager: None,
+            bus: None,
+            user_services: Vec::new(),
         };
 
         drop(session);
@@ -305,6 +328,8 @@ mod tests {
         let mut session = X11Session {
             x_server: Some(x_server),
             window_manager: Some(window_manager),
+            bus: None,
+            user_services: Vec::new(),
         };
 
         session.shutdown();

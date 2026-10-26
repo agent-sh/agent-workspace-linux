@@ -64,6 +64,7 @@ pub(crate) struct PrivateSession {
     system_bus: Option<Child>,
     accessibility_bus: Option<Child>,
     accessibility_services: Vec<zbus::blocking::Connection>,
+    user_services: Vec<super::host_services::Relay>,
 }
 impl PrivateSession {
     pub(crate) fn start(
@@ -81,6 +82,7 @@ impl PrivateSession {
             system_bus: None,
             accessibility_bus: None,
             accessibility_services: Vec::new(),
+            user_services: Vec::new(),
         };
         session.bus = Some(start_private_bus(
             runtime,
@@ -90,6 +92,7 @@ impl PrivateSession {
             extra_policy,
             &configure,
         )?);
+        session.user_services = user_services(runtime);
         let registry =
             Path::new("/usr/share/dbus-1/accessibility-services/org.a11y.atspi.Registry.service");
         if registry.is_file() {
@@ -151,6 +154,7 @@ impl PrivateSession {
         self.compositor.as_ref().map(Child::id)
     }
     pub(crate) fn shutdown(&mut self) {
+        self.user_services.clear();
         self.accessibility_services.clear();
         for slot in [
             &mut self.compositor,
@@ -223,6 +227,27 @@ impl Drop for PrivateSession {
         self.shutdown();
     }
 }
+/// A workspace session bus on its own, for backends without a private session.
+pub(crate) fn start_session_bus(runtime: &Path, configure: impl Fn(&mut Command)) -> Result<Child> {
+    start_private_bus(
+        runtime,
+        "session",
+        &bus_address(runtime),
+        &[],
+        "",
+        &configure,
+    )
+}
+
+/// The user's keyring on the workspace session bus. A workspace without it
+/// still starts: apps then cannot reach saved logins, which the log says.
+pub(crate) fn user_services(runtime: &Path) -> Vec<super::host_services::Relay> {
+    super::host_services::start(&bus_address(runtime)).unwrap_or_else(|error| {
+        eprintln!("agent workspace: keyring not relayed into the workspace: {error:#}");
+        Vec::new()
+    })
+}
+
 fn start_private_bus(
     runtime: &Path,
     kind: &str,
