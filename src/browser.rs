@@ -636,19 +636,8 @@ pub fn workspace_browser_targets(
     user_data_dir: Option<PathBuf>,
     timeout_ms: Option<u64>,
 ) -> Result<WorkspaceBrowserTargets> {
-    match workspace::browser_targets(id, app_id.clone(), user_data_dir.clone(), timeout_ms) {
-        Ok(response) => browser_targets_from_ipc_response(response),
-        Err(error) if should_use_direct_browser_compat(&error) => {
-            let status = workspace::status_workspace(id)?;
-            let mut response =
-                workspace_browser_targets_from_status(&status, app_id, user_data_dir, timeout_ms)?;
-            response
-                .warnings
-                .push(browser_ipc_compat_warning("browser_targets", &error));
-            Ok(response)
-        }
-        Err(error) => Err(error),
-    }
+    workspace::browser_targets(id, app_id.clone(), user_data_dir.clone(), timeout_ms)
+        .and_then(browser_targets_from_ipc_response)
 }
 
 pub(crate) fn workspace_browser_targets_from_status(
@@ -730,7 +719,7 @@ pub fn workspace_browser_snapshot(
     max_text_chars: Option<usize>,
     timeout_ms: Option<u64>,
 ) -> Result<WorkspaceBrowserSnapshot> {
-    match workspace::browser_snapshot(
+    workspace::browser_snapshot(
         id,
         app_id.clone(),
         user_data_dir.clone(),
@@ -739,34 +728,8 @@ pub fn workspace_browser_snapshot(
         url_contains.clone(),
         max_text_chars,
         timeout_ms,
-    ) {
-        Ok(response) => browser_snapshot_from_ipc_response(response),
-        Err(error) if should_use_direct_browser_compat(&error) => {
-            let status = workspace::status_workspace(id)?;
-            let mut response = workspace_browser_snapshot_from_status(
-                &status,
-                app_id,
-                user_data_dir,
-                target_id,
-                title_contains,
-                url_contains,
-                max_text_chars,
-                timeout_ms,
-            )?;
-            response
-                .warnings
-                .push(browser_ipc_compat_warning("browser_snapshot", &error));
-            if let Some(warning) = record_browser_event(
-                &response.id,
-                "browser_snapshot",
-                browser_snapshot_event_detail(&response),
-            ) {
-                response.warnings.push(warning);
-            }
-            Ok(response)
-        }
-        Err(error) => Err(error),
-    }
+    )
+    .and_then(browser_snapshot_from_ipc_response)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -831,7 +794,7 @@ pub fn workspace_browser_search_results(
     min_vram_gb: Option<u32>,
     timeout_ms: Option<u64>,
 ) -> Result<WorkspaceBrowserSearchResults> {
-    match workspace::browser_search_results(
+    workspace::browser_search_results(
         id,
         app_id.clone(),
         user_data_dir.clone(),
@@ -841,35 +804,8 @@ pub fn workspace_browser_search_results(
         max_results,
         min_vram_gb,
         timeout_ms,
-    ) {
-        Ok(response) => browser_search_results_from_ipc_response(response),
-        Err(error) if should_use_direct_browser_compat(&error) => {
-            let status = workspace::status_workspace(id)?;
-            let mut response = workspace_browser_search_results_from_status(
-                &status,
-                app_id,
-                user_data_dir,
-                target_id,
-                title_contains,
-                url_contains,
-                max_results,
-                min_vram_gb,
-                timeout_ms,
-            )?;
-            response
-                .warnings
-                .push(browser_ipc_compat_warning("browser_search_results", &error));
-            if let Some(warning) = record_browser_event(
-                &response.id,
-                "browser_search_results",
-                browser_search_results_event_detail(&response, min_vram_gb),
-            ) {
-                response.warnings.push(warning);
-            }
-            Ok(response)
-        }
-        Err(error) => Err(error),
-    }
+    )
+    .and_then(browser_search_results_from_ipc_response)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -946,7 +882,7 @@ pub fn workspace_browser_navigate(
     timeout_ms: Option<u64>,
 ) -> Result<WorkspaceBrowserNavigate> {
     validate_navigation_url(&url)?;
-    match workspace::browser_navigate(
+    workspace::browser_navigate(
         id,
         app_id.clone(),
         user_data_dir.clone(),
@@ -958,37 +894,8 @@ pub fn workspace_browser_navigate(
         snapshot,
         max_text_chars,
         timeout_ms,
-    ) {
-        Ok(response) => browser_navigate_from_ipc_response(response),
-        Err(error) if should_use_direct_browser_compat(&error) => {
-            let status = workspace::status_workspace(id)?;
-            let mut response = workspace_browser_navigate_from_status(
-                &status,
-                app_id,
-                user_data_dir,
-                target_id,
-                title_contains,
-                url_contains,
-                url,
-                wait_ms,
-                snapshot,
-                max_text_chars,
-                timeout_ms,
-            )?;
-            response
-                .warnings
-                .push(browser_ipc_compat_warning("browser_navigate", &error));
-            if let Some(warning) = record_browser_event(
-                &response.id,
-                "browser_navigate",
-                browser_navigate_event_detail(&response),
-            ) {
-                response.warnings.push(warning);
-            }
-            Ok(response)
-        }
-        Err(error) => Err(error),
-    }
+    )
+    .and_then(browser_navigate_from_ipc_response)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1330,18 +1237,6 @@ pub(crate) fn browser_click_event_detail(response: &WorkspaceBrowserClick) -> se
         "current_url": response.page.as_ref().map(|page| page.url.as_str()),
         "raw_text_omitted": response.page.is_some(),
     })
-}
-
-fn should_use_direct_browser_compat(error: &anyhow::Error) -> bool {
-    error
-        .to_string()
-        .contains("failed to parse workspace IPC response")
-}
-
-fn browser_ipc_compat_warning(method: &str, error: &anyhow::Error) -> String {
-    format!(
-        "workspace daemon did not handle {method} over IPC ({error}); used the compatibility browser path for this already-running workspace"
-    )
 }
 
 fn read_targets_with_optional_wait(
@@ -2028,34 +1923,7 @@ fn validate_browser_click_request(
 }
 
 fn record_browser_event(id: &str, kind: &str, detail: serde_json::Value) -> Option<String> {
-    record_browser_event_with(id, kind, detail, |id, kind, detail| {
-        workspace::record_workspace_event(id, kind, detail)
-    })
-}
-
-fn record_browser_event_with(
-    id: &str,
-    kind: &str,
-    detail: serde_json::Value,
-    mut record: impl FnMut(&str, &str, serde_json::Value) -> Result<workspace::IpcResponse>,
-) -> Option<String> {
-    let result = record(id, kind, detail.clone());
-    if should_retry_browser_event_as_snapshot(kind, &result) {
-        let fallback = record(
-            id,
-            "browser_snapshot",
-            compatibility_browser_snapshot_detail(kind, detail),
-        );
-        if matches!(fallback, Ok(ref response) if response.ok) {
-            return None;
-        }
-        if let Some(warning) = browser_event_recording_warning("browser_snapshot", fallback) {
-            return Some(format!(
-                "workspace event {kind:?} was not recorded, and compatibility fallback failed: {warning}"
-            ));
-        }
-    }
-    browser_event_recording_warning(kind, result)
+    browser_event_recording_warning(kind, workspace::record_workspace_event(id, kind, detail))
 }
 
 fn browser_event_recording_warning(
@@ -2068,53 +1936,9 @@ fn browser_event_recording_warning(
             "workspace event {kind:?} was not recorded: {}; restart the workspace if the viewer activity footer is missing this action",
             response.message
         )),
-        Err(error) if should_use_direct_browser_compat(&error) => Some(format!(
-            "workspace event {kind:?} was not recorded because this already-running workspace daemon does not support external browser activity events; start a fresh workspace to show this action in the viewer activity footer"
-        )),
         Err(error) => Some(format!(
             "workspace event {kind:?} was not recorded: {error}; restart the workspace if the viewer activity footer is missing this action"
         )),
-    }
-}
-
-fn should_retry_browser_event_as_snapshot(
-    kind: &str,
-    result: &Result<workspace::IpcResponse>,
-) -> bool {
-    kind == "browser_search_results"
-        && matches!(result, Ok(response) if !response.ok && looks_like_unsupported_event_kind(&response.message))
-}
-
-fn looks_like_unsupported_event_kind(message: &str) -> bool {
-    let lower = message.to_ascii_lowercase();
-    lower.contains("unsupported event kind")
-        || (lower.contains("external workspace event kind") && lower.contains("not allowed"))
-}
-
-fn compatibility_browser_snapshot_detail(
-    original_kind: &str,
-    detail: serde_json::Value,
-) -> serde_json::Value {
-    match detail {
-        serde_json::Value::Object(mut object) => {
-            object
-                .entry("browser_action".to_string())
-                .or_insert_with(|| serde_json::Value::String(original_kind.to_string()));
-            object
-                .entry("original_event_kind".to_string())
-                .or_insert_with(|| serde_json::Value::String(original_kind.to_string()));
-            object.insert(
-                "compatibility_event_kind".to_string(),
-                serde_json::Value::String("browser_snapshot".to_string()),
-            );
-            serde_json::Value::Object(object)
-        }
-        other => json!({
-            "browser_action": original_kind,
-            "original_event_kind": original_kind,
-            "compatibility_event_kind": "browser_snapshot",
-            "detail": other,
-        }),
     }
 }
 
@@ -3091,39 +2915,6 @@ mod tests {
         .expect("IPC error should warn");
         assert!(ipc_error.contains("browser_snapshot"));
         assert!(ipc_error.contains("workspace IPC socket is unavailable"));
-    }
-
-    #[test]
-    fn browser_search_results_event_falls_back_for_older_workspace_daemon() {
-        let mut calls: Vec<(String, serde_json::Value)> = Vec::new();
-        let warning = record_browser_event_with(
-            "browser-dogfood",
-            "browser_search_results",
-            json!({
-                "app_id": "workspace-chrome",
-                "title": "Amazon GPU Search Results",
-                "result_count": 3,
-                "min_vram_gb": 37
-            }),
-            |_, kind, detail| {
-                calls.push((kind.to_string(), detail));
-                if kind == "browser_search_results" {
-                    Ok(ipc_response(false, "unsupported event kind"))
-                } else {
-                    Ok(ipc_response(true, "recorded"))
-                }
-            },
-        );
-
-        assert!(warning.is_none());
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].0, "browser_search_results");
-        assert_eq!(calls[1].0, "browser_snapshot");
-        assert_eq!(
-            calls[1].1["browser_action"],
-            serde_json::Value::String("browser_search_results".to_string())
-        );
-        assert_eq!(calls[1].1["result_count"], serde_json::Value::from(3));
     }
 
     #[test]
