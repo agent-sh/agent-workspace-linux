@@ -11,7 +11,7 @@ use gpui::{
     Bounds, ClickEvent, Context, CursorStyle, DevicePixels, Div, DivFrameState, Element, ElementId,
     FocusHandle, GlobalElementId, Hitbox, InspectorElementId, InteractiveElement, IntoElement,
     KeyDownEvent, LayoutId, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, ObjectFit,
-    ParentElement, Pixels, Point, Render, RenderImage, ResizeEdge, ScrollDelta, ScrollWheelEvent,
+    ParentElement, Pixels, Point, Render, RenderImage, ResizeEdge, ScrollDelta, ScrollEvent,
     SharedString, Size, Stateful, Styled, Task, Window, WindowBackgroundAppearance, WindowBounds,
     WindowKind, WindowOptions,
 };
@@ -1709,7 +1709,7 @@ impl AgentWorkspaceViewer {
 
     fn forward_scroll(
         &mut self,
-        event: &ScrollWheelEvent,
+        event: &ScrollEvent,
         _window: &mut Window,
         cx: &mut Context<Self>,
     ) {
@@ -3338,7 +3338,7 @@ impl Render for AgentWorkspaceViewer {
                     // make human handoff feel noisy/laggy. Clicks still move the
                     // workspace pointer to the target point, and
                     // drag gestures are replayed on release.
-                    .on_scroll_wheel(cx.listener(Self::forward_scroll))
+                    .on_scroll(cx.listener(Self::forward_scroll))
                     .capture_key_down(cx.listener(Self::forward_key_down))
                     .child(match image {
                         Some(image) => img(image)
