@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-BIN="${BIN:-${AGENT_WORKSPACE_BIN:-$ROOT_DIR/target/debug/agent-workspace-linux}}"
+BIN="${BIN:-${AGENT_WORKSPACE_BIN:-${CARGO_TARGET_DIR:-$ROOT_DIR/target}/debug/agent-workspace-linux}}"
 
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -130,23 +130,32 @@ echo "== cli permission ceiling smoke =="
 CLI_PERMISSIONS="$SMOKE_DIR/cli-permissions.json"
 CLI_OPEN_PROFILE="$SMOKE_DIR/cli-open-profile.json"
 CLI_LOCKED_PROFILE="$SMOKE_DIR/cli-locked-profile.json"
-run_awl permissions template closed --app sh > "$CLI_PERMISSIONS"
+run_awl permissions template open --app sh > "$CLI_PERMISSIONS"
 run_awl permissions validate --json "$CLI_PERMISSIONS" > "$SMOKE_DIR/cli-permissions-validate.json"
-assert_json '.configured == true and .restricted == true and .ceiling.network.mode == "disabled" and .ceiling.apps.allow[0] == "sh"' "$SMOKE_DIR/cli-permissions-validate.json"
+assert_json '.configured == true and .restricted == true and .ceiling.apps.allow == ["sh"] and (.ceiling | has("network") | not) and (.ceiling | has("mounts") | not)' "$SMOKE_DIR/cli-permissions-validate.json"
+expect_awl_failure "$SMOKE_DIR/cli-permissions-closed.err" permissions template closed --app sh
+grep -q "removed in 0.6.0" "$SMOKE_DIR/cli-permissions-closed.err"
+CLI_LEGACY_PERMISSIONS="$SMOKE_DIR/cli-legacy-permissions.json"
+cat > "$CLI_LEGACY_PERMISSIONS" <<'JSON'
+{
+  "network": { "mode": "disabled" },
+  "mounts": [{ "host_path": "/tmp", "workspace_path": "/workspace/tmp", "mode": "read_only" }]
+}
+JSON
+run_awl permissions validate --json "$CLI_LEGACY_PERMISSIONS" > "$SMOKE_DIR/cli-legacy-permissions-validate.json"
+assert_json '.configured == true and .restricted == false and .ceiling.network.mode == "disabled" and (.ceiling.mounts | length) == 1 and ([.advisories[] | select(contains("is not enforced"))] | length) == 2' "$SMOKE_DIR/cli-legacy-permissions-validate.json"
 cat > "$CLI_OPEN_PROFILE" <<'JSON'
 {
   "id": "cli-too-open",
-  "network": { "mode": "inherit_host" },
-  "mounts": [],
   "setup_commands": [],
-  "startup_apps": []
+  "startup_apps": [
+    { "command": ["xmessage", "not allowed"] }
+  ]
 }
 JSON
 cat > "$CLI_LOCKED_PROFILE" <<'JSON'
 {
   "id": "cli-locked",
-  "network": { "mode": "disabled" },
-  "mounts": [],
   "setup_commands": [],
   "startup_apps": [
     { "command": ["sh", "-lc", "true"] }
@@ -154,7 +163,7 @@ cat > "$CLI_LOCKED_PROFILE" <<'JSON'
 }
 JSON
 expect_awl_failure "$SMOKE_DIR/cli-open-profile.err" --permissions "$CLI_PERMISSIONS" profile validate --json "$CLI_OPEN_PROFILE"
-grep -q "exceeds MCP permission ceiling" "$SMOKE_DIR/cli-open-profile.err"
+grep -q "not allowed by the MCP app allowlist" "$SMOKE_DIR/cli-open-profile.err"
 run_awl --permissions "$CLI_PERMISSIONS" profile put --json "$CLI_LOCKED_PROFILE" --dry-run > "$SMOKE_DIR/cli-locked-profile-put.json"
 assert_json '.ok == true and .dry_run == true and .would_create == true' "$SMOKE_DIR/cli-locked-profile-put.json"
 
@@ -179,6 +188,15 @@ if run_awl profile validate --json "$INVALID_PROFILE" > "$SMOKE_DIR/invalid-vali
   exit 1
 fi
 grep -q "must be absolute" "$SMOKE_DIR/invalid-validate.err"
+LEGACY_PROFILE="$SMOKE_DIR/legacy-profile.json"
+jq -n '{
+  id: "legacy-sandbox-fields",
+  network: {mode:"disabled"},
+  mounts: [{host_path:"/tmp", workspace_path:"/workspace/tmp", mode:"read_only"}],
+  require_enforced_policy: true
+}' > "$LEGACY_PROFILE"
+run_awl profile validate --json "$LEGACY_PROFILE" > "$SMOKE_DIR/legacy-validate.json"
+assert_json '.ok == true and (.profile | has("network") | not) and (.profile | has("mounts") | not) and (.profile | has("require_enforced_policy") | not) and ([.check.warnings[] | select(contains("is ignored"))] | length) == 3' "$SMOKE_DIR/legacy-validate.json"
 run_awl profile import --json "$IMPORT_PROFILE" --dry-run > "$SMOKE_DIR/import-dry.json"
 assert_json '.dry_run == true and .would_create == true and .saved == false' "$SMOKE_DIR/import-dry.json"
 run_awl profile import --json "$IMPORT_PROFILE" > "$SMOKE_DIR/import.json"
@@ -198,15 +216,15 @@ run_awl profile delete import-smoke > "$SMOKE_DIR/profile-delete.json"
 assert_json '.dry_run == false and .would_delete == true and .deleted == true and .profile.id == "import-smoke"' "$SMOKE_DIR/profile-delete.json"
 run_awl profile list > "$SMOKE_DIR/profile-list-after-delete.json"
 assert_json 'all(.profiles[]; .id != "import-smoke")' "$SMOKE_DIR/profile-list-after-delete.json"
-CHROME_TEMPLATE_ARGS=(restricted-chrome --id restricted-chrome-smoke)
+CHROME_TEMPLATE_ARGS=(restricted-chrome --id chrome-smoke)
 EXPECTED_BROWSER_BIN="${BROWSER_BIN:-google-chrome}"
 if [[ -n "$BROWSER_BIN" ]]; then
   CHROME_TEMPLATE_ARGS+=(--browser-path "$BROWSER_BIN")
 fi
-run_awl profile template "${CHROME_TEMPLATE_ARGS[@]}" > "$SMOKE_DIR/restricted-chrome-template.json"
-assert_json '.id == "restricted-chrome-smoke" and .network.mode == "disabled" and .require_enforced_policy == true and (.description | contains("--no-sandbox")) and .startup_apps[0].command[0] == $browser and (.startup_apps[0].command | index("--no-sandbox"))' "$SMOKE_DIR/restricted-chrome-template.json" --arg browser "$EXPECTED_BROWSER_BIN"
-run_awl profile validate --json "$SMOKE_DIR/restricted-chrome-template.json" > "$SMOKE_DIR/restricted-chrome-template-validate.json"
-assert_json '.ok == true and .profile.id == "restricted-chrome-smoke" and .check.applied_policy.enforcement.network.enforced == true' "$SMOKE_DIR/restricted-chrome-template-validate.json"
+run_awl profile template "${CHROME_TEMPLATE_ARGS[@]}" > "$SMOKE_DIR/chrome-template.json"
+assert_json '.id == "chrome-smoke" and (has("network") | not) and (has("mounts") | not) and (has("require_enforced_policy") | not) and .startup_apps[0].name == "chrome" and .startup_apps[0].command[0] == $browser and (.startup_apps[0].command | index("--user-data-dir=/tmp/agent-workspace-chrome")) and (.startup_apps[0].command | index("--no-sandbox") | not)' "$SMOKE_DIR/chrome-template.json" --arg browser "$EXPECTED_BROWSER_BIN"
+run_awl profile validate --json "$SMOKE_DIR/chrome-template.json" > "$SMOKE_DIR/chrome-template-validate.json"
+assert_json '.ok == true and .profile.id == "chrome-smoke" and ((.check.warnings // []) | length) == 0' "$SMOKE_DIR/chrome-template-validate.json"
 BROWSER_SESSION_DATA="$SMOKE_DIR/browser-session-data"
 mkdir -p "$BROWSER_SESSION_DATA"
 BROWSER_SESSION_ARGS=(browser-session --id browser-session-smoke --user-data-dir "$BROWSER_SESSION_DATA")
@@ -214,9 +232,9 @@ if [[ -n "$BROWSER_BIN" ]]; then
   BROWSER_SESSION_ARGS+=(--browser-path "$BROWSER_BIN")
 fi
 run_awl profile template "${BROWSER_SESSION_ARGS[@]}" > "$SMOKE_DIR/browser-session-template.json"
-assert_json '.id == "browser-session-smoke" and .network.mode == "inherit_host" and .require_enforced_policy == true and (.description | contains("explicit user approval")) and .mounts[0].workspace_path == "/workspace/browser-user-data" and .mounts[0].mode == "read_write" and .startup_apps[0].command[0] == $browser and (.startup_apps[0].command | index("--no-sandbox")) and (.startup_apps[0].command | index("--user-data-dir=/workspace/browser-user-data"))' "$SMOKE_DIR/browser-session-template.json" --arg browser "$EXPECTED_BROWSER_BIN"
+assert_json '.id == "browser-session-smoke" and (has("network") | not) and (has("mounts") | not) and (has("require_enforced_policy") | not) and .startup_apps[0].name == "browser-session" and .startup_apps[0].command[0] == $browser and (.startup_apps[0].command | index("--no-sandbox") | not) and (.startup_apps[0].command | index("--user-data-dir=" + $data))' "$SMOKE_DIR/browser-session-template.json" --arg browser "$EXPECTED_BROWSER_BIN" --arg data "$BROWSER_SESSION_DATA"
 run_awl profile validate --json "$SMOKE_DIR/browser-session-template.json" > "$SMOKE_DIR/browser-session-template-validate.json"
-assert_json '.ok == true and .profile.id == "browser-session-smoke" and .check.applied_policy.enforcement.mounts.enforced == true and .check.applied_policy.enforcement.network.state == "not_requested"' "$SMOKE_DIR/browser-session-template-validate.json"
+assert_json '.ok == true and .profile.id == "browser-session-smoke" and ((.check.warnings // []) | length) == 0' "$SMOKE_DIR/browser-session-template-validate.json"
 if [[ -n "$BROWSER_BIN" ]]; then
   run_awl profile import --json "$SMOKE_DIR/browser-session-template.json" > "$SMOKE_DIR/browser-session-import.json"
   assert_json '.created == true and .saved == true' "$SMOKE_DIR/browser-session-import.json"
@@ -225,12 +243,12 @@ if [[ -n "$BROWSER_BIN" ]]; then
   run_awl workspace open-profile --ack-hidden-workspace --profile browser-session-smoke --id "$BROWSER_SESSION_ID" --purpose "Browser session smoke" --startup-wait-window --startup-screenshot-window --startup-window-timeout-ms 20000 > "$SMOKE_DIR/browser-session-open.json"
   assert_json '.ready == true and .startup_launched == true and .startup.launched[0].ok == true and (.startup.launched[0].screenshot.bytes > 0) and .startup.launched[0].apps[0].profile_id == "browser-session-smoke"' "$SMOKE_DIR/browser-session-open.json"
   run_awl workspace observe --id "$BROWSER_SESSION_ID" --screenshot --events --events-tail 20 > "$SMOKE_DIR/browser-session-observe.json"
-  assert_json '(.screenshot.bytes > 0) and (.active_window.title | length > 0) and (.apps[] | select(.name == "browser-session-no-sandbox" and .running == true and .profile_id == "browser-session-smoke")) and (.events | length > 0)' "$SMOKE_DIR/browser-session-observe.json"
-  run_awl workspace run --id "$BROWSER_SESSION_ID" --name browser-session-mount-probe --timeout-ms 8000 --tail-bytes 4000 -- bash -lc 'printf browser-session-write-ok > /workspace/browser-user-data/session-write.txt' > "$SMOKE_DIR/browser-session-mount-probe.json"
-  assert_json '.succeeded == true and .launch.apps[0].mount_isolation == "bubblewrap_mount_namespace"' "$SMOKE_DIR/browser-session-mount-probe.json"
+  assert_json '(.screenshot.bytes > 0) and (.active_window.title | length > 0) and (.apps[] | select(.name == "browser-session" and .running == true and .profile_id == "browser-session-smoke")) and (.events | length > 0)' "$SMOKE_DIR/browser-session-observe.json"
+  run_awl workspace run --id "$BROWSER_SESSION_ID" --name browser-session-write-probe --timeout-ms 8000 --tail-bytes 4000 -- bash -lc 'printf browser-session-write-ok > "$1/session-write.txt"' _ "$BROWSER_SESSION_DATA" > "$SMOKE_DIR/browser-session-write-probe.json"
+  assert_json '.succeeded == true' "$SMOKE_DIR/browser-session-write-probe.json"
   grep -q '^browser-session-write-ok$' "$BROWSER_SESSION_DATA/session-write.txt"
   run_awl workspace stop --id "$BROWSER_SESSION_ID" > "$SMOKE_DIR/browser-session-stop.json"
-  assert_json '.ok == true and (.apps[] | select(.name == "browser-session-no-sandbox" and .running == false))' "$SMOKE_DIR/browser-session-stop.json"
+  assert_json '.ok == true and (.apps[] | select(.name == "browser-session" and .running == false))' "$SMOKE_DIR/browser-session-stop.json"
   run_awl profile delete browser-session-smoke > "$SMOKE_DIR/browser-session-delete.json"
   assert_json '.deleted == true and .profile.id == "browser-session-smoke"' "$SMOKE_DIR/browser-session-delete.json"
 else
@@ -253,6 +271,9 @@ run_awl workspace open-profile --dry-run --profile open-preview --id "$OPEN_ID" 
 assert_json '.would_open == false and .approval.missing_acknowledgements[0].id == "hidden_workspace"' "$SMOKE_DIR/open-noack.json"
 run_awl workspace open-profile --dry-run --ack-hidden-workspace --profile open-preview --id "$OPEN_ID" --setup --startup-wait-window > "$SMOKE_DIR/open-ack.json"
 assert_json '.would_open == true and .setup.command_count == 1 and .startup.app_count == 1 and .approval.approved == true' "$SMOKE_DIR/open-ack.json"
+# Removed in 0.6.0; still accepted so older callers keep working.
+run_awl workspace open-profile --dry-run --ack-hidden-workspace --ack-unenforced-policy --profile open-preview --id "$OPEN_ID" > "$SMOKE_DIR/open-ack-legacy.json"
+assert_json '.would_open == true and .approval.approved == true' "$SMOKE_DIR/open-ack-legacy.json"
 test ! -d "$RUNTIME_DIR/agent-workspace-linux/$OPEN_ID"
 
 echo "== open-profile setup and startup =="
@@ -294,168 +315,68 @@ assert_json '.ok == true and .status.ready == false' "$SMOKE_DIR/open-real-stop.
 run_awl workspace logs --id "$OPEN_REAL_ID" --stream stdout --tail-bytes 2000 "$OPEN_REAL_SETUP_APP_ID" > "$SMOKE_DIR/open-real-setup-log.json"
 assert_json '.ok == true and .message == "workspace app log read from saved manifest" and (.app_log.content | contains("setup-log-smoke"))' "$SMOKE_DIR/open-real-setup-log.json"
 
-echo "== local-only workspace =="
-LOCAL_PROFILE="$SMOKE_DIR/local-profile.json"
-jq -n '{
-  id: "local-only",
-  network: {mode:"local_only", allow_hosts:["localhost:3000", "127.0.0.1:5173"]}
-}' > "$LOCAL_PROFILE"
-run_awl profile import --json "$LOCAL_PROFILE" > /dev/null
-LOCAL_ID="local-only-smoke-$$"
-WORKSPACE_IDS+=("$LOCAL_ID")
-run_awl workspace start --ack-hidden-workspace --profile local-only --id "$LOCAL_ID" --purpose "Integration smoke" > "$SMOKE_DIR/local-start.json"
-run_awl workspace status --id "$LOCAL_ID" > "$SMOKE_DIR/local-status.json"
-assert_json '.applied_policy.enforcement.network.enforced == true and .applied_policy.enforcement.network.backend == "bubblewrap_loopback_only" and .user_acknowledged_unenforced_policy == false' "$SMOKE_DIR/local-status.json"
-SESSION_ID="$(jq -r '.session_id' "$SMOKE_DIR/local-status.json")"
+echo "== run workspace =="
+RUN_ID="run-smoke-$$"
+WORKSPACE_IDS+=("$RUN_ID")
+run_awl workspace start --ack-hidden-workspace --id "$RUN_ID" --purpose "Integration smoke" > "$SMOKE_DIR/run-start.json"
+run_awl workspace status --id "$RUN_ID" > "$SMOKE_DIR/run-status.json"
+assert_json '(has("applied_policy") | not) and (has("user_acknowledged_unenforced_policy") | not)' "$SMOKE_DIR/run-status.json"
+SESSION_ID="$(jq -r '.session_id' "$SMOKE_DIR/run-status.json")"
 
-NETWORK_PROBE="$SMOKE_DIR/network_probe.py"
-cat > "$NETWORK_PROBE" <<'PY'
-import socket
-import threading
-
-s = socket.socket()
-s.bind(("127.0.0.1", 0))
-s.listen(1)
-port = s.getsockname()[1]
-
-def serve():
-    conn, _ = s.accept()
-    conn.recv(16)
-    conn.sendall(b"loopback-ok")
-    conn.close()
-
-t = threading.Thread(target=serve)
-t.start()
-c = socket.create_connection(("127.0.0.1", port), timeout=2)
-c.sendall(b"ping")
-print(c.recv(64).decode())
-c.close()
-t.join(2)
-
-try:
-    socket.create_connection(("1.1.1.1", 80), timeout=2)
-except OSError:
-    print("external-blocked")
-else:
-    raise SystemExit("external network unexpectedly reachable")
-PY
-run_awl workspace run --id "$LOCAL_ID" --timeout-ms 8000 --tail-bytes 4000 -- python3 "$NETWORK_PROBE" > "$SMOKE_DIR/local-run.json"
-assert_json '.succeeded == true and (.stdout.content | contains("loopback-ok")) and (.stdout.content | contains("external-blocked")) and .launch.apps[0].network_isolation == "bubblewrap_loopback_only"' "$SMOKE_DIR/local-run.json"
-assert_json '(.launch.status.apps | length) == 0 and (.wait.status.apps | length) == 0 and (.launch.apps | length) == 1 and (.wait.apps | length) == 1' "$SMOKE_DIR/local-run.json"
-run_awl workspace env --id "$LOCAL_ID" > "$SMOKE_DIR/local-env.json"
-assert_json '.environment.session_id == $sid and (.environment.variables[] | select(.name == "AGENT_WORKSPACE_SESSION_ID" and .value == $sid))' "$SMOKE_DIR/local-env.json" --arg sid "$SESSION_ID"
-run_awl workspace events --id "$LOCAL_ID" --tail 20 > "$SMOKE_DIR/local-events.json"
-assert_json '.events[] | select(.kind == "workspace_start" and .detail.session_id == $sid)' "$SMOKE_DIR/local-events.json" --arg sid "$SESSION_ID"
-run_awl workspace stop --id "$LOCAL_ID" > "$SMOKE_DIR/local-stop.json"
-assert_json '.ok == true and .status.ready == false' "$SMOKE_DIR/local-stop.json"
+# Workspace apps run as the user on the workspace session bus.
+run_awl workspace run --id "$RUN_ID" --timeout-ms 8000 --tail-bytes 4000 -- bash -lc 'set -eu; test -S "$AGENT_WORKSPACE_RUNTIME_DIR/session-bus"; test "$DBUS_SESSION_BUS_ADDRESS" = "unix:path=$AGENT_WORKSPACE_RUNTIME_DIR/session-bus"; printf user-file-ok > "$1/run-write.txt"; echo session-bus-ok' _ "$SMOKE_DIR" > "$SMOKE_DIR/run-run.json"
+assert_json '.succeeded == true and (.stdout.content | contains("session-bus-ok")) and (.launch.apps[0] | has("network_isolation") | not) and (.launch.apps[0] | has("mount_isolation") | not)' "$SMOKE_DIR/run-run.json"
+assert_json '(.launch.status.apps | length) == 0 and (.wait.status.apps | length) == 0 and (.launch.apps | length) == 1 and (.wait.apps | length) == 1' "$SMOKE_DIR/run-run.json"
+test "$(cat "$SMOKE_DIR/run-write.txt")" = "user-file-ok"
+run_awl workspace env --id "$RUN_ID" > "$SMOKE_DIR/run-env.json"
+assert_json '.environment.session_id == $sid and (.environment.variables[] | select(.name == "AGENT_WORKSPACE_SESSION_ID" and .value == $sid))' "$SMOKE_DIR/run-env.json" --arg sid "$SESSION_ID"
+run_awl workspace events --id "$RUN_ID" --tail 20 > "$SMOKE_DIR/run-events.json"
+assert_json '.events[] | select(.kind == "workspace_start" and .detail.session_id == $sid)' "$SMOKE_DIR/run-events.json" --arg sid "$SESSION_ID"
+run_awl workspace stop --id "$RUN_ID" > "$SMOKE_DIR/run-stop.json"
+assert_json '.ok == true and .status.ready == false' "$SMOKE_DIR/run-stop.json"
 WORKSPACE_IDS=()
-run_awl workspace manifest --id "$LOCAL_ID" > "$SMOKE_DIR/local-stopped-manifest.json"
-assert_json '.manifest.session_id == $sid and .manifest.ready == false and .manifest.stopped_at_unix != null' "$SMOKE_DIR/local-stopped-manifest.json" --arg sid "$SESSION_ID"
+run_awl workspace manifest --id "$RUN_ID" > "$SMOKE_DIR/run-stopped-manifest.json"
+assert_json '.manifest.session_id == $sid and .manifest.ready == false and .manifest.stopped_at_unix != null' "$SMOKE_DIR/run-stopped-manifest.json" --arg sid "$SESSION_ID"
 
-echo "== disabled-network workspace =="
-DISABLED_PROFILE="$SMOKE_DIR/disabled-profile.json"
-jq -n '{
-  id: "disabled-network",
-  network: {mode:"disabled"},
-  require_enforced_policy: true
-}' > "$DISABLED_PROFILE"
-run_awl profile import --json "$DISABLED_PROFILE" > /dev/null
-DISABLED_ID="disabled-network-smoke-$$"
-WORKSPACE_IDS+=("$DISABLED_ID")
-run_awl workspace start --ack-hidden-workspace --profile disabled-network --id "$DISABLED_ID" --purpose "Disabled network smoke" > "$SMOKE_DIR/disabled-start.json"
-run_awl workspace status --id "$DISABLED_ID" > "$SMOKE_DIR/disabled-status.json"
-assert_json '.applied_policy.enforcement.network.enforced == true and .applied_policy.enforcement.network.backend == "bubblewrap_unshare_net" and .user_acknowledged_unenforced_policy == false' "$SMOKE_DIR/disabled-status.json"
-DISABLED_PROBE="$SMOKE_DIR/disabled_network_probe.py"
-cat > "$DISABLED_PROBE" <<'PY'
-import socket
-
-try:
-    socket.create_connection(("1.1.1.1", 80), timeout=2)
-except OSError:
-    print("direct-blocked")
-else:
-    raise SystemExit("direct network unexpectedly reachable")
-
-try:
-    socket.getaddrinfo("example.com", 80)
-except OSError:
-    print("dns-blocked")
-else:
-    raise SystemExit("dns unexpectedly resolved")
-PY
-run_awl workspace run --id "$DISABLED_ID" --timeout-ms 8000 --tail-bytes 4000 -- python3 "$DISABLED_PROBE" > "$SMOKE_DIR/disabled-run.json"
-assert_json '.succeeded == true and (.stdout.content | contains("direct-blocked")) and (.stdout.content | contains("dns-blocked")) and .launch.apps[0].network_isolation == "bubblewrap_unshare_net"' "$SMOKE_DIR/disabled-run.json"
-assert_json '(.launch.status.apps | length) == 0 and (.wait.status.apps | length) == 0 and (.launch.apps | length) == 1 and (.wait.apps | length) == 1' "$SMOKE_DIR/disabled-run.json"
-if [[ -n "$BROWSER_BIN" ]]; then
-  run_awl workspace launch --id "$DISABLED_ID" --name disabled-network-browser --wait-window --screenshot-window --window-timeout-ms 20000 -- "$BROWSER_BIN" "--user-data-dir=$SMOKE_DIR/disabled-browser-profile" --no-sandbox --disable-dev-shm-usage --no-first-run --no-default-browser-check --new-window https://example.com > "$SMOKE_DIR/disabled-browser-launch.json"
-  assert_json '.ok == true and (.screenshot.bytes > 0) and .apps[0].network_isolation == "bubblewrap_unshare_net" and .windows[0].wm_class == "Google-chrome"' "$SMOKE_DIR/disabled-browser-launch.json"
-  DISABLED_BROWSER_APP_ID="$(jq -r '.apps[0].id' "$SMOKE_DIR/disabled-browser-launch.json")"
-  run_awl workspace wait-window --id "$DISABLED_ID" --app "$DISABLED_BROWSER_APP_ID" --title example.com --timeout-ms 10000 > "$SMOKE_DIR/disabled-browser-wait.json"
-  assert_json '.ok == true and (.windows[0].title | contains("example.com"))' "$SMOKE_DIR/disabled-browser-wait.json"
-else
-  echo "== disabled-network browser smoke skipped: Chrome/Chromium not found =="
-fi
-run_awl workspace stop --id "$DISABLED_ID" > /dev/null
-
-echo "== mount enforcement workspace =="
-MOUNT_RW_HOST="$SMOKE_DIR/mount-rw"
-MOUNT_RO_HOST="$SMOKE_DIR/mount-ro"
-mkdir -p "$MOUNT_RW_HOST" "$MOUNT_RO_HOST"
-printf 'seed\n' > "$MOUNT_RO_HOST/seed.txt"
-MOUNT_PROFILE="$SMOKE_DIR/mount-profile.json"
-jq -n --arg rw "$MOUNT_RW_HOST" --arg ro "$MOUNT_RO_HOST" '{
-  id: "mount-policy",
-  cwd: "/workspace/rw",
-  require_enforced_policy: true,
-  mounts: [
-    {host_path: $rw, workspace_path: "/workspace/rw", mode: "read_write"},
-    {host_path: $ro, workspace_path: "/workspace/ro", mode: "read_only"}
-  ]
-}' > "$MOUNT_PROFILE"
-run_awl profile import --json "$MOUNT_PROFILE" > /dev/null
-MOUNT_ID="mount-policy-smoke-$$"
-WORKSPACE_IDS+=("$MOUNT_ID")
-run_awl workspace start --ack-hidden-workspace --profile mount-policy --id "$MOUNT_ID" --purpose "Mount policy smoke" > "$SMOKE_DIR/mount-start.json"
-run_awl workspace status --id "$MOUNT_ID" > "$SMOKE_DIR/mount-status.json"
-assert_json '.applied_policy.enforcement.mounts.enforced == true and .applied_policy.enforcement.mounts.backend == "bubblewrap_mount_namespace" and .user_acknowledged_unenforced_policy == false' "$SMOKE_DIR/mount-status.json"
-run_awl workspace run --id "$MOUNT_ID" --timeout-ms 8000 --tail-bytes 4000 -- bash -lc 'set -eu; test "$(cat /workspace/ro/seed.txt)" = "seed"; echo rw-ok > /workspace/rw/out.txt; if sh -c "echo blocked > /workspace/ro/nope.txt" 2>/tmp/ro-write.err; then echo ro-write-unexpected; exit 7; else echo ro-blocked; fi' > "$SMOKE_DIR/mount-run.json"
-assert_json '.succeeded == true and (.stdout.content | contains("ro-blocked")) and .launch.apps[0].mount_isolation == "bubblewrap_mount_namespace"' "$SMOKE_DIR/mount-run.json"
-grep -q '^rw-ok$' "$MOUNT_RW_HOST/out.txt"
-test ! -e "$MOUNT_RO_HOST/nope.txt"
 if [[ -n "$GUI_EDITOR_BIN" ]]; then
-  echo "== mounted GUI editor workspace =="
-  printf 'seed editor\n' > "$MOUNT_RW_HOST/editor-note.txt"
-  run_awl workspace launch --id "$MOUNT_ID" --name mounted-gui-editor --env XDG_CACHE_HOME=/tmp/agent-workspace-cache --wait-window --screenshot-window --window-timeout-ms 20000 -- "$GUI_EDITOR_BIN" /workspace/rw/editor-note.txt > "$SMOKE_DIR/mount-editor-launch.json"
-  assert_json '.ok == true and (.screenshot.bytes > 0) and ((.windows | length) > 0) and .apps[0].mount_isolation == "bubblewrap_mount_namespace"' "$SMOKE_DIR/mount-editor-launch.json"
-  MOUNT_EDITOR_APP_ID="$(jq -r '.apps[0].id' "$SMOKE_DIR/mount-editor-launch.json")"
-  MOUNT_EDITOR_TEXT=$'edited-from-integration-smoke\nmounted-editor-save-ok\n'
+  echo "== GUI editor workspace =="
+  EDITOR_DIR="$SMOKE_DIR/editor"
+  mkdir -p "$EDITOR_DIR"
+  printf 'seed editor\n' > "$EDITOR_DIR/editor-note.txt"
+  EDITOR_ID="editor-smoke-$$"
+  WORKSPACE_IDS+=("$EDITOR_ID")
+  run_awl workspace start --ack-hidden-workspace --id "$EDITOR_ID" --purpose "GUI editor smoke" > "$SMOKE_DIR/editor-start.json"
+  run_awl workspace launch --id "$EDITOR_ID" --name gui-editor --env XDG_CACHE_HOME=/tmp/agent-workspace-cache --wait-window --screenshot-window --window-timeout-ms 20000 -- "$GUI_EDITOR_BIN" "$EDITOR_DIR/editor-note.txt" > "$SMOKE_DIR/editor-launch.json"
+  assert_json '.ok == true and (.screenshot.bytes > 0) and ((.windows | length) > 0)' "$SMOKE_DIR/editor-launch.json"
+  EDITOR_APP_ID="$(jq -r '.apps[0].id' "$SMOKE_DIR/editor-launch.json")"
+  EDITOR_TEXT=$'edited-from-integration-smoke\neditor-save-ok\n'
   for _ in {1..30}; do
-    run_awl workspace screenshot-window --id "$MOUNT_ID" --app "$MOUNT_EDITOR_APP_ID" --output "$SMOKE_DIR/mount-editor-ready.png" --timeout-ms 5000 > "$SMOKE_DIR/mount-editor-ready-screenshot.json"
-    if jq -e '.screenshot.bytes > 1000' "$SMOKE_DIR/mount-editor-ready-screenshot.json" >/dev/null; then
+    run_awl workspace screenshot-window --id "$EDITOR_ID" --app "$EDITOR_APP_ID" --output "$SMOKE_DIR/editor-ready.png" --timeout-ms 5000 > "$SMOKE_DIR/editor-ready-screenshot.json"
+    if jq -e '.screenshot.bytes > 1000' "$SMOKE_DIR/editor-ready-screenshot.json" >/dev/null; then
       break
     fi
     sleep 0.2
   done
-  assert_json '.screenshot.bytes > 1000 and .screenshot.path == $path' "$SMOKE_DIR/mount-editor-ready-screenshot.json" --arg path "$SMOKE_DIR/mount-editor-ready.png"
-  run_awl workspace focus-window --id "$MOUNT_ID" --app "$MOUNT_EDITOR_APP_ID" --timeout-ms 5000 > "$SMOKE_DIR/mount-editor-focus.json"
-  run_awl workspace click-window --id "$MOUNT_ID" --app "$MOUNT_EDITOR_APP_ID" --timeout-ms 5000 120 150 > "$SMOKE_DIR/mount-editor-click-body.json"
-  run_awl workspace key-window --id "$MOUNT_ID" --app "$MOUNT_EDITOR_APP_ID" --timeout-ms 5000 ctrl+a > "$SMOKE_DIR/mount-editor-select.json"
-  run_awl workspace paste-window --id "$MOUNT_ID" --app "$MOUNT_EDITOR_APP_ID" --timeout-ms 5000 "$MOUNT_EDITOR_TEXT" > "$SMOKE_DIR/mount-editor-paste.json"
-  run_awl workspace key-window --id "$MOUNT_ID" --app "$MOUNT_EDITOR_APP_ID" --timeout-ms 5000 ctrl+s > "$SMOKE_DIR/mount-editor-save.json"
+  assert_json '.screenshot.bytes > 1000 and .screenshot.path == $path' "$SMOKE_DIR/editor-ready-screenshot.json" --arg path "$SMOKE_DIR/editor-ready.png"
+  run_awl workspace focus-window --id "$EDITOR_ID" --app "$EDITOR_APP_ID" --timeout-ms 5000 > "$SMOKE_DIR/editor-focus.json"
+  run_awl workspace click-window --id "$EDITOR_ID" --app "$EDITOR_APP_ID" --timeout-ms 5000 120 150 > "$SMOKE_DIR/editor-click-body.json"
+  run_awl workspace key-window --id "$EDITOR_ID" --app "$EDITOR_APP_ID" --timeout-ms 5000 ctrl+a > "$SMOKE_DIR/editor-select.json"
+  run_awl workspace paste-window --id "$EDITOR_ID" --app "$EDITOR_APP_ID" --timeout-ms 5000 "$EDITOR_TEXT" > "$SMOKE_DIR/editor-paste.json"
+  run_awl workspace key-window --id "$EDITOR_ID" --app "$EDITOR_APP_ID" --timeout-ms 5000 ctrl+s > "$SMOKE_DIR/editor-save.json"
   for _ in {1..30}; do
-    if grep -q '^mounted-editor-save-ok$' "$MOUNT_RW_HOST/editor-note.txt"; then
+    if grep -q '^editor-save-ok$' "$EDITOR_DIR/editor-note.txt"; then
       break
     fi
     sleep 0.2
   done
-  grep -q '^edited-from-integration-smoke$' "$MOUNT_RW_HOST/editor-note.txt"
-  grep -q '^mounted-editor-save-ok$' "$MOUNT_RW_HOST/editor-note.txt"
-  run_awl workspace screenshot-window --id "$MOUNT_ID" --app "$MOUNT_EDITOR_APP_ID" --output "$SMOKE_DIR/mount-editor.png" --timeout-ms 5000 > "$SMOKE_DIR/mount-editor-screenshot.json"
-  assert_json '.screenshot.bytes > 0 and .screenshot.path == $path' "$SMOKE_DIR/mount-editor-screenshot.json" --arg path "$SMOKE_DIR/mount-editor.png"
+  grep -q '^edited-from-integration-smoke$' "$EDITOR_DIR/editor-note.txt"
+  grep -q '^editor-save-ok$' "$EDITOR_DIR/editor-note.txt"
+  run_awl workspace screenshot-window --id "$EDITOR_ID" --app "$EDITOR_APP_ID" --output "$SMOKE_DIR/editor.png" --timeout-ms 5000 > "$SMOKE_DIR/editor-screenshot.json"
+  assert_json '.screenshot.bytes > 0 and .screenshot.path == $path' "$SMOKE_DIR/editor-screenshot.json" --arg path "$SMOKE_DIR/editor.png"
+  run_awl workspace stop --id "$EDITOR_ID" > /dev/null
 else
-  echo "== mounted GUI editor workspace skipped: no supported editor found =="
+  echo "== GUI editor workspace skipped: no supported editor found =="
 fi
-run_awl workspace stop --id "$MOUNT_ID" > /dev/null
 
 echo "== window, screenshot, input, clipboard, and artifacts =="
 GUI_ID="gui-smoke-$$"

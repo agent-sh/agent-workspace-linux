@@ -51,5 +51,5 @@ RUN apt-get update \
 
 RUN apt-get update && apt-get install -y --no-install-recommends xterm tmux libkscreen-bin && rm -rf /var/lib/apt/lists/*
 
-COPY hyprland_smoke.py runtime_isolation_smoke.py kwin_mcp.py kwin_qt_fixture.py sandbox_wayland_globals_smoke.py wayland_globals_probe.py /opt/hyprland-probe/
+COPY hyprland_smoke.py kwin_mcp.py kwin_qt_fixture.py /opt/hyprland-probe/
 ENTRYPOINT ["python3", "/opt/hyprland-probe/hyprland_smoke.py"]

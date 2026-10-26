@@ -15,8 +15,8 @@ const failureModes = [
   "approved path has Singleton* or DevToolsActivePort lock markers from a running browser",
   "approved path has invalid Local State JSON",
   "Chrome/Chromium binary or built agent-workspace-linux binary is missing",
-  "profile copy fails or the copied profile cannot be mounted",
-  "workspace/browser startup fails because Xvfb, window manager, bubblewrap, or Chrome fails",
+  "profile copy fails",
+  "workspace/browser startup fails because Xvfb, the window manager, or Chrome fails",
   "workspace browser does not expose a loopback DevTools endpoint",
   "Slack/GitHub redirects to sign-in or the logged-in page heuristic does not match",
 ];
@@ -537,9 +537,8 @@ async function main() {
     );
     assert(template.profile?.id === profileId, `browser-session template failed: ${JSON.stringify(template)}`);
     assert(
-      template.profile?.mounts?.[0]?.host_path === copyDir &&
-        template.profile?.mounts?.[0]?.workspace_path === "/workspace/browser-user-data",
-      `browser-session template should mount the disposable copy: ${JSON.stringify(template.profile?.mounts)}`,
+      template.profile?.startup_apps?.[0]?.command?.includes(`--user-data-dir=${copyDir}`),
+      `browser-session template should start Chrome on the disposable copy: ${JSON.stringify(template.profile?.startup_apps)}`,
     );
 
     const put = await mcp.callTool("profile_put", { profile: template.profile }, 8000);
@@ -563,7 +562,7 @@ async function main() {
     assert(opened.ok === true && opened.open?.ready === true, `workspace_open_profile failed: ${JSON.stringify(opened)}`);
 
     const startupApps = opened.open?.startup?.launched?.flatMap((entry) => entry.apps || []) || [];
-    const browserApp = startupApps.find((app) => app.name === "browser-session-no-sandbox") || startupApps[0];
+    const browserApp = startupApps.find((app) => app.name === "browser-session") || startupApps[0];
     assert(browserApp?.id, `browser-session startup did not return a browser app: ${JSON.stringify(opened.open?.startup)}`);
 
     const targets = await mcp.callTool(

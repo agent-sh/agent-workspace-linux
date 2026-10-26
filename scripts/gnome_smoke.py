@@ -221,31 +221,24 @@ for scale in (1, 1.5):
             wait(lambda: process_stopped(status['window_manager_pid']), 'compositor shutdown')
             wait(lambda: all(process_stopped(pid) for pid in terminal_pids), 'managed terminal cleanup')
             assert not (runtime / 'workspace-wayland').exists(), 'stale Wayland socket'
-            for name in ('session-bus','client-bus','system-bus','at-spi/bus'):
+            for name in ('session-bus','system-bus','at-spi/bus'):
                 assert not (runtime / name).exists(), f'stale private bus {name}'
             assert not Path('/tmp/.X11-unix/X' + status['display'][1:]).exists(), 'stale XWayland socket'
         else:
             subprocess.run([BIN, 'workspace', 'cleanup', '--id', id], capture_output=True, timeout=10)
 
-# The daemon must retain enforced mount/network restrictions for native and
-# legacy XWayland clients, while its own bus cannot activate arbitrary services.
+# Native and legacy XWayland clients on one workspace: input, PRIMARY,
+# capture without focus changes, and the workspace session bus.
 project = Path('/tmp/gnome-project')
 project.mkdir()
-profile = Path('/tmp/gnome-profile.json')
-profile.write_text(json.dumps({'id': 'gnome-restricted', 'session': {'backend': 'gnome'},
-    'cwd': '/workspace/project', 'require_enforced_policy': True, 'network': {'mode': 'disabled'},
-    'mounts': [{'host_path': str(project), 'workspace_path': '/workspace/project', 'mode': 'read_write'}]}))
-command('profile', 'import', '--json', profile)
-id = 'gnome-restricted'
+id = 'gnome-apps'
 try:
-    ws(id, 'start', '--profile', id, '--ack-hidden-workspace')
-    native = ws(id, 'launch', '--wait-window', '--window-timeout-ms', 10000, '--', 'python3', '/opt/gnome-probe/gnome_fixture.py', '/workspace/project/native.json')
-    wait(lambda: (project / 'native.json').exists(), 'restricted native client')
-    app = native['apps'][0]
-    assert app['mount_isolation'] == 'bubblewrap_mount_namespace' and app['network_isolation'] == 'bubblewrap_unshare_net', app
+    ws(id, 'start', '--session', 'gnome', '--ack-hidden-workspace')
+    native = ws(id, 'launch', '--wait-window', '--window-timeout-ms', 10000, '--', 'python3', '/opt/gnome-probe/gnome_fixture.py', str(project / 'native.json'))
+    wait(lambda: (project / 'native.json').exists(), 'native client')
     legacy_fixture = ws(id, 'launch', '--wait-window', '--window-timeout-ms', 10000, '--',
         'env', 'GDK_BACKEND=x11', 'GTK_IM_MODULE=simple', 'GNOME_FIXTURE_APP_ID=org.agent_sh.GnomeLegacyFixture',
-        'python3', '/opt/gnome-probe/gnome_fixture.py', '/workspace/project/x11.json')
+        'python3', '/opt/gnome-probe/gnome_fixture.py', str(project/'x11.json'))
     legacy_id = legacy_fixture['windows'][0]['id']
     ws(id, 'focus-window', legacy_id)
     ws(id, 'type', 'Legacy café שלום 日本語')
@@ -259,7 +252,7 @@ try:
     ws(id,'type','א')
     wait(lambda: json.loads((project/'x11.json').read_text())['text']=='Rאeplacement 😀','GTK caret insertion')
     qt=ws(id,'launch','--wait-window','--window-timeout-ms',10000,'--','env','QT_QPA_PLATFORM=xcb','QT_IM_MODULE=compose',
-        'python3','/opt/gnome-probe/gnome_qt_fixture.py','/workspace/project/qt.json')
+        'python3','/opt/gnome-probe/gnome_qt_fixture.py',str(project/'qt.json'))
     ws(id,'focus-window',qt['windows'][0]['id'])
     ws(id,'type','Qt café שלום 日本語')
     wait(lambda:(project/'qt.json').exists() and json.loads((project/'qt.json').read_text())['text']=='Qt café שלום 日本語','cold Qt Unicode insertion')
@@ -272,16 +265,17 @@ try:
     wait(lambda:json.loads((project/'qt.json').read_text())['text']=='Rאeplacement 😀','Qt caret insertion')
     entry=ws(id,'launch','--wait-window','--window-timeout-ms',10000,'--','env','GDK_BACKEND=x11','GTK_IM_MODULE=simple',
         'GNOME_FIXTURE_ENTRY_ROLE=search-box','GNOME_FIXTURE_APP_ID=org.agent_sh.GnomeEntryFixture',
-        'python3','/opt/gnome-probe/gnome_fixture.py','/workspace/project/entry.json')
+        'python3','/opt/gnome-probe/gnome_fixture.py',str(project/'entry.json'))
     ws(id,'focus-window',entry['windows'][0]['id'])
     wait(lambda:(project/'entry.json').exists() and json.loads((project/'entry.json').read_text())['role']=='search-box','entry-role fixture')
     ws(id,'type','Entry café שלום 😀')
     wait(lambda:json.loads((project/'entry.json').read_text())['text']=='Entry café שלום 😀','AT-SPI entry role insertion')
-    legacy = ws(id, 'launch', '--wait-window', '--window-timeout-ms', 10000, '--', 'xterm', '-e', 'sh', '-c', 'printf ready > /workspace/project/legacy; exec tail -f /dev/null')
+    legacy = ws(id, 'launch', '--wait-window', '--window-timeout-ms', 10000, '--', 'xterm', '-e', 'sh', '-c', 'printf %s "$DBUS_SESSION_BUS_ADDRESS" > "$1/legacy"; exec tail -f /dev/null', 'sh', str(project))
     assert legacy['windows'], legacy
-    wait(lambda: (project / 'legacy').exists(), 'restricted XWayland client')
+    wait(lambda: (project / 'legacy').exists() and (project / 'legacy').read_text(), 'XWayland client')
+    assert (project / 'legacy').read_text().endswith(f'/{id}/session-bus'), (project / 'legacy').read_text()
     terminal=ws(id,'launch','--wait-window','--window-timeout-ms',10000,'--','xterm','-e','python3','-c',
-        "import pathlib,time; pathlib.Path('/workspace/project/terminal.txt').write_text(input()); time.sleep(60)")
+        "import pathlib,sys,time; pathlib.Path(sys.argv[1]).write_text(input()); time.sleep(60)",str(project/'terminal.txt'))
     terminal_id = terminal['windows'][0]['id']
     ws(id,'focus-window',terminal_id)
     ws(id,'clipboard-set','CLIPBOARD SENTINEL')
@@ -289,16 +283,16 @@ try:
     wait(lambda:(project/'terminal.txt').exists() and (project/'terminal.txt').read_text()=='Terminal café שלום 日本語','xterm PRIMARY Unicode paste')
     assert ws(id,'clipboard-get')['clipboard']['content']=='CLIPBOARD SENTINEL'
     # Typed text must not stay readable in PRIMARY by other clients.
-    ws(id,'launch','--','env','GDK_BACKEND=x11','python3','/opt/gnome-probe/gnome_primary_reader.py','/workspace/project/primary.json')
+    ws(id,'launch','--','env','GDK_BACKEND=x11','python3','/opt/gnome-probe/gnome_primary_reader.py',str(project/'primary.json'))
     wait(lambda:(project/'primary.json').exists(),'PRIMARY reader')
     primary = json.loads((project/'primary.json').read_text())
-    (ARTIFACTS/'restricted-primary.json').write_text(json.dumps(primary))
+    (ARTIFACTS/'apps-primary.json').write_text(json.dumps(primary))
     assert not primary['text'], primary
     # Window capture must not change focus or stacking, minimized or not.
     order = [w['id'] for w in ws(id,'windows','--all')['windows']]
     assert ws(id,'active-window')['active_window']['id'] == terminal_id
     shot = ws(id,'screenshot-window','--window',qt['windows'][0]['id'])['screenshot']
-    shutil.copy2(shot['path'], ARTIFACTS/'restricted-qt-window.png')
+    shutil.copy2(shot['path'], ARTIFACTS/'apps-qt-window.png')
     assert Image.open(shot['path']).convert('RGB').getcolors(1) is None, 'blank window capture'
     assert ws(id,'active-window')['active_window']['id'] == terminal_id
     assert [w['id'] for w in ws(id,'windows','--all')['windows']] == order
@@ -316,7 +310,7 @@ try:
 finally:
     save_logs(Path(os.environ['XDG_RUNTIME_DIR']) / 'agent-workspace-linux' / id, id)
     for name in ('native','x11','qt','entry'):
-        if (project/f'{name}.json').exists(): (ARTIFACTS/f'restricted-{name}.json').write_text((project/f'{name}.json').read_text())
+        if (project/f'{name}.json').exists(): (ARTIFACTS/f'apps-{name}.json').write_text((project/f'{name}.json').read_text())
     ws(id, 'stop')
 
 # Spawn-time app ceiling remains effective after the originating MCP exits.
@@ -354,8 +348,4 @@ while True:
 os.kill(status['daemon_pid'], signal.SIGKILL)
 wait(lambda: all(process_stopped(pid) for pid in children), 'crash-owned process cleanup')
 command('workspace', 'cleanup', '--id', id)
-# Sandboxed apps must reach only the filtered Wayland socket.
-(Path.home()/".cache").mkdir(exist_ok=True)
-subprocess.run(["python3","/opt/gnome-probe/sandbox_wayland_globals_smoke.py","gnome"],
-               env=dict(os.environ,AGENT_WORKSPACE_BIN=BIN,SANDBOX_GLOBALS_ARTIFACTS=str(ARTIFACTS)),check=True,timeout=300)
 print('GNOME native acceptance passed', flush=True)

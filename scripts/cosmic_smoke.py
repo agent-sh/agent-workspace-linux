@@ -96,41 +96,14 @@ def check_compositor_log(path, output_captures, window_captures):
             "output_captures": output_captures, "window_captures": window_captures}
 
 
-# COSMIC hides these from clients with a security context (src/state.rs).
-PRIVILEGED_GLOBALS = {
-    "zcosmic_toplevel_info_v1", "zcosmic_toplevel_manager_v1", "zcosmic_workspace_manager_v2",
-    "ext_workspace_manager_v1", "ext_image_copy_capture_manager_v1",
-    "ext_output_image_capture_source_manager_v1", "ext_foreign_toplevel_image_capture_source_manager_v1",
-    "zcosmic_workspace_image_capture_source_manager_v1", "zwlr_output_manager_v1",
-    "zwlr_output_power_manager_v1", "zwp_virtual_keyboard_manager_v1", "zwp_input_method_manager_v2",
-    "zwlr_layer_shell_v1", "ext_session_lock_manager_v1", "cosmic_session_lock_layer_manager_v1",
-    "zcosmic_keyboard_layout_manager_v1", "ext_data_control_manager_v1", "zwlr_data_control_manager_v1",
-    "cosmic_a11y_manager_v1", "wp_security_context_manager_v1",
-}
 # Launched apps write what their own Wayland connection advertises.
-WAYLAND_PROBE = r'''import json,os,re,socket,subprocess,sys
+WAYLAND_PROBE = r'''import json,os,re,subprocess,sys
 info=subprocess.run(["wayland-info"],capture_output=True,text=True,timeout=10)
-main=socket.socket(socket.AF_UNIX)
-try:
-    main.connect(sys.argv[2]); reachable=True
-except OSError:
-    reachable=False
-finally:
-    main.close()
 open(sys.argv[1]+".staging","w").write(json.dumps({"returncode":info.returncode,"stderr":info.stderr[-500:],
-    "wayland_display":os.environ.get("WAYLAND_DISPLAY"),"main_socket_reachable":reachable,
+    "wayland_display":os.environ.get("WAYLAND_DISPLAY"),"dbus":os.environ.get("DBUS_SESSION_BUS_ADDRESS"),
     "globals":sorted(set(re.findall(r"interface: '([^']+)'",info.stdout)))}))
 os.replace(sys.argv[1]+".staging",sys.argv[1])
 '''
-
-
-def check_app_globals(result, label):
-    assert result["returncode"] == 0, (label, result)
-    globals_ = set(result["globals"])
-    exposed = sorted(globals_ & PRIVILEGED_GLOBALS)
-    assert not exposed, f"{label}: privileged COSMIC globals reach a launched app: {exposed}"
-    assert {"wl_compositor", "xdg_wm_base", "wl_seat"} <= globals_, (label, result)
-    assert result["wayland_display"] == "wayland-apps", (label, result)
 
 
 def capture_image(id):
@@ -166,7 +139,7 @@ for scale in (1, 1.5):
     note.write_text("")
     mcp = None
     runtime = Path(os.environ["XDG_RUNTIME_DIR"]) / "agent-workspace-linux" / id
-    # Standard service activation would execute this outside app namespaces.
+    # The workspace bus must not activate services from the standard directories.
     standard_services = runtime / "session-data/dbus-1/services"
     standard_services.mkdir(parents=True, exist_ok=True)
     marker = Path(f"/artifacts/scratch/forbidden-service-{id}")
@@ -202,8 +175,8 @@ for scale in (1, 1.5):
         env = workspace(id, "env")["environment"]["variables"]
         env = {entry["name"]: entry["value"] for entry in env}
         assert env["XDG_SESSION_TYPE"] == "wayland"
-        # Attached controllers (computer-use-linux) need the compositor bus;
-        # launched apps get client-bus instead (runtime_isolation_smoke.py).
+        # Attached controllers (computer-use-linux) and launched apps share the
+        # workspace session bus.
         assert env["DBUS_SESSION_BUS_ADDRESS"].endswith(f"/{id}/session-bus")
         assert env["WAYLAND_DISPLAY"].startswith("wayland-")
         assert env["QT_QPA_PLATFORM"] == "wayland"
@@ -217,19 +190,18 @@ for scale in (1, 1.5):
         assert authorized.returncode==0,authorized.stderr
         unauthorized=subprocess.run(["xdpyinfo"],env=dict(bus_env,XAUTHORITY=str(runtime/"absent-authority")),capture_output=True,timeout=5)
         assert unauthorized.returncode!=0,"XWayland accepted a client without the workspace cookie"
-        # Attached controllers and unsandboxed apps keep the compositor socket,
-        # like the control bus: they could open it by path anyway, and desktop
-        # services such as portals need capture. Sandboxed apps are checked below.
+        # Attached controllers and launched apps use the compositor socket and
+        # session bus; desktop services such as portals need capture.
         attached = subprocess.run(["wayland-info"], env=bus_env, capture_output=True, text=True, timeout=10)
         attached_globals = set(re.findall(r"interface: '([^']+)'", attached.stdout))
         assert {"zcosmic_toplevel_manager_v1", "ext_image_copy_capture_manager_v1"} <= attached_globals, attached
-        main_socket = runtime / env["WAYLAND_DISPLAY"]
         app_receipt = Path(f"/artifacts/scratch/{id}-app-globals.json")
-        workspace(id, "launch", "--", "python3", "-c", WAYLAND_PROBE, app_receipt, main_socket)
+        workspace(id, "launch", "--", "python3", "-c", WAYLAND_PROBE, app_receipt)
         wait_for(app_receipt.exists, "launched app Wayland registry", timeout=15)
-        unsandboxed = json.loads(app_receipt.read_text())
-        assert unsandboxed["wayland_display"] == env["WAYLAND_DISPLAY"], unsandboxed
-        assert "zcosmic_toplevel_manager_v1" in unsandboxed["globals"], unsandboxed
+        app_view = json.loads(app_receipt.read_text())
+        assert app_view["wayland_display"] == env["WAYLAND_DISPLAY"], app_view
+        assert app_view["dbus"] == env["DBUS_SESSION_BUS_ADDRESS"], app_view
+        assert "zcosmic_toplevel_manager_v1" in app_view["globals"], app_view
         a11y_address = env["AT_SPI_BUS_ADDRESS"]
         a11y_update = subprocess.run(["dbus-send", f"--bus={a11y_address}", "--print-reply", "--reply-timeout=1000",
             "--dest=org.freedesktop.DBus", "/org/freedesktop/DBus",
@@ -372,21 +344,15 @@ for scale in (1, 1.5):
     print(f"COSMIC {scale}: compositor log gate {json.dumps(gate)}", flush=True)
     cleanup = command("workspace", "cleanup", "--id", id)
     assert not runtime.exists(), f"stopped COSMIC runtime survived cleanup: {cleanup}"
-# Enforced mounts + network namespace must retain the owning XWayland socket.
-project = Path("/artifacts/scratch/legacy-project")
+# XWayland clients type through the seat layout.
+project = Path("/artifacts/scratch/xwayland-project")
 project.mkdir(parents=True)
-profile = Path("/artifacts/scratch/legacy-profile.json")
-profile.write_text(json.dumps({"id":"cosmic-restricted", "session":{"backend":"cosmic"},
-    "cwd":"/workspace/project", "require_enforced_policy":True,
-    "network":{"mode":"disabled"}, "mounts":[{"host_path":str(project),
-    "workspace_path":"/workspace/project", "mode":"read_write"}]}))
-command("profile","import","--json",profile)
-id="cosmic-restricted"
+id="cosmic-xwayland"
 try:
-    workspace(id,"start","--profile","cosmic-restricted","--ack-hidden-workspace", "--purpose","Legacy XWayland sandbox acceptance")
-    launch=workspace(id,"launch","--wait-window","--window-timeout-ms",10000,"--","xterm","-fa","monospace","-e","sh","-c","printf ready > /workspace/project/ready; exec cat > /workspace/project/typed")
+    workspace(id,"start","--session","cosmic","--ack-hidden-workspace", "--purpose","XWayland terminal acceptance")
+    launch=workspace(id,"launch","--wait-window","--window-timeout-ms",10000,"--","xterm","-fa","monospace","-e","sh","-c",'printf ready > "$1/ready"; exec cat > "$1/typed"',"sh",project)
     assert launch["windows"], launch
-    wait_for(lambda:(project/"ready").exists(),"XWayland terminal in enforced sandbox")
+    wait_for(lambda:(project/"ready").exists(),"XWayland terminal")
     # X11 clients have no text-input. They get the seat layout's own keys, and
     # characters outside that layout are refused before anything is typed.
     workspace(id,"focus-window",launch["windows"][0]["id"])
@@ -398,66 +364,9 @@ try:
     assert "U+0001" in command("workspace","type","--id",id,"bad\u0001",expected=False)
     workspace(id,"type","after refusal\n")
     wait_for(lambda:(project/"typed").read_text(encoding="utf-8")==typed+"after refusal\n","refused text typed nothing")
-    app=launch["apps"][0]
-    assert app["mount_isolation"]=="bubblewrap_mount_namespace",app
-    assert app["network_isolation"]=="bubblewrap_unshare_net",app
-    print("COSMIC restricted XWayland terminal passed",flush=True)
+    print("COSMIC XWayland terminal passed",flush=True)
 finally:
     workspace(id,"stop")
-
-# The restricted app sees only its client bus and a private runtime overlay.
-# Creating a launcher in that overlay must not affect the compositor's PATH.
-for mounts in (False, True):
-    ident="cosmic-isolation-mounts" if mounts else "cosmic-isolation-network"
-    project=ARTIFACTS/ident
-    project.mkdir(exist_ok=True)
-    spec={"id":ident,"session":{"backend":"cosmic"},"require_enforced_policy":True,"network":{"mode":"disabled"}}
-    if mounts:
-        spec["mounts"]=[{"host_path":str(project),"workspace_path":"/workspace/project","mode":"read_write"}]
-    profile=ARTIFACTS/f"{ident}.json"
-    profile.write_text(json.dumps(spec))
-    command("profile","import","--json",profile)
-    try:
-        workspace(ident,"start","--profile",ident,"--ack-hidden-workspace")
-        status=workspace(ident,"status")
-        runtime=Path(status["runtime_dir"])
-        wrapper=(runtime/"cosmic-bin/Xwayland").read_bytes()
-        destination="/workspace/project/result.json" if mounts else str(project/"result.json")
-        script=r'''import json,os,re,socket,subprocess,sys
-from pathlib import Path
-runtime=Path(os.environ["AGENT_WORKSPACE_RUNTIME_DIR"])
-info=subprocess.run(["wayland-info"],capture_output=True,text=True,timeout=10)
-main=socket.socket(socket.AF_UNIX)
-try:
-    main.connect(sys.argv[2]); reachable=True
-except OSError:
-    reachable=False
-finally:
-    main.close()
-wayland={"returncode":info.returncode,"stderr":info.stderr[-500:],"wayland_display":os.environ.get("WAYLAND_DISPLAY"),
-    "main_socket_reachable":reachable,"globals":sorted(set(re.findall(r"interface: '([^']+)'",info.stdout)))}
-assert not (runtime/"session-bus").exists()
-assert (runtime/"client-bus").is_socket()
-assert not (runtime/"cosmic-parent").exists()
-probe=subprocess.run(["dbus-send","--session","--print-reply","--reply-timeout=1000","--dest=com.system76.CosmicComp","/com/system76/CosmicComp/Ei","com.system76.CosmicComp.Ei.GetSenderSocket","uint32:3"],capture_output=True,text=True,timeout=3)
-assert probe.returncode!=0 and "ServiceUnknown" in probe.stderr,probe.stderr
-launcher=runtime/"cosmic-bin/cosmic-settings"
-launcher.parent.mkdir(exist_ok=True)
-launcher.write_text("#!/bin/sh\nexit 99\n")
-launcher.chmod(0o755)
-Path(sys.argv[1]).write_text(json.dumps({"control_bus_hidden":True,"launcher_only_in_app_namespace":True,"wayland":wayland}))
-'''
-        main_socket=runtime/json.loads((runtime/"cosmic-client.json").read_text())["WAYLAND_DISPLAY"]
-        workspace(ident,"launch","--","python3","-c",script,destination,main_socket)
-        wait_for(lambda:(project/"result.json").exists(),"COSMIC restricted control and launcher isolation")
-        sandboxed=json.loads((project/"result.json").read_text())["wayland"]
-        check_app_globals(sandboxed,f"sandboxed app mounts={mounts}")
-        assert not sandboxed["main_socket_reachable"],sandboxed
-        assert not (runtime/"cosmic-bin/cosmic-settings").exists()
-        assert (runtime/"cosmic-bin/Xwayland").read_bytes()==wrapper
-        print(f"COSMIC isolation mounts={mounts}: client bus only, immutable compositor launcher namespace",flush=True)
-    finally:
-        workspace(ident,"stop")
 
 # A crashed daemon leaves a stale COSMIC runtime that cleanup must remove.
 id="cosmic-crash"
@@ -476,19 +385,4 @@ cleanup=command("workspace","cleanup","--id",id)
 assert not runtime.exists(),f"crashed COSMIC runtime survived cleanup: {cleanup}"
 print("COSMIC crashed runtime cleanup passed",flush=True)
 
-# Shared runtime isolation contract: host runtime and /proc denial, a real
-# managed xterm through XWayland, app attribution and terminal shutdown.
-# A short HOME keeps its managed tmux socket paths below the Unix limit.
-isolation_home = Path("/tmp/h")
-(isolation_home / ".cache").mkdir(mode=0o700, parents=True, exist_ok=True)
-isolation = subprocess.run(["python3", "/opt/cosmic-probe/runtime_isolation_smoke.py"],
-    env=dict(os.environ, HOME=str(isolation_home), AWL_TEST_SESSION="cosmic", AGENT_WORKSPACE_BIN=BIN),
-    capture_output=True, text=True, timeout=240)
-(ARTIFACTS / "runtime-isolation.log").write_text(isolation.stdout + isolation.stderr)
-assert isolation.returncode == 0, isolation.stdout + isolation.stderr
-print("COSMIC shared runtime isolation passed", flush=True)
-# Sandboxed apps must reach only the filtered Wayland socket.
-subprocess.run(["python3", "/opt/cosmic-probe/sandbox_wayland_globals_smoke.py", "cosmic"],
-               env=dict(os.environ, HOME=str(isolation_home), AGENT_WORKSPACE_BIN=BIN,
-                        SANDBOX_GLOBALS_ARTIFACTS=str(ARTIFACTS)), check=True, timeout=300)
 print("COSMIC native acceptance passed", flush=True)

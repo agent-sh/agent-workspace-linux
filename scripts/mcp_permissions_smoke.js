@@ -27,7 +27,6 @@ fs.writeFileSync(
   permissionsPath,
   `${JSON.stringify(
     {
-      network: { mode: "disabled" },
       apps: { allow: ["sh"] },
     },
     null,
@@ -271,7 +270,8 @@ async function main() {
   const permissionsDescription = toolByName.get("mcp_permissions")?.description || "";
   assert(
     /configured=true/.test(permissionsDescription) &&
-      /immutable ceilings/.test(permissionsDescription) &&
+      /immutable ceiling/.test(permissionsDescription) &&
+      /not enforced/.test(permissionsDescription) &&
       /configured=false/.test(permissionsDescription) &&
       /imposes no ceiling/.test(permissionsDescription),
     `mcp_permissions description should distinguish explicit ceilings from clean/default MCP: ${permissionsDescription}`,
@@ -494,10 +494,8 @@ async function main() {
         profiles: [
           {
             id: "saved-too-open",
-            network: { mode: "inherit_host" },
-            mounts: [],
             setup_commands: [],
-            startup_apps: [],
+            startup_apps: [{ command: ["xmessage", "outside the allowlist"] }],
           },
         ],
       },
@@ -556,8 +554,8 @@ async function main() {
       appQaPlan.steps.some(
         (step) =>
           step.id === "template_project_profile" &&
-          !step.ready_to_call &&
-          step.permission_blockers?.some((blocker) => /permission ceiling/.test(blocker)),
+          step.ready_to_call === true &&
+          !step.permission_blockers?.length,
       ) &&
       appQaPlan.steps.some(
         (step) =>
@@ -571,7 +569,7 @@ async function main() {
           step.id === "run_project_profile_after_save" &&
           !step.ready_to_call &&
           step.depends_on?.includes("save_project_profile_after_review") &&
-          step.permission_blockers?.some((blocker) => /permission ceiling/.test(blocker)),
+          !step.permission_blockers?.length,
       ) &&
       appQaPlan.steps.some(
         (step) =>
@@ -600,7 +598,7 @@ async function main() {
           !step.ready_to_call &&
           step.required_input?.some((input) => /active_window|app_id/i.test(input)),
       ),
-    `mcp_task_plan should produce an end-to-end project-dev app QA plan that reflects the active ceiling: ${JSON.stringify(appQaPlan)}`,
+    `mcp_task_plan should produce an end-to-end project-dev app QA plan that the app allowlist does not block: ${JSON.stringify(appQaPlan)}`,
   );
   assert(
     appQaPlan.task_context?.action_boundaries?.some(
@@ -623,16 +621,13 @@ async function main() {
           boundary.approval_required === true &&
           boundary.approval_kind === "project_file_write",
       ),
-    `mcp_task_plan should expose app-QA action boundaries even when the ceiling blocks the generated profile: ${JSON.stringify(appQaPlan)}`,
+    `mcp_task_plan should expose app-QA action boundaries: ${JSON.stringify(appQaPlan)}`,
   );
   assert(
-    appQaPlan.approval_summary?.next_boundary?.kind === "permission_ceiling" &&
-      appQaPlan.approval_summary?.next_boundary?.step_id === "template_project_profile" &&
-      appQaPlan.approval_summary?.next_boundary?.blocks_step === true &&
-      appQaPlan.approval_summary?.next_boundary?.permission_blockers?.some((blocker) =>
-        /permission ceiling/.test(blocker),
-      ),
-    `mcp_task_plan should summarize the permission ceiling as the next blocked app-QA boundary: ${JSON.stringify(appQaPlan)}`,
+    appQaPlan.approval_summary?.next_boundary?.kind === "required_input" &&
+      appQaPlan.approval_summary?.next_boundary?.step_id === "dry_run_save_project_profile" &&
+      appQaPlan.approval_summary?.next_boundary?.blocks_step === true,
+    `mcp_task_plan should summarize the profile preview as the next app-QA boundary when the app allowlist does not block project-dev: ${JSON.stringify(appQaPlan)}`,
   );
   const groceryPlan = await callTool("mcp_task_plan", { intent: "grocery shopping" });
   assert(
@@ -910,32 +905,16 @@ async function main() {
   assert(permissions.configured === true, "mcp_permissions did not report configured=true");
   assert(permissions.restricted === true, "mcp_permissions did not report restricted=true");
   assert(
-    permissions.ceiling?.network?.mode === "disabled",
-    "mcp_permissions did not report disabled network ceiling",
-  );
-
-  const tooOpen = await callTool("profile_put", {
-    dry_run: true,
-    profile: {
-      id: "too-open",
-      network: { mode: "inherit_host" },
-      mounts: [],
-      setup_commands: [],
-      startup_apps: [],
-    },
-  });
-  assert(tooOpen.ok === false, "profile_put should reject inherited network under disabled ceiling");
-  assert(
-    String(tooOpen.message || "").includes("exceeds MCP permission ceiling"),
-    "profile_put rejection did not mention the permission ceiling",
+    JSON.stringify(permissions.ceiling?.apps?.allow) === JSON.stringify(["sh"]) &&
+      permissions.ceiling?.network === undefined &&
+      permissions.ceiling?.mounts === undefined,
+    `mcp_permissions did not report the app allowlist ceiling: ${JSON.stringify(permissions.ceiling)}`,
   );
 
   const disallowedApp = await callTool("profile_put", {
     dry_run: true,
     profile: {
       id: "bad-app",
-      network: { mode: "disabled" },
-      mounts: [],
       setup_commands: [],
       startup_apps: [{ command: ["bash", "-lc", "true"] }],
     },
@@ -950,8 +929,6 @@ async function main() {
     dry_run: false,
     profile: {
       id: "allowed",
-      network: { mode: "disabled" },
-      mounts: [],
       setup_commands: [],
       startup_apps: [{ command: ["sh", "-lc", "true"] }],
     },
