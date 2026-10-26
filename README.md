@@ -154,11 +154,13 @@ Ubuntu does not package `cosmic-comp`. Install the Pop!_OS build that the COSMIC
 ```bash
 curl -fLO https://apt.pop-os.org/release/pool/noble/cosmic-comp/8cb1802caada438bb5cc7670dfabdaca5fad0502/cosmic-comp_0.1~1792508925~24.04~8cb1802_amd64.deb
 curl -fLO https://archive.ubuntu.com/ubuntu/pool/universe/libd/libdisplay-info/libdisplay-info1_0.1.1-2build1_amd64.deb
-sha256sum -c <<'EOF'
+cat > cosmic.sha256 <<'EOF'
 f493771502e56245158906e92b4da0b5a7f0bc2fb1926f3feb81d6294541b427  cosmic-comp_0.1~1792508925~24.04~8cb1802_amd64.deb
 a3bfce18d53aa9d635d899f1f555e84bbbf2c859d80cef3b4eb1c36b2c772026  libdisplay-info1_0.1.1-2build1_amd64.deb
 EOF
-sudo apt install ./cosmic-comp_0.1~1792508925~24.04~8cb1802_amd64.deb ./libdisplay-info1_0.1.1-2build1_amd64.deb
+# Installs only when both checksums match
+sha256sum -c cosmic.sha256 && sudo apt install \
+    ./cosmic-comp_0.1~1792508925~24.04~8cb1802_amd64.deb ./libdisplay-info1_0.1.1-2build1_amd64.deb
 ```
 
 </details>
