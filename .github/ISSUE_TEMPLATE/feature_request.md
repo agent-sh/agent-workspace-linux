@@ -21,5 +21,5 @@ Other approaches you thought about.
 
 ## Scope / notes
 
-- Does this affect the permission boundary or isolation guarantees? If so, how?
+- Does this change what agents may do (action marks, app allowlist, live control)? If so, how?
 - Is this Linux/X11-specific, or does it assume a particular desktop session?

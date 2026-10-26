@@ -14,7 +14,14 @@ pub(crate) fn socket_path(runtime: &Path) -> PathBuf {
 pub(crate) fn blockers() -> Vec<String> {
     let mut blockers = Vec::new();
     for name in [
-        "Xvfb", "xauth", "xdpyinfo", "xprop", "xdotool", "i3", "import",
+        "Xvfb",
+        "xauth",
+        "xdpyinfo",
+        "xprop",
+        "xdotool",
+        "i3",
+        "import",
+        "dbus-daemon",
     ] {
         if !command_path_check(name).ok {
             blockers.push(format!("Install {name} for the private i3 workspace."));

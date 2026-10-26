@@ -15,4 +15,4 @@ What does this change and why?
 ## Notes for reviewers
 
 Evidence the change works (test output, smoke excerpt, `doctor` output), and
-anything that affects the isolation or permission boundary.
+anything that affects the action marks, the app allowlist or live control.

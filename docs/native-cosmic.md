@@ -46,7 +46,7 @@ for the requested geometry to be observed. Refused geometry returns an error.
 Focus, minimize, show and close also wait for the resulting native state.
 Raising a window uses COSMIC activation and also gives it keyboard focus.
 
-## Launch isolation
+## Compositor launch
 
 Only `cosmic-comp` runs, not `cosmic-session`, panels, a desktop portal or a
 settings daemon. COSMIC is started in its supported kiosk mode with an owned
@@ -55,25 +55,13 @@ configuration watcher. It does not turn every workspace application into a
 fullscreen window.
 
 The compositor's private mount namespace has a read-only PATH containing only an XWayland launcher and `xrdb`. Bubblewrap copies the workspace executable into a private read-only mount; changing the host file or its permissions cannot change that copy. This is an executable, not a shell script, so a noexec runtime mount cannot make COSMIC fall back to an unauthenticated server.
-Smithay clears the XWayland environment except `PATH` and `XDG_RUNTIME_DIR`, so the launcher takes its configuration from a read-only descriptor reserved before Bubblewrap starts, not from the environment. The configuration must name the COSMIC backend. The launcher rejects `-ac` and `-auth` arguments, refuses an Xauthority file that is missing, empty, not owned by the workspace user or readable by others, and execs the resolved XWayland binary with `-auth` set to the workspace's private Xauthority file. Any failure stops XWayland; workspace start then fails because COSMIC publishes no display. There is no unauthenticated fallback. The PATH directory is not mounted into restricted app
-sandboxes. Network-only clients retain host filesystem access, but the compositor
-uses the separate immutable copy. Both parent and child compositors receive a
+Smithay clears the XWayland environment except `PATH` and `XDG_RUNTIME_DIR`, so the launcher takes its configuration from a read-only descriptor reserved before Bubblewrap starts, not from the environment. The configuration must name the COSMIC backend. The launcher rejects `-ac` and `-auth` arguments, refuses an Xauthority file that is missing, empty, not owned by the workspace user or readable by others, and execs the resolved XWayland binary with `-auth` set to the workspace's private Xauthority file. Any failure stops XWayland; workspace start then fails because COSMIC publishes no display. There is no unauthenticated fallback. Both parent and child compositors receive a
 private `/dev` with no input or DRM devices. There is no host PATH fallback. The private session bus has no
 application activation services; the accessibility bus has only its registry.
 The system bus is private and contains no activation services.
 
-Sandboxed apps connect to a separate `wayland-apps` socket. At startup the
-daemon registers it with COSMIC through `wp_security_context_v1`, with the
-sandbox engine `agent-workspace-linux`, and keeps its close descriptor open for
-the session. COSMIC withholds its privileged globals from every client of that
-socket: toplevel info and management, workspaces, image capture, output
-configuration and power, virtual keyboard, input method, layer shell, session
-lock, keyboard layout, data control, accessibility and nested security
-contexts. Startup fails if the socket advertises any of them. Only this socket
-is bound into sandboxes. The compositor socket stays with the daemon's
-helpers, attached controllers and unsandboxed launches, matching the control
-bus: those run as the same user with full file access, and desktop services
-such as portals need capture.
+Apps connect to the compositor's own socket and run as the user, like apps in a
+regular COSMIC session.
 
 The current upstream spawn inventory is:
 
@@ -132,6 +120,6 @@ Upstream sources:
 
 `scripts/cosmic_probe.sh` runs acceptance in a container as an unprivileged user
 with no capabilities, devices, network or host display. Docker masks parts of
-`/proc`, which stops Bubblewrap from mounting the fresh procfs that restricted
-apps get. The probe sets `--security-opt systempaths=unconfined` for that reason.
+`/proc`, which stops Bubblewrap from mounting the fresh procfs of the
+compositor's private namespace. The probe sets `--security-opt systempaths=unconfined` for that reason.
 It does not grant the container any capability.

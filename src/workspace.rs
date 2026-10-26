@@ -141,6 +141,8 @@ pub struct RuntimeReport {
     pub xdotool: Check,
     pub screenshot: Check,
     pub clipboard: Check,
+    /// The workspace's own session bus, which its apps use.
+    pub dbus_daemon: Check,
 }
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
@@ -1076,6 +1078,7 @@ pub fn doctor_report() -> DoctorReport {
         xprop: command_path_check("xprop"),
         window_manager: first_available_command(&["openbox", "i3", "fluxbox"]),
         xdotool: command_path_check("xdotool"),
+        dbus_daemon: command_path_check("dbus-daemon"),
         // Mirror the runtime capture order in capture_workspace_screenshot:
         // ffmpeg (cursor-capable) is preferred, then import/scrot. An
         // ffmpeg-only host can take screenshots, so it must read as ready here.
@@ -1089,6 +1092,9 @@ pub fn doctor_report() -> DoctorReport {
     };
 
     let mut blockers = Vec::new();
+    if !runtime.dbus_daemon.ok {
+        blockers.push("Install dbus-daemon for the workspace's session bus.".to_string());
+    }
     if !runtime.xvfb.ok && !runtime.xephyr.ok {
         blockers.push("Install Xvfb or Xephyr to create the workspace's X11 display.".to_string());
     }
