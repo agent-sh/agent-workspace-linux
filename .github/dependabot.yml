@@ -4,6 +4,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    groups:
+      # Both crates come from one zed commit and only build together.
+      gpui:
+        patterns:
+          - gpui
+          - gpui_platform
   - package-ecosystem: github-actions
     directory: /
     schedule:
