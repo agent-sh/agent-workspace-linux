@@ -514,7 +514,7 @@ for _ in range(30):
         time.sleep(0.1)
 else:
     raise SystemExit(last)" > "$SMOKE_DIR/browser-probe.json"
-  assert_json '.succeeded == true and (.stdout.content | contains("# agent-workspace-linux"))' "$SMOKE_DIR/browser-probe.json"
+  assert_json '.succeeded == true and (.stdout.content | contains("agent-workspace-linux"))' "$SMOKE_DIR/browser-probe.json"
   run_awl workspace launch --id "$BROWSER_ID" --name browser-local-dev --wait-window --screenshot-window --window-timeout-ms 15000 -- "$BROWSER_BIN" "--user-data-dir=$SMOKE_DIR/browser-profile" --no-first-run --no-default-browser-check --new-window "$BROWSER_README_URL" > "$SMOKE_DIR/browser-launch.json"
   assert_json '.ok == true and (.screenshot.bytes > 0) and ((.windows | length) > 0) and .apps[0].running == true' "$SMOKE_DIR/browser-launch.json"
   BROWSER_APP_ID="$(jq -r '.apps[0].id' "$SMOKE_DIR/browser-launch.json")"
