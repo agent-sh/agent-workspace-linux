@@ -157,9 +157,13 @@ async fn main() -> Result<()> {
             print_help();
             Ok(())
         }
+        Some("--version") | Some("-V") => {
+            println!("agent-workspace-linux {}", env!("CARGO_PKG_VERSION"));
+            Ok(())
+        }
         Some(command) => {
             bail!(
-                "unknown command '{command}'. Expected one of: doctor, guardrails, mcp, permissions, profile, workspace, viewer, --help"
+                "unknown command '{command}'. Expected one of: doctor, guardrails, mcp, permissions, profile, workspace, viewer, --help, --version"
             )
         }
     }
@@ -4372,6 +4376,7 @@ fn print_help() {
 
 Usage:
   agent-workspace-linux [--permissions PATH] <command>
+  agent-workspace-linux --version
   agent-workspace-linux doctor
   agent-workspace-linux guardrails
   agent-workspace-linux mcp [--permissions PATH] [--headless]

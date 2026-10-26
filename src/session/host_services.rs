@@ -132,6 +132,10 @@ impl Relay {
     fn start(name: &'static str, user_bus: &str, workspace_bus: &str) -> Result<Self> {
         let user = connect(user_bus)?;
         let workspace = connect(workspace_bus)?;
+        // A connection hands each message only to the iterators that exist
+        // when it arrives, so subscribe before the name can receive calls.
+        let calls_in = MessageIterator::from(&workspace);
+        let answers_in = MessageIterator::from(&user);
         workspace.request_name(name)?;
         DBusProxy::new(&user)?.add_match_rule(
             format!("type='signal',sender='{name}'")
@@ -144,13 +148,13 @@ impl Relay {
             let (user, workspace, pending) = (user.clone(), workspace.clone(), pending.clone());
             thread::Builder::new()
                 .name(format!("relay-calls-{name}"))
-                .spawn(move || forward_calls(name, &workspace, &user, &pending))?
+                .spawn(move || forward_calls(name, calls_in, &workspace, &user, &pending))?
         };
         let answers = {
-            let (user, workspace) = (user.clone(), workspace.clone());
+            let workspace = workspace.clone();
             thread::Builder::new()
                 .name(format!("relay-answers-{name}"))
-                .spawn(move || forward_answers(&user, &workspace, &pending))?
+                .spawn(move || forward_answers(answers_in, &workspace, &pending))?
         };
         Ok(Self {
             user,
@@ -173,12 +177,13 @@ impl Drop for Relay {
 /// Method calls apps send the relayed name, re-sent to the user's bus.
 fn forward_calls(
     name: &str,
+    incoming: MessageIterator,
     workspace: &Connection,
     user: &Connection,
     pending: &Mutex<HashMap<NonZeroU32, Message>>,
 ) {
     let own = workspace.unique_name().map(|n| n.to_string());
-    for message in MessageIterator::from(workspace) {
+    for message in incoming {
         let Ok(call) = message else { break };
         let header = call.header();
         if header.message_type() != Type::MethodCall {
@@ -216,11 +221,11 @@ fn forward_calls(
 
 /// Replies to forwarded calls and the service's signals, sent back to apps.
 fn forward_answers(
-    user: &Connection,
+    incoming: MessageIterator,
     workspace: &Connection,
     pending: &Mutex<HashMap<NonZeroU32, Message>>,
 ) {
-    for message in MessageIterator::from(user) {
+    for message in incoming {
         let Ok(answer) = message else { break };
         let header = answer.header();
         // A reply for an app that has gone is dropped; the loop ends with the bus.
