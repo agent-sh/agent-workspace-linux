@@ -24,16 +24,42 @@ cargo run -- doctor   # quick self-check
 
 ## Quality Gates
 
-Run all four gates before pushing:
+Install the test runner once, then run the gates before pushing:
+
+```bash
+cargo install cargo-nextest --locked
+```
 
 ```bash
 cargo fmt --check
 cargo clippy --locked -- -D warnings
-cargo test --locked
+cargo nextest run --locked
 git diff --check
 ```
 
-All four gates must pass. PRs that fail any gate will not be merged.
+All gates must pass. `cargo test --locked` remains supported when nextest is
+unavailable. The dev and test profiles retain file and line information in
+backtraces without full type and variable debug information. Release profiles
+are unchanged.
+
+The package currently has only a binary target. When a library target is added,
+also run `cargo test --locked --doc`: nextest does not run documentation tests.
+CI detects those targets and keeps that check separate.
+
+The installer smoke can reuse a binary you already built:
+
+```bash
+scripts/install_smoke.sh target/debug/agent-workspace-linux
+```
+
+It runs the real installer in a disposable checkout and checks the installed
+binary, skill and config cleanup. With no argument it builds and tests the
+release binary as before.
+
+To inspect a slow local build, run `cargo build --locked --timings` and open
+`target/cargo-timings/cargo-timing.html`. The committed configuration works on
+stable Rust with its default linker; machine-specific linker settings belong
+in your own Cargo configuration.
 
 ## Integration Smoke Test
 

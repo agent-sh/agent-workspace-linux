@@ -44,6 +44,10 @@ wayland-protocols-wlr = { version = "0.3", features = ["client"] }
 reis = "0.7.1"
 
 
+[profile.dev]
+# Preserve file and line numbers in backtraces without full type/variable info.
+debug = "line-tables-only"
+
 [profile.release]
 codegen-units = 1
 opt-level = 3

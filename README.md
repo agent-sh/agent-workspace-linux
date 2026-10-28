@@ -367,7 +367,7 @@ The helper refuses obvious active-profile hazards, copies the approved profile t
 
 ## Contributing
 
-Build with `cargo build --locked`. Before pushing, run `cargo fmt --check`, `cargo clippy --locked -- -D warnings`, `cargo test --locked`, `git diff --check` and, for runtime changes, `scripts/integration_smoke.sh`. See [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
+Build with `cargo build --locked`. Before pushing, run `cargo fmt --check`, `cargo clippy --locked -- -D warnings`, `cargo nextest run --locked`, `git diff --check` and, for runtime changes, `scripts/integration_smoke.sh`. `cargo test --locked` remains supported. See [CONTRIBUTING.md](CONTRIBUTING.md) and [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md).
 
 ## License
 

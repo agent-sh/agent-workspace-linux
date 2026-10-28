@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 BIN_NAME="agent-workspace-linux"
 SOURCE_BIN="$ROOT_DIR/target/release/$BIN_NAME"
+INSTALLER="$ROOT_DIR/install.sh"
 
 need() {
   if ! command -v "$1" >/dev/null 2>&1; then
@@ -12,10 +13,23 @@ need() {
   fi
 }
 
-need cargo
 need cmp
 
-cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release >/dev/null
+if [[ "$#" -gt 1 ]]; then
+  echo "usage: $0 [already-built-binary]" >&2
+  exit 2
+fi
+
+if [[ "$#" -eq 1 ]]; then
+  SOURCE_BIN="$(realpath "$1")"
+  if [[ ! -f "$SOURCE_BIN" || ! -x "$SOURCE_BIN" ]]; then
+    echo "installer smoke needs an executable binary: $SOURCE_BIN" >&2
+    exit 1
+  fi
+else
+  need cargo
+  cargo build --manifest-path "$ROOT_DIR/Cargo.toml" --locked --release >/dev/null
+fi
 
 SMOKE_DIR="$(mktemp -d)"
 PREFIX="$SMOKE_DIR/prefix"
@@ -32,6 +46,17 @@ cleanup() {
   fi
 }
 trap cleanup EXIT
+
+if [[ "$#" -eq 1 ]]; then
+  # Test the real installer against a disposable checkout. Its release-path
+  # contract stays intact while CI reuses the binary it already built.
+  INSTALLER_ROOT="$SMOKE_DIR/checkout"
+  mkdir -p "$INSTALLER_ROOT/target/release" "$INSTALLER_ROOT/skills"
+  cp "$SOURCE_BIN" "$INSTALLER_ROOT/target/release/$BIN_NAME"
+  cp "$ROOT_DIR/install.sh" "$INSTALLER_ROOT/install.sh"
+  cp -R "$ROOT_DIR/skills/agent-workspace-linux" "$INSTALLER_ROOT/skills/"
+  INSTALLER="$INSTALLER_ROOT/install.sh"
+fi
 
 mkdir -p "$CODEX_HOME" "$HOME_DIR"
 cat >"$CONFIG" <<'TOML'
@@ -62,7 +87,7 @@ CODEX_HOME= \
 SKILLS_DIR= \
 PREFIX= \
 BINDIR= \
-"$ROOT_DIR/install.sh" \
+"$INSTALLER" \
   --skip-build \
   --no-doctor \
   --prefix "$PREFIX" \

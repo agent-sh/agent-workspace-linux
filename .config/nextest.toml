@@ -1,0 +1,4 @@
+[profile.default]
+# Tests start private desktops and D-Bus services. Bound concurrency so the
+# local edit/test loop leaves capacity for the desktop and other agent work.
+test-threads = 4
