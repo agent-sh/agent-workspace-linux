@@ -115,6 +115,8 @@ agent-workspace-linux workspace stop
 
 Through an MCP host you don't run these by hand. The agent calls the matching tools, routed by the [bundled skill](#the-skill).
 
+Use `--id NAME` to name a workspace. The name `viewers` is reserved for the shared viewer registry and is excluded from workspace listing and stale cleanup.
+
 ## Desktop backends
 
 Choose a backend with `--session` on `workspace start` and `workspace open-profile`, or with `"session": {"backend":"hyprland"}` in MCP calls and saved profiles. Explicit CLI or MCP input overrides the profile. With neither, the workspace uses X11.
