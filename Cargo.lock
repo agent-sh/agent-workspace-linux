@@ -121,7 +121,7 @@ dependencies = [
 
 [[package]]
 name = "agent-workspace-linux"
-version = "0.6.1"
+version = "0.6.2"
 dependencies = [
  "anyhow",
  "bitflags 2.13.2",
