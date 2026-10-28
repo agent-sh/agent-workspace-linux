@@ -62,6 +62,8 @@ const MAX_UNIX_SOCKET_PATH_BYTES: usize = 107;
 pub(crate) const MAX_CLIPBOARD_TEXT_BYTES: usize = 64 * 1024;
 const EVENT_LOG_FILE: &str = "events.jsonl";
 const WORKSPACE_MANIFEST_FILE: &str = "workspace.json";
+// Shared runtime metadata must never be accepted as a workspace directory.
+pub(crate) const VIEWER_REGISTRY_DIR: &str = "viewers";
 const OBSERVE_SCREENSHOT_FILE: &str = "observe-frame.png";
 const LINUX_DELETED_EXE_SUFFIX: &str = " (deleted)";
 
@@ -8846,6 +8848,9 @@ fn sanitize_workspace_id(id: &str) -> Result<String> {
     let trimmed = id.trim();
     if trimmed.is_empty() {
         bail!("workspace id cannot be empty");
+    }
+    if trimmed == VIEWER_REGISTRY_DIR {
+        bail!("workspace id '{trimmed}' is reserved for the viewer registry");
     }
     if !trimmed
         .chars()

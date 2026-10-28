@@ -117,7 +117,6 @@ const SCROLL_PIXELS_PER_WORKSPACE_TICK: f32 = 80.0;
 const MAX_WORKSPACE_SCROLL_TICKS: f32 = 12.0;
 const VIEWER_PREFERENCES_FILE: &str = "viewer.json";
 const VIEWER_FRAME_FILE: &str = "viewer-frame.png";
-const VIEWER_REGISTRY_DIR: &str = "viewers";
 const VIEWER_REGISTRY_SCHEMA: &str = "agent-workspace-linux.viewer-instance.v1";
 const SIGTERM: i32 = 15;
 const ESRCH: i32 = 3;
@@ -3838,7 +3837,7 @@ fn viewer_registry_dir() -> PathBuf {
         .map(PathBuf::from)
         .unwrap_or_else(env::temp_dir)
         .join("agent-workspace-linux")
-        .join(VIEWER_REGISTRY_DIR)
+        .join(crate::workspace::VIEWER_REGISTRY_DIR)
 }
 
 fn viewer_registry_path(
