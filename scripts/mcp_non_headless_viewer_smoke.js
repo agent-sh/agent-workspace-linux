@@ -30,7 +30,8 @@ if (!process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
   process.exit(0);
 }
 
-const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-workspace-non-headless-mcp-smoke-"));
+// Keep private D-Bus socket paths short when TMPDIR is an on-disk cache.
+const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "awl-nh-"));
 const configDir = path.join(tempDir, "config");
 const runtimeDir = path.join(tempDir, "runtime");
 const browserDataDir = path.join(tempDir, "browser-data");

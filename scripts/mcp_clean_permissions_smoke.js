@@ -15,7 +15,8 @@ if (!fs.existsSync(bin)) {
   throw new Error(`agent-workspace-linux binary not found at ${bin}; run cargo build first`);
 }
 
-const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "agent-workspace-clean-mcp-smoke-"));
+// Keep private D-Bus socket paths short when TMPDIR is an on-disk cache.
+const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "awl-clean-"));
 const configDir = path.join(tempDir, "config");
 const runtimeDir = path.join(tempDir, "runtime");
 const browserDataDir = path.join(tempDir, "browser-data");

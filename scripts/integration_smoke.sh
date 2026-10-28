@@ -41,9 +41,11 @@ if [[ -z "$GUI_EDITOR_BIN" ]]; then
   GUI_EDITOR_BIN="$(command -v gnome-text-editor || command -v gedit || command -v xed || true)"
 fi
 
-SMOKE_DIR="$(mktemp -d)"
+# Keep private D-Bus and workspace socket paths below the Unix socket limit
+# when TMPDIR points to an on-disk cache instead of /tmp.
+SMOKE_DIR="$(mktemp -d "${TMPDIR:-/tmp}/awl.XXXXXX")"
 CONFIG_DIR="$SMOKE_DIR/config"
-RUNTIME_DIR="$SMOKE_DIR/runtime"
+RUNTIME_DIR="$SMOKE_DIR/r"
 mkdir -p "$CONFIG_DIR"
 mkdir -m 700 -p "$RUNTIME_DIR"
 
@@ -222,7 +224,7 @@ assert_json '.ok == true and .profile.id == "browser-session-smoke" and ((.check
 if [[ -n "$BROWSER_BIN" ]]; then
   run_awl profile import --json "$SMOKE_DIR/browser-session-template.json" > "$SMOKE_DIR/browser-session-import.json"
   assert_json '.created == true and .saved == true' "$SMOKE_DIR/browser-session-import.json"
-  BROWSER_SESSION_ID="browser-session-open-smoke-$$"
+  BROWSER_SESSION_ID="browser-session-$$"
   WORKSPACE_IDS+=("$BROWSER_SESSION_ID")
   run_awl workspace open-profile --ack-hidden-workspace --profile browser-session-smoke --id "$BROWSER_SESSION_ID" --purpose "Browser session smoke" --startup-wait-window --startup-screenshot-window --startup-window-timeout-ms 20000 > "$SMOKE_DIR/browser-session-open.json"
   assert_json '.ready == true and .startup_launched == true and .startup.launched[0].ok == true and (.startup.launched[0].screenshot.bytes > 0) and .startup.launched[0].apps[0].profile_id == "browser-session-smoke"' "$SMOKE_DIR/browser-session-open.json"
@@ -389,7 +391,7 @@ assert_json '(.files[] | select(.kind == "manifest" and .exists == true)) and (.
 
 if [[ -n "$BROWSER_BIN" ]]; then
   echo "== browser local-dev workspace =="
-  BROWSER_ID="browser-local-dev-smoke-$$"
+  BROWSER_ID="browser-dev-$$"
   BROWSER_PORT="$(python3 - <<'PY'
 import socket
 
@@ -431,7 +433,7 @@ else:
   assert_json '.ok == true and (.apps[] | select(.name == "dev-server" and .running == false)) and (.apps[] | select(.name == "browser-local-dev" and .running == false))' "$SMOKE_DIR/browser-stop.json"
 
   echo "== browser native input workspace =="
-  NATIVE_BROWSER_ID="browser-native-input-smoke-$$"
+  NATIVE_BROWSER_ID="browser-input-$$"
   NATIVE_BROWSER_URL="$(python3 - <<'PY'
 from urllib.parse import quote
 
