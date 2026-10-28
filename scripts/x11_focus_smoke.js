@@ -30,14 +30,14 @@ function cli(...args) {
   else assert.equal(response.ok, true, JSON.stringify(response));
   return response;
 }
-function waitForFile(file) {
+function waitForFile(file, phase) {
   if (fs.existsSync(file)) return Promise.resolve();
   return new Promise((resolve, reject) => {
     const watcher = fs.watch(path.dirname(file), () => {
       if (fs.existsSync(file)) { clearTimeout(timer); watcher.close(); resolve(); }
     });
     const timer = setTimeout(() => {
-      watcher.close(); reject(new Error("Keyboard input did not reach the popup within 5 seconds"));
+      watcher.close(); reject(new Error(`${phase} timed out after 5 seconds`));
     }, 5000);
     if (fs.existsSync(file)) { clearTimeout(timer); watcher.close(); resolve(); }
   });
@@ -57,13 +57,14 @@ try {
   assertNoApplicationFocus();
   const inputApp = cli("launch", "--id", id, "--name", "input", "--",
     "wish", path.join(__dirname, "fixtures", "focus-popup.tcl"), marker, childIdFile);
-  const windowId = run("xdotool", ["search", "--sync", "--name", "^Focus smoke$"], display).trim().split("\n")[0];
+  await waitForFile(childIdFile, "Popup fixture readiness");
+  const windowId = run("xdotool", ["search", "--sync", "--onlyvisible", "--name", "^Focus smoke$"], display).trim().split("\n")[0];
   assert.match(windowId, /^\d+$/);
   assert.match(run("xwininfo", ["-id", windowId], display), /Override Redirect State: yes/);
   cli("focus-window", "--id", id, windowId);
   cli("type", "--id", id, "FOCUS_SMOKE_OK");
   cli("key", "--id", id, "Return");
-  await waitForFile(marker);
+  await waitForFile(marker, "Popup keyboard input");
   assert.equal(fs.readFileSync(marker, "utf8").trim(), "FOCUS_SMOKE_OK");
 
   const childId = String(Number(fs.readFileSync(childIdFile, "utf8").trim()));
@@ -86,14 +87,16 @@ try {
   }
 
   const managedMarker = path.join(root, "managed-received");
+  const managedChildIdFile = path.join(root, "managed-child");
   const managedApp = cli("launch", "--id", id, "--name", "managed-input", "--", "wish",
-    path.join(__dirname, "fixtures", "focus-popup.tcl"), managedMarker, path.join(root, "managed-child"), "managed");
-  const managedId = run("xdotool", ["search", "--sync", "--name", "^Managed focus smoke$"], display).trim().split("\n")[0];
+    path.join(__dirname, "fixtures", "focus-popup.tcl"), managedMarker, managedChildIdFile, "managed");
+  await waitForFile(managedChildIdFile, "Managed fixture readiness");
+  const managedId = run("xdotool", ["search", "--sync", "--onlyvisible", "--name", "^Managed focus smoke$"], display).trim().split("\n")[0];
   cli("focus-window", "--id", id, windowId);
   cli("focus-window", "--id", id, managedId);
   cli("type", "--id", id, "MANAGED_FOCUS_OK");
   cli("key", "--id", id, "Return");
-  await waitForFile(managedMarker);
+  await waitForFile(managedMarker, "Managed keyboard input");
   assert.equal(fs.readFileSync(managedMarker, "utf8").trim(), "MANAGED_FOCUS_OK");
   cli("kill-app", "--id", id, inputApp.apps[0].id);
   cli("kill-app", "--id", id, managedApp.apps.find(app => app.name === "managed-input").id);
