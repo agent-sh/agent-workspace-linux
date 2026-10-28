@@ -124,6 +124,11 @@ async fn main() -> Result<()> {
             args.remove(0);
             if let Some(command) = args.first().map(String::as_str) {
                 match command {
+                    "font-license" => {
+                        parse_no_options(&args[1..], "viewer font-license")?;
+                        print!("{}", include_str!("../assets/fonts/LICENSE.txt"));
+                        return Ok(());
+                    }
                     "list" => {
                         parse_no_options(&args[1..], "viewer list")?;
                         return print_json(&viewer::list_viewers()?);
@@ -4485,6 +4490,7 @@ Usage:
   agent-workspace-linux viewer [--id ID] [--always-on-top] [--input-forwarding] [--exit-when-workspace-gone]
   agent-workspace-linux viewer list
   agent-workspace-linux viewer close (--id ID | --all) [--dry-run]
+  agent-workspace-linux viewer font-license
 
 Opens the small host-visible Agent Workspace GPUI monitor.
 The viewer runs outside the MCP stdio server and surfaces the selected
@@ -4501,6 +4507,8 @@ default and still requires a visible second-click confirmation in the viewer UI.
 The list and close subcommands use the repo-owned viewer registry, so they can
 inspect and close GPUI viewers even when the desktop compositor does not expose
 them as ordinary controllable windows.
+The font-license subcommand prints the bundled Inter font's attribution and
+SIL Open Font License without opening a window.
 "#
     );
 }

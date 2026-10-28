@@ -27,9 +27,10 @@ if (!commandExists("xterm") || !commandExists("tmux")) {
   process.exit(0);
 }
 
-const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "awl-tui-"));
+// Leave room for the nested tmux socket when TMPDIR is an on-disk cache.
+const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "tui-"));
 const configDir = path.join(tempDir, "config");
-const runtimeDir = path.join(tempDir, "runtime");
+const runtimeDir = path.join(tempDir, "r");
 fs.mkdirSync(configDir, { recursive: true });
 fs.mkdirSync(runtimeDir, { recursive: true, mode: 0o700 });
 fs.chmodSync(runtimeDir, 0o700);
@@ -210,7 +211,7 @@ async function startExtraTerminal(id, terminalId) {
 }
 
 async function main() {
-  const workspaceId = `tui-${process.pid}`;
+  const workspaceId = `t-${process.pid}`;
   const terminalId = "game";
   const socket = terminalSocket(workspaceId, terminalId);
   try {

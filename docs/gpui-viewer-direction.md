@@ -52,8 +52,8 @@ footer mode in the user's XDG config directory.
   compositor-invisible viewer windows.
 
 The viewer refreshes workspace status, app state, event state, and live-control
-state without constantly capturing screen pixels. Screen streaming is off by
-default; enabling `View` overwrites one reusable frame file instead of creating a
+state without constantly capturing screen pixels. Screen streaming is on by
+default; enabling `Live view` overwrites one reusable frame file instead of creating a
 new timestamped screenshot per refresh. The footer favors user-useful context:
 in-flight viewer actions, latest workspace events, browser reads/navigations,
 active app/window, inferred task intent, and permission state.
@@ -69,6 +69,29 @@ focus to the viewer. Opening the monitor or leaving forwarding off does not
 claim keyboard focus. Workspace focus requests verify actual keyboard focus,
 including focused child windows, before reporting success. Stale window-manager
 active-window metadata falls back to actual input focus.
+
+## Appearance
+
+The viewer follows the desktop light/dark appearance by default. **More → Theme**
+cycles System, Light and Dark and saves the choice alongside the existing window
+preferences. Files written by older versions default to System without losing
+size, position, streaming or footer settings.
+
+Inter 4.1 is embedded in the viewer binary and loaded before the window opens,
+including its tooltips. Typography does not depend on the desktop font or an
+installed Inter package. The font and its SIL Open Font License are in
+`assets/fonts/`.
+
+The chrome uses shared semantic colors for surfaces, borders, text, selections
+and destructive actions. Titles are 16px, controls and supporting text are 12px,
+and the activity footer is 11px. Controls share a 30px height and 7px radius.
+The active mode uses a quiet green fill; status also has a text label.
+
+Below 620px wide, workspace identity and controls occupy separate header rows so
+the workspace name stays readable. Secondary controls wrap and scroll within a
+third of the window height, leaving room for the preview in short windows.
+Hover feedback is limited to fill and border changes; live screen frames remain
+the primary moving content.
 
 ## Agent Boundary
 

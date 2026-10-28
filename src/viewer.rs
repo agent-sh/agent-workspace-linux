@@ -40,63 +40,139 @@ use x11rb::{
     wrapper::ConnectionExt as X11WrapperConnectionExt,
 };
 
-// Polished opaque silver-graphite palette — premium brushed metal, not flat.
-// GNOME (the X11/Xwayland popup path) cannot blur, so the panel is an opaque
-// graphite solid and the "metal" comes from strong silvery edges plus a bright
-// brushed top highlight. Text is soft silver-white; status accents are reserved
-// for the footer status dot only — the chrome stays silver/neutral.
+// Semantic colors keep the monitor chrome consistent across desktop themes.
+#[derive(Clone, Copy)]
+struct ViewerPalette {
+    background: u32,
+    surface: u32,
+    raised: u32,
+    border: u32,
+    outer_border: u32,
+    text: u32,
+    muted: u32,
+    button: u32,
+    hover: u32,
+    selected: u32,
+    selected_hover: u32,
+    selected_edge: u32,
+    selected_text: u32,
+    disabled_text: u32,
+    danger: u32,
+    danger_hover: u32,
+    danger_edge: u32,
+    danger_text: u32,
+    preview: u32,
+    green: u32,
+    amber: u32,
+    red: u32,
+}
 
-/// Opaque root panel fill (`0xRRGGBBAA`, alpha ff) — a deep, lifted cool
-/// graphite that reads as a solid premium surface (no translucency, since the
-/// GNOME path cannot blur). Rendered via `rgba(..)`.
-const BG_GLASS: u32 = 0x171c23ff;
-const SURFACE: u32 = 0x20262e;
-const SURFACE_2: u32 = 0x2c333d;
-const BORDER: u32 = 0x49525e;
-/// Bright silvery metallic edge for the panel's primary borders (its "chrome").
-const EDGE_SILVER: u32 = 0xc4ccd6;
-/// Near-white brushed-metal highlight for the bright top/inner edge.
-const EDGE_HIGHLIGHT: u32 = 0xe4eaf1;
-const TEXT: u32 = 0xe9edf2;
-const MUTED: u32 = 0x9aa3ae;
-const BUTTON_BG: u32 = 0x252c35;
-const BUTTON_BG_HOVER: u32 = 0x2f3742;
-const BUTTON_EDGE: u32 = 0xc4ccd6;
-const BUTTON_EDGE_SOFT: u32 = 0x7b848d;
-const BUTTON_SELECTED_BG: u32 = 0x37454f;
-const BUTTON_SELECTED_BG_HOVER: u32 = 0x3f4e5a;
-const BUTTON_SELECTED_EDGE: u32 = 0xe4eaf1;
-const BUTTON_DISABLED_BG: u32 = 0x191e24;
-const BUTTON_DISABLED_EDGE: u32 = 0x4a525c;
-const BUTTON_DISABLED_TEXT: u32 = 0x6c7681;
-/// Single unified pill radius (shared by buttons and the tooltip surface).
-const BUTTON_RADIUS: f32 = 8.0;
-/// Single unified pill height for every button state.
-const BUTTON_HEIGHT: f32 = 24.0;
-/// Single unified horizontal padding for every button state.
-const BUTTON_PAD_X: f32 = 11.0;
-/// Single unified button label size.
+impl ViewerPalette {
+    const DARK: Self = Self {
+        background: 0x171a1f,
+        surface: 0x1d2127,
+        raised: 0x2b313a,
+        border: 0x343b45,
+        outer_border: 0x454d59,
+        text: 0xf0f2f5,
+        muted: 0xa7b0bd,
+        button: 0x242930,
+        hover: 0x303741,
+        selected: 0x23453b,
+        selected_hover: 0x2c5548,
+        selected_edge: 0x477d67,
+        selected_text: 0xb5ecd4,
+        disabled_text: 0x727c89,
+        danger: 0x322329,
+        danger_hover: 0x452c34,
+        danger_edge: 0x65404b,
+        danger_text: 0xf1b8c3,
+        preview: 0x101318,
+        green: 0x6bd4a8,
+        amber: 0xe9bd69,
+        red: 0xee8a9b,
+    };
+    const LIGHT: Self = Self {
+        background: 0xf6f7f9,
+        surface: 0xffffff,
+        raised: 0xe9edf2,
+        border: 0xd8dde5,
+        outer_border: 0xbfc7d2,
+        text: 0x202630,
+        muted: 0x606b7b,
+        button: 0xffffff,
+        hover: 0xe9edf2,
+        selected: 0xe1f1e9,
+        selected_hover: 0xcfe7db,
+        selected_edge: 0xa7cbb9,
+        selected_text: 0x1c6048,
+        disabled_text: 0x87919f,
+        danger: 0xfff1f3,
+        danger_hover: 0xf9dfe4,
+        danger_edge: 0xe0b6c0,
+        danger_text: 0x9b354e,
+        preview: 0xe9edf2,
+        green: 0x27835d,
+        amber: 0x936311,
+        red: 0xb33b54,
+    };
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ViewerTheme {
+    Light,
+    Dark,
+    #[default]
+    #[serde(other)]
+    System,
+}
+
+impl ViewerTheme {
+    fn next(self) -> Self {
+        match self {
+            Self::System => Self::Light,
+            Self::Light => Self::Dark,
+            Self::Dark => Self::System,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::System => "System",
+            Self::Light => "Light",
+            Self::Dark => "Dark",
+        }
+    }
+
+    fn palette(self, appearance: gpui::WindowAppearance) -> ViewerPalette {
+        let dark = match self {
+            Self::System => matches!(
+                appearance,
+                gpui::WindowAppearance::Dark | gpui::WindowAppearance::VibrantDark
+            ),
+            Self::Light => false,
+            Self::Dark => true,
+        };
+        if dark {
+            ViewerPalette::DARK
+        } else {
+            ViewerPalette::LIGHT
+        }
+    }
+}
+
+const BUTTON_RADIUS: f32 = 7.0;
+const BUTTON_HEIGHT: f32 = 30.0;
+const BUTTON_PAD_X: f32 = 10.0;
 const BUTTON_TEXT: f32 = 12.0;
-const TOOLTIP_BG: u32 = 0x232932;
-const TOOLTIP_EDGE: u32 = 0x70797f;
-// Danger state stays silver-chrome with a faint warm tint so it reads as a
-// distinct, restrained accent rather than a loud red button.
-const DANGER_BG: u32 = 0x2a2228;
-const DANGER_EDGE: u32 = 0x9a8e92;
-const DANGER_EDGE_HOVER: u32 = 0xc2b3b7;
-const DANGER_HOVER: u32 = 0x342a30;
-const DANGER_TEXT: u32 = 0xe6cbcf;
-// Status-dot accents (footer running light only).
-const GREEN: u32 = 0x36d07a;
-const AMBER: u32 = 0xf0b84a;
-const RED: u32 = 0xef5a5a;
 
 const VIEWER_APP_ID: &str = "agent-workspace-linux-viewer";
 const VIEWER_BACKEND_ENV: &str = "AGENT_WORKSPACE_VIEWER_BACKEND";
 const VIEWER_PERMISSIONS_ENV: &str = "AGENT_WORKSPACE_VIEWER_PERMISSIONS";
 const VIEWER_BACKEND_X11: &str = "x11";
 const VIEWER_BACKEND_WAYLAND: &str = "wayland";
-const UI_FONT: &str = ".ZedSans";
+const UI_FONT: &str = "Inter Variable";
 const OVERLAY_WIDTH: f32 = 420.0;
 const OVERLAY_HEIGHT: f32 = 420.0;
 const OVERLAY_MIN_WIDTH: f32 = 380.0;
@@ -397,27 +473,33 @@ impl IntoElement for BoundsTrackedDiv {
 
 struct ViewerTooltip {
     text: SharedString,
+    palette: ViewerPalette,
 }
 
 impl ViewerTooltip {
-    fn new(text: impl Into<SharedString>) -> Self {
-        Self { text: text.into() }
+    fn new(text: impl Into<SharedString>, palette: ViewerPalette) -> Self {
+        Self {
+            text: text.into(),
+            palette,
+        }
     }
 }
 
 impl Render for ViewerTooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .font_family(UI_FONT)
             .max_w(px(260.0))
             .rounded(px(BUTTON_RADIUS))
             .border_1()
-            .border_color(rgb(TOOLTIP_EDGE))
-            .bg(rgb(TOOLTIP_BG))
+            .border_color(rgb(self.palette.border))
+            .bg(rgb(self.palette.surface))
             .px(px(8.0))
             .py(px(5.0))
             .shadow_md()
-            .text_size(px(10.0))
-            .text_color(rgb(TEXT))
+            .text_size(px(12.0))
+            .line_height(px(18.0))
+            .text_color(rgb(self.palette.text))
             .children(
                 self.text
                     .split('\n')
@@ -493,6 +575,8 @@ struct AgentWorkspaceViewer {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct ViewerPreferences {
+    #[serde(default)]
+    theme: ViewerTheme,
     width: f32,
     height: f32,
     #[serde(default = "default_screen_stream")]
@@ -687,6 +771,7 @@ fn normalize_xdotool_key(key: &str) -> Option<String> {
 impl Default for ViewerPreferences {
     fn default() -> Self {
         Self {
+            theme: ViewerTheme::System,
             width: OVERLAY_WIDTH,
             height: OVERLAY_HEIGHT,
             screen_stream: default_screen_stream(),
@@ -2592,7 +2677,14 @@ fn bound_target_id_missing(
 }
 
 impl Render for AgentWorkspaceViewer {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let palette = self.preferences.theme.palette(window.appearance());
+        let compact = window.bounds().size.width < px(620.0);
+        let on_theme = cx.listener(|this: &mut Self, _event: &ClickEvent, _window, cx| {
+            this.preferences.theme = this.preferences.theme.next();
+            let _ = save_viewer_preferences(&this.preferences);
+            cx.notify();
+        });
         let on_refresh = cx.listener(|this: &mut Self, _event: &ClickEvent, _window, cx| {
             if let Some(action) = &this.action_in_flight {
                 this.message = format!("{} is running", action.label());
@@ -2700,7 +2792,7 @@ impl Render for AgentWorkspaceViewer {
             },
             Segment {
                 id: "viewer-mcp-read-only",
-                label: McpControlMode::ReadOnly.button_label().into(),
+                label: "Read only".into(),
                 active: control_mode == McpControlMode::ReadOnly,
                 tooltip: Some(tooltip_text(mcp_control_action_tooltip(
                     control_mode,
@@ -2770,7 +2862,11 @@ impl Render for AgentWorkspaceViewer {
         let frame = self.frame.clone();
         let image = frame.as_ref().map(|frame| frame.image.clone());
         let title = format!("Workspace {}", self.target_id);
-        let live_label = if self.screen_stream { "View" } else { "Still" };
+        let live_label = if self.screen_stream {
+            "Live view"
+        } else {
+            "Resume view"
+        };
         let live_tooltip = if self.screen_stream {
             "Stop streaming screen frames; status still refreshes"
         } else {
@@ -2817,7 +2913,7 @@ impl Render for AgentWorkspaceViewer {
             "Refreshing workspace snapshot...".to_string()
         } else if let Some(seconds_left) = revoke_confirm_seconds_left {
             format!(
-                "Click Rev again within {seconds_left}s to stop and remove {}",
+                "Click Revoke again within {seconds_left}s to stop and remove {}",
                 self.target_id
             )
         } else if let Some(seconds_left) = cleanup_confirm_seconds_left {
@@ -2853,7 +2949,7 @@ impl Render for AgentWorkspaceViewer {
         let mut footer_text = if revoke_armed {
             let seconds_left = revoke_confirm_seconds_left.unwrap_or(1);
             format!(
-                "Confirm revoke: click Rev again within {seconds_left}s to stop workspace and remove files"
+                "Confirm revoke: click Revoke again within {seconds_left}s to stop workspace and remove files"
             )
         } else if cleanup_armed {
             let seconds_left = cleanup_confirm_seconds_left.unwrap_or(1);
@@ -2929,62 +3025,52 @@ impl Render for AgentWorkspaceViewer {
             .size_full()
             .relative()
             .overflow_hidden()
-            .rounded(px(10.0))
-            .p(px(8.0))
-            .gap(px(8.0))
-            // Translucent graphite fill so the window blur reads through as
-            // frosted glass; the silvery outer edge plus a brighter top edge
-            // fakes a brushed-metal rim.
-            .bg(rgba(BG_GLASS))
+            .rounded(px(14.0))
+            .p(px(12.0))
+            .gap(px(10.0))
+            .bg(rgb(palette.background))
             .text_size(px(12.0))
-            .text_color(rgb(TEXT))
+            .text_color(rgb(palette.text))
             .font_family(UI_FONT)
             .border_1()
-            .border_color(rgb(EDGE_SILVER))
+            .border_color(rgb(palette.outer_border))
             .cursor(CursorStyle::Arrow)
             .on_mouse_move(cx.listener(Self::update_interaction))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::end_interaction))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::end_interaction))
-            // Faint brushed-metal highlight row hugging the inner top edge.
-            .child(
-                div()
-                    .absolute()
-                    .top_0()
-                    .left_0()
-                    .right_0()
-                    .h(px(1.0))
-                    .bg(rgba((EDGE_HIGHLIGHT << 8) | 0xb0)),
-            )
             .child(
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
                     .gap(px(8.0))
-                    .h(px(34.0))
+                    .h(px(48.0))
+                    .flex_shrink_0()
+                    .when(compact, |header| header.flex_col().items_start().h_auto())
                     .cursor(CursorStyle::OpenHand)
                     .child(
                         div()
                             .flex()
                             .flex_col()
                             .flex_1()
-                            .gap(px(1.0))
+                            .gap(px(3.0))
+                            .when(compact, |identity| identity.flex_none().w_full())
                             .min_w_0()
                             .cursor(CursorStyle::OpenHand)
                             .on_mouse_down(MouseButton::Left, on_window_move_start)
                             .child(
                                 div()
-                                    .text_size(px(13.0))
+                                    .text_size(px(16.0))
                                     .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .line_height(px(16.0))
+                                    .line_height(px(20.0))
                                     .truncate()
                                     .child(SharedString::from(title)),
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.0))
-                                    .line_height(px(14.0))
-                                    .text_color(rgb(MUTED))
+                                    .text_size(px(12.0))
+                                    .line_height(px(16.0))
+                                    .text_color(rgb(palette.muted))
                                     .truncate()
                                     .child(SharedString::from(header_detail)),
                             ),
@@ -2997,15 +3083,19 @@ impl Render for AgentWorkspaceViewer {
                             .flex()
                             .items_center()
                             .gap(px(6.0))
-                            .child(segmented_control(control_segments))
+                            .flex_shrink_0()
+                            .when(compact, |actions| actions.w_full().justify_between())
+                            .child(segmented_control(palette, control_segments))
                             .child(if let Some(action) = &busy_action {
                                 disabled_button_with_tooltip(
+                                    palette,
                                     "viewer-action",
                                     action.button_label(),
                                     Some(tooltip_text(action.label())),
                                 )
                             } else if running {
                                 danger_button_with_tooltip(
+                                    palette,
                                     "viewer-stop",
                                     "Stop",
                                     Some(tooltip_text(
@@ -3015,6 +3105,7 @@ impl Render for AgentWorkspaceViewer {
                                 )
                             } else {
                                 button_with_tooltip(
+                                    palette,
                                     "viewer-start",
                                     "Start",
                                     Some(tooltip_text(format!("Start {selected_profile_label}"))),
@@ -3023,6 +3114,7 @@ impl Render for AgentWorkspaceViewer {
                             })
                             .child(if self.show_more {
                                 selected_button_with_tooltip(
+                                    palette,
                                     "viewer-more",
                                     "More ▴",
                                     Some(tooltip_text("Hide the secondary controls")),
@@ -3030,6 +3122,7 @@ impl Render for AgentWorkspaceViewer {
                                 )
                             } else {
                                 button_with_tooltip(
+                                    palette,
                                     "viewer-more",
                                     "More ▾",
                                     Some(tooltip_text(
@@ -3039,6 +3132,7 @@ impl Render for AgentWorkspaceViewer {
                                 )
                             })
                             .child(button_with_tooltip(
+                                palette,
                                 "viewer-close",
                                 "✕",
                                 Some(tooltip_text("Close the viewer (the workspace keeps running)")),
@@ -3053,28 +3147,39 @@ impl Render for AgentWorkspaceViewer {
             .when(self.show_more, |panel| {
                 panel.child(
                     div()
+                        .id("viewer-secondary-controls")
                         .flex()
                         .flex_wrap()
                         .items_center()
-                        .gap(px(4.0))
-                        .rounded(px(8.0))
+                        .max_h(window.bounds().size.height / 3.0)
+                        .overflow_y_scroll()
+                        .gap(px(6.0))
+                        .rounded(px(10.0))
                         .border_1()
-                        .border_color(rgb(BORDER))
-                        .bg(rgb(SURFACE))
-                        .px(px(6.0))
-                        .py(px(5.0))
+                        .border_color(rgb(palette.border))
+                        .bg(rgb(palette.surface))
+                        .p(px(8.0))
                         .cursor(CursorStyle::Arrow)
                         .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
                             cx.stop_propagation();
                         })
+                        .child(button_with_tooltip(
+                            palette,
+                            "viewer-theme",
+                            format!("Theme: {}", self.preferences.theme.label()),
+                            Some(tooltip_text("Cycle appearance: System, Light, Dark")),
+                            on_theme,
+                        ))
                         .child(if busy_action.is_some() || refreshing {
                             disabled_button_with_tooltip(
+                                palette,
                                 "viewer-refresh",
                                 "Refresh",
                                 Some(tooltip_text("Refresh waits for the current action")),
                             )
                         } else {
                             button_with_tooltip(
+                                palette,
                                 "viewer-refresh",
                                 "Refresh",
                                 Some(tooltip_text("Refresh workspace state now")),
@@ -3083,6 +3188,7 @@ impl Render for AgentWorkspaceViewer {
                         })
                         .child(if self.screen_stream {
                             selected_button_with_tooltip(
+                                palette,
                                 "viewer-live",
                                 live_label,
                                 Some(tooltip_text(live_tooltip)),
@@ -3090,6 +3196,7 @@ impl Render for AgentWorkspaceViewer {
                             )
                         } else {
                             button_with_tooltip(
+                                palette,
                                 "viewer-live",
                                 live_label,
                                 Some(tooltip_text(live_tooltip)),
@@ -3100,6 +3207,7 @@ impl Render for AgentWorkspaceViewer {
                             div().into_any_element()
                         } else if self.input_forwarding_enabled {
                             selected_button_with_tooltip(
+                                palette,
                                 "viewer-input-on",
                                 "Input",
                                 Some(tooltip_text(
@@ -3109,6 +3217,7 @@ impl Render for AgentWorkspaceViewer {
                             )
                         } else if input_forward_confirm_seconds_left.is_some() {
                             danger_button_with_tooltip(
+                                palette,
                                 "viewer-input-confirm",
                                 "Input?",
                                 Some(tooltip_text(
@@ -3118,6 +3227,7 @@ impl Render for AgentWorkspaceViewer {
                             )
                         } else {
                             button_with_tooltip(
+                                palette,
                                 "viewer-input",
                                 "Input",
                                 Some(tooltip_text(
@@ -3129,12 +3239,14 @@ impl Render for AgentWorkspaceViewer {
                         .child(if let Some(label) = workspace_cycle_label {
                             if busy_action.is_some() || refreshing {
                                 disabled_button_with_tooltip(
+                                    palette,
                                     "viewer-workspace",
                                     label,
                                     Some(tooltip_text("Workspace switching waits for refresh")),
                                 )
                             } else {
                                 button_with_tooltip(
+                                    palette,
                                     "viewer-workspace",
                                     label,
                                     Some(tooltip_text("Switch between known workspaces")),
@@ -3148,6 +3260,7 @@ impl Render for AgentWorkspaceViewer {
                             div().into_any_element()
                         } else if busy_action.is_some() {
                             disabled_button_with_tooltip(
+                                palette,
                                 "viewer-profile",
                                 "Profile",
                                 Some(tooltip_text(
@@ -3156,6 +3269,7 @@ impl Render for AgentWorkspaceViewer {
                             )
                         } else {
                             button_with_tooltip(
+                                palette,
                                 "viewer-profile",
                                 "Profile",
                                 Some(tooltip_text("Cycle the profile used by Start")),
@@ -3166,14 +3280,16 @@ impl Render for AgentWorkspaceViewer {
                             div().into_any_element()
                         } else if busy_action.is_some() || refreshing {
                             disabled_button_with_tooltip(
+                                palette,
                                 "viewer-capture",
-                                "Shot",
+                                "Snapshot",
                                 Some(tooltip_text("Screenshot waits for the current action")),
                             )
                         } else {
                             button_with_tooltip(
+                                palette,
                                 "viewer-capture",
-                                "Shot",
+                                "Snapshot",
                                 Some(tooltip_text(
                                     "Save a screenshot of the active workspace window",
                                 )),
@@ -3184,12 +3300,14 @@ impl Render for AgentWorkspaceViewer {
                             div().into_any_element()
                         } else if busy_action.is_some() || refreshing {
                             disabled_button_with_tooltip(
+                                palette,
                                 "viewer-revoke",
-                                "Rev",
+                                "Revoke",
                                 Some(tooltip_text("Revoke waits for the current action")),
                             )
                         } else if revoke_armed {
                             danger_button_with_tooltip(
+                                palette,
                                 "viewer-revoke-confirm",
                                 "Sure?",
                                 Some(tooltip_text(
@@ -3199,8 +3317,9 @@ impl Render for AgentWorkspaceViewer {
                             )
                         } else {
                             danger_button_with_tooltip(
+                                palette,
                                 "viewer-revoke",
-                                "Rev",
+                                "Revoke",
                                 Some(tooltip_text(
                                     "Revoke: stop workspace and remove runtime files",
                                 )),
@@ -3211,12 +3330,14 @@ impl Render for AgentWorkspaceViewer {
                             div().into_any_element()
                         } else if busy_action.is_some() || refreshing {
                             disabled_button_with_tooltip(
+                                palette,
                                 "viewer-clean",
                                 "Clean",
                                 Some(tooltip_text("Cleanup waits for the current action")),
                             )
                         } else if cleanup_armed {
                             danger_button_with_tooltip(
+                                palette,
                                 "viewer-clean-confirm",
                                 "Sure?",
                                 Some(tooltip_text(
@@ -3226,6 +3347,7 @@ impl Render for AgentWorkspaceViewer {
                             )
                         } else {
                             danger_button_with_tooltip(
+                                palette,
                                 "viewer-clean",
                                 "Clean",
                                 Some(tooltip_text("Remove stopped workspace runtime files")),
@@ -3236,12 +3358,14 @@ impl Render for AgentWorkspaceViewer {
                             div().into_any_element()
                         } else if footer_locked {
                             disabled_button_with_tooltip(
+                                palette,
                                 "viewer-artifacts",
                                 "Files",
                                 Some(tooltip_text("Artifact folder waits for the current state")),
                             )
                         } else {
                             button_with_tooltip(
+                                palette,
                                 "viewer-artifacts",
                                 "Files",
                                 Some(tooltip_text("Open the workspace artifact folder")),
@@ -3252,14 +3376,16 @@ impl Render for AgentWorkspaceViewer {
                             div().into_any_element()
                         } else if footer_locked {
                             disabled_button_with_tooltip(
+                                palette,
                                 "viewer-events",
-                                "Evt",
+                                "Events",
                                 Some(tooltip_text("Event log waits for the current state")),
                             )
                         } else {
                             button_with_tooltip(
+                                palette,
                                 "viewer-events",
-                                "Evt",
+                                "Events",
                                 Some(tooltip_text("Open the workspace event log")),
                                 on_events,
                             )
@@ -3268,26 +3394,30 @@ impl Render for AgentWorkspaceViewer {
                             div().into_any_element()
                         } else if footer_locked {
                             disabled_button_with_tooltip(
+                                palette,
                                 "viewer-app-log",
-                                "Log",
+                                "App log",
                                 Some(tooltip_text("App log waits for the current state")),
                             )
                         } else {
                             button_with_tooltip(
+                                palette,
                                 "viewer-app-log",
-                                "Log",
+                                "App log",
                                 Some(tooltip_text("Open the active app log")),
                                 on_app_log,
                             )
                         })
                         .child(if footer_locked {
                             disabled_button_with_tooltip(
+                                palette,
                                 "viewer-footer-mode",
                                 self.footer_mode.label(),
                                 Some(tooltip_text("Footer mode waits for the current state")),
                             )
                         } else {
                             button_with_tooltip(
+                                palette,
                                 "viewer-footer-mode",
                                 self.footer_mode.label(),
                                 Some(tooltip_text("Cycle footer: activity, task, isolation, apps")),
@@ -3304,14 +3434,16 @@ impl Render for AgentWorkspaceViewer {
                     .flex()
                     .flex_1()
                     .w_full()
-                    .min_h_0()
+                    // Keep a thumbnail visible while the secondary controls
+                    // scroll in the minimum-height window.
+                    .min_h(px(64.0))
                     .relative()
                     .items_center()
                     .justify_center()
-                    .rounded(px(8.0))
+                    .rounded(px(10.0))
                     .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(0x0b0d10))
+                    .border_color(rgb(palette.border))
+                    .bg(rgb(palette.preview))
                     .overflow_hidden()
                     .cursor(if self.input_forwarding_ready() {
                         CursorStyle::Crosshair
@@ -3341,14 +3473,20 @@ impl Render for AgentWorkspaceViewer {
                             .object_fit(ObjectFit::Cover)
                             .into_any_element(),
                         None => div()
-                            .px(px(14.0))
-                            .text_size(px(12.0))
-                            .text_color(rgb(MUTED))
-                            .child(if running {
-                                "Screen stream off"
-                            } else {
-                                "No running workspace yet"
-                            })
+                            .flex()
+                            .flex_col()
+                            .items_center()
+                            .gap(px(6.0))
+                            .px(px(20.0))
+                            .child(div()
+                                .text_size(px(16.0))
+                                .font_weight(gpui::FontWeight::MEDIUM)
+                                .text_color(rgb(palette.text))
+                                .child(if running { "Screen view is paused" } else { "No workspace running" }))
+                            .child(div()
+                                .text_size(px(12.0))
+                                .text_color(rgb(palette.muted))
+                                .child(if running { "Resume the live view from More." } else { "Start a workspace to see its desktop here." }))
                             .into_any_element(),
                     }),
                 self.screen_bounds.clone(),
@@ -3359,12 +3497,12 @@ impl Render for AgentWorkspaceViewer {
                     .items_center()
                     .justify_between()
                     .gap(px(8.0))
-                    .rounded(px(7.0))
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SURFACE))
-                    .px(px(6.0))
-                    .py(px(4.0))
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(rgb(palette.border))
+                    .pt(px(8.0))
+                    .pb(px(2.0))
+                    .px(px(2.0))
                     .cursor(CursorStyle::Arrow)
                     .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
                         cx.stop_propagation();
@@ -3375,19 +3513,34 @@ impl Render for AgentWorkspaceViewer {
                             .min_w_0()
                             .text_size(px(11.0))
                             .line_height(px(14.0))
-                            .text_color(rgb(MUTED))
+                            .text_color(rgb(palette.muted))
                             .truncate()
                             .child(SharedString::from(footer_text)),
                     )
-                    // Footer right side: just the running status light (no text
-                    // banner). The artifact/footer-mode buttons moved into the
-                    // "More" cluster above.
+                    // Pair the status color with text so state is readable
+                    // without relying on color alone.
                     .child(
                         div()
                             .flex()
                             .items_center()
+                            .flex_shrink_0()
+                            .gap(px(6.0))
+                            .text_size(px(11.0))
+                            .text_color(rgb(palette.muted))
                             .pl(px(8.0))
+                            .child(if self.error.is_some() {
+                                "Attention"
+                            } else if !running {
+                                "Stopped"
+                            } else {
+                                match control_mode {
+                                    McpControlMode::Active => "Running",
+                                    McpControlMode::ReadOnly => "Read only",
+                                    McpControlMode::Paused => "Paused",
+                                }
+                            })
                             .child(status_light(running_status_color(
+                                palette,
                                 running,
                                 control_mode,
                                 self.error.is_some(),
@@ -3397,48 +3550,56 @@ impl Render for AgentWorkspaceViewer {
             // Resize hit-zones on every edge and corner. Edges are thin strips;
             // corners are small squares layered on top so they win the overlap.
             .child(resize_edge_zone(
+                palette,
                 "viewer-resize-top",
                 ResizeEdge::Top,
                 CursorStyle::ResizeUpDown,
                 on_resize_top,
             ))
             .child(resize_edge_zone(
+                palette,
                 "viewer-resize-bottom",
                 ResizeEdge::Bottom,
                 CursorStyle::ResizeUpDown,
                 on_resize_bottom,
             ))
             .child(resize_edge_zone(
+                palette,
                 "viewer-resize-left",
                 ResizeEdge::Left,
                 CursorStyle::ResizeLeftRight,
                 on_resize_left,
             ))
             .child(resize_edge_zone(
+                palette,
                 "viewer-resize-right",
                 ResizeEdge::Right,
                 CursorStyle::ResizeLeftRight,
                 on_resize_right,
             ))
             .child(resize_edge_zone(
+                palette,
                 "viewer-resize-top-left",
                 ResizeEdge::TopLeft,
                 CursorStyle::ResizeUpLeftDownRight,
                 on_resize_top_left,
             ))
             .child(resize_edge_zone(
+                palette,
                 "viewer-resize-top-right",
                 ResizeEdge::TopRight,
                 CursorStyle::ResizeUpRightDownLeft,
                 on_resize_top_right,
             ))
             .child(resize_edge_zone(
+                palette,
                 "viewer-resize-bottom-left",
                 ResizeEdge::BottomLeft,
                 CursorStyle::ResizeUpRightDownLeft,
                 on_resize_bottom_left,
             ))
             .child(resize_edge_zone(
+                palette,
                 "viewer-resize-bottom-right",
                 ResizeEdge::BottomRight,
                 CursorStyle::ResizeUpLeftDownRight,
@@ -3465,12 +3626,18 @@ pub fn run(options: ViewerOptions) -> Result<()> {
         }
     };
     application().run(move |cx: &mut App| {
+        cx.text_system()
+            .add_fonts(vec![std::borrow::Cow::Borrowed(
+                include_bytes!("../assets/fonts/InterVariable.ttf").as_slice(),
+            )])
+            .expect("failed to load the bundled Inter typeface");
         if backend == ViewerBackend::X11Popup {
             let popup_options = options.clone();
             cx.open_window(
                 x11_window_options(cx),
                 move |window, cx| {
                     window.set_app_id(VIEWER_APP_ID);
+                    window.observe_window_appearance(|window, _cx| window.refresh()).detach();
                     cx.new(|cx| AgentWorkspaceViewer::new(popup_options.clone(), cx))
                 },
             )
@@ -3483,6 +3650,7 @@ pub fn run(options: ViewerOptions) -> Result<()> {
             let normal_options = options.clone();
             cx.open_window(normal_window_options(cx), move |window, cx| {
                 window.set_app_id(VIEWER_APP_ID);
+                    window.observe_window_appearance(|window, _cx| window.refresh()).detach();
                 cx.new(|cx| AgentWorkspaceViewer::new(normal_options.clone(), cx))
             })
             .expect("failed to open agent workspace viewer");
@@ -3492,6 +3660,7 @@ pub fn run(options: ViewerOptions) -> Result<()> {
         let layer_options = options.clone();
         if let Err(error) = cx.open_window(layer_shell_window_options(options.input_forwarding), move |window, cx| {
             window.set_app_id(VIEWER_APP_ID);
+                    window.observe_window_appearance(|window, _cx| window.refresh()).detach();
             cx.new(|cx| AgentWorkspaceViewer::new(layer_options.clone(), cx))
         }) {
             match maybe_spawn_x11_replacement(&options) {
@@ -3517,6 +3686,7 @@ pub fn run(options: ViewerOptions) -> Result<()> {
                 x11_window_options(cx),
                 move |window, cx| {
                     window.set_app_id(VIEWER_APP_ID);
+                    window.observe_window_appearance(|window, _cx| window.refresh()).detach();
                     cx.new(|cx| AgentWorkspaceViewer::new(fallback_options.clone(), cx))
                 },
             )
@@ -4798,8 +4968,9 @@ const RESIZE_EDGE_HIT: f32 = 6.0;
 
 /// Build one thin resize hit-zone pinned to the given edge/corner. `on_down`
 /// starts the resize for that edge; the visible bottom-right corner also carries
-/// a faint brushed-metal grip so the resize affordance stays discoverable.
+/// a subtle grip so resizing stays discoverable.
 fn resize_edge_zone<F>(
+    palette: ViewerPalette,
     id: &'static str,
     edge: ResizeEdge,
     cursor: CursorStyle,
@@ -4841,12 +5012,17 @@ where
                     .flex_col()
                     .items_end()
                     .gap(px(2.0))
-                    .child(div().w(px(6.0)).border_b_1().border_color(rgb(EDGE_SILVER)))
+                    .child(
+                        div()
+                            .w(px(6.0))
+                            .border_b_1()
+                            .border_color(rgb(palette.outer_border)),
+                    )
                     .child(
                         div()
                             .w(px(10.0))
                             .border_b_1()
-                            .border_color(rgb(EDGE_HIGHLIGHT)),
+                            .border_color(rgb(palette.muted)),
                     ),
             );
     }
@@ -4896,11 +5072,15 @@ fn control_segment_labels(mode: McpControlMode) -> Vec<&'static str> {
     }
 }
 
-fn attach_tooltip(element: Stateful<Div>, tooltip: Option<SharedString>) -> Stateful<Div> {
+fn attach_tooltip(
+    palette: ViewerPalette,
+    element: Stateful<Div>,
+    tooltip: Option<SharedString>,
+) -> Stateful<Div> {
     element.when_some(tooltip, |element, tooltip| {
         element.tooltip(move |_window, cx| {
             let tooltip = tooltip.clone();
-            cx.new(|_| ViewerTooltip::new(tooltip)).into()
+            cx.new(|_| ViewerTooltip::new(tooltip, palette)).into()
         })
     })
 }
@@ -4918,36 +5098,35 @@ enum ButtonKind {
 }
 
 impl ButtonKind {
-    /// (fill, border, text, hover_fill, hover_border) for this state.
-    fn colors(self) -> (u32, u32, u32, u32, u32) {
+    fn colors(self, palette: ViewerPalette) -> (u32, u32, u32, u32, u32) {
         match self {
-            ButtonKind::Normal => (
-                BUTTON_BG,
-                BUTTON_EDGE_SOFT,
-                TEXT,
-                BUTTON_BG_HOVER,
-                BUTTON_EDGE,
+            Self::Normal => (
+                palette.button,
+                palette.border,
+                palette.text,
+                palette.hover,
+                palette.outer_border,
             ),
-            ButtonKind::Selected => (
-                BUTTON_SELECTED_BG,
-                BUTTON_SELECTED_EDGE,
-                TEXT,
-                BUTTON_SELECTED_BG_HOVER,
-                BUTTON_EDGE,
+            Self::Selected => (
+                palette.selected,
+                palette.selected_edge,
+                palette.selected_text,
+                palette.selected_hover,
+                palette.selected_edge,
             ),
-            ButtonKind::Danger => (
-                DANGER_BG,
-                DANGER_EDGE,
-                DANGER_TEXT,
-                DANGER_HOVER,
-                DANGER_EDGE_HOVER,
+            Self::Danger => (
+                palette.danger,
+                palette.danger_edge,
+                palette.danger_text,
+                palette.danger_hover,
+                palette.danger_edge,
             ),
-            ButtonKind::Disabled => (
-                BUTTON_DISABLED_BG,
-                BUTTON_DISABLED_EDGE,
-                BUTTON_DISABLED_TEXT,
-                BUTTON_DISABLED_BG,
-                BUTTON_DISABLED_EDGE,
+            Self::Disabled => (
+                palette.background,
+                palette.border,
+                palette.disabled_text,
+                palette.background,
+                palette.border,
             ),
         }
     }
@@ -4957,6 +5136,7 @@ impl ButtonKind {
 /// optional click handler. `Disabled` renders the same pill with muted fill and
 /// no hover/click affordance.
 fn pill_button<F>(
+    palette: ViewerPalette,
     id: &'static str,
     label: impl Into<SharedString>,
     tooltip: Option<SharedString>,
@@ -4966,7 +5146,7 @@ fn pill_button<F>(
 where
     F: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 {
-    let (bg, border, text, hover_bg, hover_border) = kind.colors();
+    let (bg, border, text, hover_bg, hover_border) = kind.colors(palette);
     let interactive = !matches!(kind, ButtonKind::Disabled);
     let base = div()
         .id(id)
@@ -4978,13 +5158,12 @@ where
         .rounded(px(BUTTON_RADIUS))
         .bg(rgb(bg))
         .text_size(px(BUTTON_TEXT))
+        .whitespace_nowrap()
         .font_weight(gpui::FontWeight::MEDIUM)
         .line_height(px(BUTTON_HEIGHT))
         .text_color(rgb(text))
         .border_1()
         .border_color(rgb(border))
-        // Faint brushed-metal highlight on the top edge of the pill.
-        .border_t_1()
         .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
             cx.stop_propagation();
         });
@@ -4997,7 +5176,7 @@ where
     let base = base.when_some(on_click.filter(|_| interactive), |element, on_click| {
         element.on_click(on_click)
     });
-    attach_tooltip(base.child(label.into()), tooltip).into_any_element()
+    attach_tooltip(palette, base.child(label.into()), tooltip).into_any_element()
 }
 
 /// A boxed click handler for a segmented-control segment.
@@ -5014,27 +5193,25 @@ struct Segment {
     on_click: Option<SegmentClick>,
 }
 
-/// A connected segmented control — equal-width segments sharing one rounded
-/// silvery rim, with hairline dividers between them. The active segment shows
-/// the selected fill; the others are quiet and clickable. Used for the live
-/// control mode `[ Run · RO · Pause ]`.
-fn segmented_control(segments: Vec<Segment>) -> AnyElement {
-    let last = segments.len().saturating_sub(1);
+/// A shared track with a filled active segment for Run, Read only and Pause.
+fn segmented_control(palette: ViewerPalette, segments: Vec<Segment>) -> AnyElement {
     let mut row = div()
         .flex()
         .items_center()
         .h(px(BUTTON_HEIGHT))
+        .p(px(2.0))
+        .gap(px(2.0))
         .rounded(px(BUTTON_RADIUS))
         .border_1()
-        .border_color(rgb(EDGE_SILVER))
-        .bg(rgb(SURFACE))
+        .border_color(rgb(palette.border))
+        .bg(rgb(palette.surface))
         .overflow_hidden();
 
-    for (index, segment) in segments.into_iter().enumerate() {
+    for segment in segments {
         let (bg, text) = if segment.active {
-            (BUTTON_SELECTED_BG, TEXT)
+            (palette.selected, palette.selected_text)
         } else {
-            (SURFACE, MUTED)
+            (palette.surface, palette.muted)
         };
         let mut cell = div()
             .id(segment.id)
@@ -5043,34 +5220,37 @@ fn segmented_control(segments: Vec<Segment>) -> AnyElement {
             .items_center()
             .justify_center()
             .h_full()
-            .px(px(10.0))
+            .rounded(px(4.0))
+            .px(px(8.0))
             .bg(rgb(bg))
             .text_size(px(BUTTON_TEXT))
+            .whitespace_nowrap()
             .font_weight(gpui::FontWeight::MEDIUM)
             .line_height(px(BUTTON_HEIGHT))
             .text_color(rgb(text))
             .on_mouse_down(MouseButton::Left, |_event, _window, cx| {
                 cx.stop_propagation();
             });
-        if index < last {
-            // Hairline divider between segments.
-            cell = cell.border_r_1().border_color(rgb(BORDER));
-        }
         if !segment.active {
             cell = cell
                 .cursor_pointer()
-                .hover(|style| style.bg(rgb(SURFACE_2)).text_color(rgb(TEXT)));
+                .hover(move |style| style.bg(rgb(palette.raised)).text_color(rgb(palette.text)));
             if let Some(on_click) = segment.on_click {
                 cell = cell.on_click(move |event, window, app| on_click(event, window, app));
             }
         }
-        row = row.child(attach_tooltip(cell.child(segment.label), segment.tooltip));
+        row = row.child(attach_tooltip(
+            palette,
+            cell.child(segment.label),
+            segment.tooltip,
+        ));
     }
 
     row.into_any_element()
 }
 
 fn button_with_tooltip<F>(
+    palette: ViewerPalette,
     id: &'static str,
     label: impl Into<SharedString>,
     tooltip: Option<SharedString>,
@@ -5079,10 +5259,18 @@ fn button_with_tooltip<F>(
 where
     F: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 {
-    pill_button(id, label, tooltip, ButtonKind::Normal, Some(on_click))
+    pill_button(
+        palette,
+        id,
+        label,
+        tooltip,
+        ButtonKind::Normal,
+        Some(on_click),
+    )
 }
 
 fn danger_button_with_tooltip<F>(
+    palette: ViewerPalette,
     id: &'static str,
     label: impl Into<SharedString>,
     tooltip: Option<SharedString>,
@@ -5091,10 +5279,18 @@ fn danger_button_with_tooltip<F>(
 where
     F: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 {
-    pill_button(id, label, tooltip, ButtonKind::Danger, Some(on_click))
+    pill_button(
+        palette,
+        id,
+        label,
+        tooltip,
+        ButtonKind::Danger,
+        Some(on_click),
+    )
 }
 
 fn selected_button_with_tooltip<F>(
+    palette: ViewerPalette,
     id: &'static str,
     label: impl Into<SharedString>,
     tooltip: Option<SharedString>,
@@ -5103,15 +5299,24 @@ fn selected_button_with_tooltip<F>(
 where
     F: Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 {
-    pill_button(id, label, tooltip, ButtonKind::Selected, Some(on_click))
+    pill_button(
+        palette,
+        id,
+        label,
+        tooltip,
+        ButtonKind::Selected,
+        Some(on_click),
+    )
 }
 
 fn disabled_button_with_tooltip(
+    palette: ViewerPalette,
     id: &'static str,
     label: impl Into<SharedString>,
     tooltip: Option<SharedString>,
 ) -> AnyElement {
     pill_button(
+        palette,
         id,
         label,
         tooltip,
@@ -5122,15 +5327,20 @@ fn disabled_button_with_tooltip(
 
 /// Pick the running indicator color: green when running, amber when paused or
 /// read-only (or when something needs attention), muted grey when stopped.
-fn running_status_color(running: bool, mode: McpControlMode, has_error: bool) -> u32 {
+fn running_status_color(
+    palette: ViewerPalette,
+    running: bool,
+    mode: McpControlMode,
+    has_error: bool,
+) -> u32 {
     if has_error {
-        RED
+        palette.red
     } else if !matches!(mode, McpControlMode::Active) {
-        AMBER
+        palette.amber
     } else if running {
-        GREEN
+        palette.green
     } else {
-        MUTED
+        palette.muted
     }
 }
 
@@ -5898,6 +6108,7 @@ mod tests {
         let dir = temp_test_path("prefs");
         let path = dir.join("viewer.json");
         let preferences = ViewerPreferences {
+            theme: ViewerTheme::Dark,
             width: 120.0,
             height: 200.0,
             screen_stream: false,
@@ -5909,6 +6120,7 @@ mod tests {
         save_viewer_preferences_to_path(&path, &preferences).expect("save viewer preferences");
         let loaded = load_viewer_preferences_from_path(&path);
 
+        assert_eq!(loaded.theme, ViewerTheme::Dark);
         assert_eq!(loaded.width, OVERLAY_MIN_WIDTH);
         assert_eq!(loaded.height, OVERLAY_MIN_HEIGHT);
         assert_eq!(loaded.x, Some(42.0));
@@ -5921,6 +6133,7 @@ mod tests {
     #[test]
     fn viewer_preferences_normalize_invalid_position() {
         let loaded = normalize_viewer_preferences(ViewerPreferences {
+            theme: ViewerTheme::System,
             width: f32::NAN,
             height: f32::INFINITY,
             screen_stream: true,
@@ -5979,6 +6192,7 @@ mod tests {
         .expect("write old preferences without footer mode");
         let loaded = load_viewer_preferences_from_path(&path);
         assert_eq!(loaded.footer_mode, FooterMode::Activity);
+        assert_eq!(loaded.theme, ViewerTheme::System);
         assert!(
             loaded.screen_stream,
             "preferences predating the screen_stream field default to the screen shown on"
