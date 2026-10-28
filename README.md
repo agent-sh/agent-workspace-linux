@@ -60,7 +60,7 @@ Other backends need [their own packages](#backend-packages).
 # npm: downloads the prebuilt binary from the matching release and checks its sha256
 npm install -g @agent-sh/agent-workspace-linux
 
-# cargo: builds from git and installs only the binary (add --tag v0.6.0 to pin)
+# cargo: builds from git and installs only the binary (add --tag v0.6.1 to pin)
 cargo install --git https://github.com/agent-sh/agent-workspace-linux
 ```
 
