@@ -12,6 +12,9 @@ jobs:
   rust:
     name: Rust and script checks
     runs-on: ubuntu-latest
+    env:
+      CARGO_INCREMENTAL: "0"
+      CARGO_PROFILE_DEV_DEBUG: "0"
 
     steps:
       - name: Checkout
@@ -56,6 +59,9 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@c8037a86dde8214a8310e9f54a8fc61ab362aa31 # v2
 
+      - name: Install nextest
+        uses: taiki-e/install-action@d042af60014eb018fcd01f57f4f62118b69e3ea6 # nextest
+
       - name: Format
         run: cargo fmt --check
 
@@ -69,7 +75,18 @@ jobs:
         run: cargo clippy --locked -- -D warnings
 
       - name: Test
-        run: cargo test --locked
+        run: cargo nextest run --locked
+
+      - name: Doc tests
+        # This package is currently binary-only. Keep doctests in the workflow
+        # when a library target is added; nextest never runs them.
+        run: |
+          cargo metadata --locked --no-deps --format-version 1 > target/doc-targets.json
+          if python3 -c 'import json; import sys; data = json.load(open("target/doc-targets.json")); sys.exit(not any(t["doctest"] and "lib" in t["kind"] for p in data["packages"] for t in p["targets"]))'; then
+            cargo test --locked --doc
+          else
+            echo "No library targets with doctests."
+          fi
 
       - name: Native X11 focus regression
         run: node scripts/x11_focus_smoke.js

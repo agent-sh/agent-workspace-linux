@@ -9527,7 +9527,16 @@ mod tests {
     #[test]
     fn owned_daemon_matches_only_its_live_session() {
         let mut child = Command::new("sh")
-            .args(["-c", "sleep 30", "daemon", "--session-id", "session-test-1"])
+            // Block in the shell itself. An external sleep survives killing
+            // the shell and keeps nextest's captured output pipes open.
+            .args([
+                "-c",
+                "read -r unused",
+                "daemon",
+                "--session-id",
+                "session-test-1",
+            ])
+            .stdin(std::process::Stdio::piped())
             .spawn()
             .expect("spawn stand-in daemon");
         let pid = child.id() as i32;
