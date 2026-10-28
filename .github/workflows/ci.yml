@@ -69,7 +69,7 @@ jobs:
         run: cargo build --locked
 
       - name: Installer smoke
-        run: scripts/install_smoke.sh
+        run: scripts/install_smoke.sh target/debug/agent-workspace-linux
 
       - name: Clippy
         run: cargo clippy --locked -- -D warnings

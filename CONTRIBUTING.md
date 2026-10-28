@@ -46,6 +46,16 @@ The package currently has only a binary target. When a library target is added,
 also run `cargo test --locked --doc`: nextest does not run documentation tests.
 CI detects those targets and keeps that check separate.
 
+The installer smoke can reuse a binary you already built:
+
+```bash
+scripts/install_smoke.sh target/debug/agent-workspace-linux
+```
+
+It runs the real installer in a disposable checkout and checks the installed
+binary, skill and config cleanup. With no argument it builds and tests the
+release binary as before.
+
 To inspect a slow local build, run `cargo build --locked --timings` and open
 `target/cargo-timings/cargo-timing.html`. The committed configuration works on
 stable Rust with its default linker; machine-specific linker settings belong
