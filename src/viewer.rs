@@ -19,7 +19,7 @@ use image::{Frame, ImageBuffer};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::{
-    collections::VecDeque,
+    collections::{BTreeMap, VecDeque},
     env,
     ffi::OsString,
     fs,
@@ -333,6 +333,7 @@ struct ViewerInstanceGuard {
 struct ViewerSnapshot {
     workspaces: Vec<workspace::WorkspaceListEntry>,
     profiles: Vec<profile::WorkspaceProfile>,
+    runtime_blockers: BTreeMap<String, Vec<String>>,
     doctor_ready: bool,
     doctor_blockers: Vec<String>,
     i3_doctor_ready: bool,
@@ -349,6 +350,14 @@ struct ViewerSnapshot {
 
 impl ViewerSnapshot {
     fn start_readiness(&self, session: crate::session::SessionSpec) -> (bool, &[String]) {
+        if session.version.is_some() {
+            return self
+                .runtime_blockers
+                .get(&session.to_string())
+                .map_or((false, &[][..]), |blockers| {
+                    (blockers.is_empty(), blockers.as_slice())
+                });
+        }
         match session.backend {
             crate::session::SessionBackend::X11 => (self.doctor_ready, &self.doctor_blockers),
             crate::session::SessionBackend::I3 => (self.i3_doctor_ready, &self.i3_doctor_blockers),
@@ -2584,9 +2593,18 @@ fn compute_viewer_refresh(
                 .and_then(workspace_entry_apps)
                 .map(|apps| apps.to_vec())
                 .unwrap_or_default();
+            let mut runtime_blockers = BTreeMap::new();
+            for profile in &profiles.profiles {
+                if profile.session.version.is_some() {
+                    runtime_blockers
+                        .entry(profile.session.to_string())
+                        .or_insert_with(|| profile.session.blockers());
+                }
+            }
             let snapshot = ViewerSnapshot {
                 workspaces: list.workspaces,
                 profiles: profiles.profiles,
+                runtime_blockers,
                 doctor_ready: doctor.ready_for_x11_workspace,
                 doctor_blockers: doctor.blockers,
                 i3_doctor_ready: doctor.ready_for_i3_workspace,
@@ -2883,12 +2901,7 @@ impl Render for AgentWorkspaceViewer {
             .selected_profile()
             .map(|profile| profile.session)
             .unwrap_or_default();
-        let version_blockers = start_session.version.map(|_| start_session.blockers());
-        let (doctor_ready, doctor_blockers) = if let Some(blockers) = &version_blockers {
-            (blockers.is_empty(), blockers.as_slice())
-        } else {
-            self.snapshot.start_readiness(start_session)
-        };
+        let (doctor_ready, doctor_blockers) = self.snapshot.start_readiness(start_session);
         let cleanup_confirm_seconds_left = self.pending_cleanup.as_ref().and_then(|pending| {
             (pending.id == self.target_id && pending.expires_at_unix > now)
                 .then_some(pending.expires_at_unix.saturating_sub(now).max(1))
@@ -6089,6 +6102,24 @@ mod tests {
         snapshot.gnome_doctor_ready = true;
         snapshot.gnome_doctor_blockers.clear();
         assert_eq!(snapshot.start_readiness(gnome), (true, &[][..]));
+        let pinned = SessionSpec {
+            version: Some("46".parse().unwrap()),
+            ..gnome
+        };
+        assert_eq!(snapshot.start_readiness(pinned), (false, &[][..]));
+        snapshot
+            .runtime_blockers
+            .insert(pinned.to_string(), vec!["Prepare GNOME 46".into()]);
+        assert_eq!(
+            snapshot.start_readiness(pinned),
+            (false, &["Prepare GNOME 46".into()][..])
+        );
+        snapshot
+            .runtime_blockers
+            .get_mut(&pinned.to_string())
+            .unwrap()
+            .clear();
+        assert_eq!(snapshot.start_readiness(pinned), (true, &[][..]));
         snapshot.doctor_ready = true;
         snapshot.doctor_blockers.clear();
         snapshot.kwin_doctor_ready = false;

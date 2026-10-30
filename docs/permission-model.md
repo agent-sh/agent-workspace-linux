@@ -1,8 +1,10 @@
 # Permission model
 
 A workspace is computer use that runs in the background. It is not a sandbox.
-Apps launched in it run as you, with your files, network, keyring and SSH
-agent; only their windows stay in the workspace. So the model decides what an
+Apps launched in it run as you, with your files and network. Host runtimes
+also relay your keyring and SSH agent. Prepared GNOME 46 does not relay the
+host session bus, keyring, SSH/GPG agents, dconf or sound. Only app windows
+stay in the workspace. So the model decides what an
 agent may do, not what it can reach.
 
 Three controls do that:

@@ -11,7 +11,8 @@ apps, browser automation, screenshots, clipboard, and input inside its own
 hidden display, never the user's real desktop, focus, or host Chrome.
 
 It is not a sandbox. Apps you launch there run as the user, with the user's
-files, network, keyring and SSH agent: a `git push`, a sent message or a file
+files and network. Host runtimes also relay the keyring and SSH agent; prepared
+GNOME 46 does not relay host session services. A `git push`, a sent message or a file
 deleted from a workspace terminal is real. Act as carefully as on the user's
 own machine. Launch Chrome through `workspace_open_browser` or with `--user-data-dir`: a plain launch would hand off to the user's running browser and is refused.
 

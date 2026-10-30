@@ -12,6 +12,7 @@ use std::{
 };
 
 const MARKER: &str = "AGENT_WORKSPACE_SESSION_RUNTIME";
+const OWNER_FD: i32 = 4;
 const DEFINITION: &str = include_str!("../../runtimes/gnome-46/Dockerfile");
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -352,6 +353,7 @@ pub fn daemon_prefix(options: &DaemonOptions) -> Result<Vec<std::ffi::OsString>>
     if !home.is_absolute() || home == std::path::Path::new("/") {
         bail!("HOME must be an absolute user directory");
     }
+    cleanup_stale_userspaces(&options.id, false)?;
     let overlay = userspace_dir(options)?;
     if overlay.exists() {
         bail!("session userspace {} already exists", overlay.display());
@@ -369,9 +371,13 @@ pub fn daemon_prefix(options: &DaemonOptions) -> Result<Vec<std::ffi::OsString>>
     }
     fs::write(
         overlay.join("owner.json"),
-        serde_json::to_vec(
-            &serde_json::json!({"session_id":options.session_id,"pid":std::process::id()}),
-        )?,
+        serde_json::to_vec(&UserspaceOwner {
+            session_id: options.session_id.clone(),
+            pid: std::process::id(),
+            start_ticks: crate::workspace::process_start_ticks(std::process::id())
+                .context("supervisor process identity missing")?,
+            root_device: None,
+        })?,
     )?;
     // The control daemon keeps its own ABI. Only its private executable gets
     // this RPATH; compositor and app children use the selected image's loader
@@ -379,10 +385,7 @@ pub fn daemon_prefix(options: &DaemonOptions) -> Result<Vec<std::ffi::OsString>>
     let executable = crate::workspace::daemon_executable_path()?;
     let copied = overlay.join("agent-workspace-linux");
     fs::copy(&executable, &copied)?;
-    let patcher = info.path.join("rootfs/usr/bin/patchelf");
-    let interpreter = Command::new("timeout")
-        .arg("20s")
-        .arg(&patcher)
+    let interpreter = patcher_command(&info)?
         .arg("--print-interpreter")
         .arg(&executable)
         .output()?;
@@ -390,9 +393,7 @@ pub fn daemon_prefix(options: &DaemonOptions) -> Result<Vec<std::ffi::OsString>>
         bail!("cannot inspect workspace daemon interpreter");
     }
     let interpreter = PathBuf::from(String::from_utf8(interpreter.stdout)?.trim());
-    let patched = Command::new("timeout")
-        .arg("20s")
-        .arg(&patcher)
+    let patched = patcher_command(&info)?
         .args([
             "--set-interpreter",
             "/opt/awl-controller-libs/ld.so",
@@ -421,9 +422,14 @@ pub fn daemon_prefix(options: &DaemonOptions) -> Result<Vec<std::ffi::OsString>>
                 .map(PathBuf::from)
         })
         .collect::<Vec<_>>();
-    let mut args: Vec<OsString> = ["bwrap", "--unshare-user", "--overlay-src"]
-        .map(OsString::from)
-        .to_vec();
+    let mut args: Vec<OsString> = [
+        "bwrap",
+        "--unshare-user",
+        "--die-with-parent",
+        "--overlay-src",
+    ]
+    .map(OsString::from)
+    .to_vec();
     args.push(info.path.join("rootfs").into());
     args.push("--overlay".into());
     args.push(overlay.join("upper").into());
@@ -441,13 +447,13 @@ pub fn daemon_prefix(options: &DaemonOptions) -> Result<Vec<std::ffi::OsString>>
         args.push(source.into());
         args.push(target.into());
     };
+    bind(overlay.join("tmp"), "/tmp".into(), false);
     bind(home.clone(), home.clone(), false);
     bind(
         options.runtime_dir.clone(),
         options.runtime_dir.clone(),
         false,
     );
-    bind(overlay.join("tmp"), "/tmp".into(), false);
     bind(copied, "/opt/agent-workspace-linux".into(), true);
     bind(interpreter, "/opt/awl-controller-libs/ld.so".into(), true);
     for path in library_paths {
@@ -510,6 +516,7 @@ pub fn daemon_prefix(options: &DaemonOptions) -> Result<Vec<std::ffi::OsString>>
         .map(OsString::from),
     );
     args.push(key(options.session).into());
+    args.extend(["--setenv", crate::control::SHARED_CONTROL_ENV, "1"].map(OsString::from));
     for name in [
         "XDG_CONFIG_HOME",
         "XDG_CACHE_HOME",
@@ -541,6 +548,109 @@ pub fn daemon_prefix(options: &DaemonOptions) -> Result<Vec<std::ffi::OsString>>
     Ok(args)
 }
 
+fn patcher_command(info: &RuntimeInfo) -> Result<Command> {
+    let (multiarch, loader) = match env::consts::ARCH {
+        "x86_64" => ("x86_64-linux-gnu", "ld-linux-x86-64.so.2"),
+        "aarch64" => ("aarch64-linux-gnu", "ld-linux-aarch64.so.1"),
+        architecture => bail!("no runtime loader for {architecture}"),
+    };
+    let libraries = info.path.join("rootfs/usr/lib").join(multiarch);
+    let mut command = Command::new("timeout");
+    command
+        .arg("20s")
+        .arg(libraries.join(loader))
+        .args(["--inhibit-cache", "--library-path"])
+        .arg(libraries)
+        .arg(info.path.join("rootfs/usr/bin/patchelf"));
+    Ok(command)
+}
+
+pub fn share_runtime_descriptors(command: &mut Command, options: &DaemonOptions) -> Result<()> {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+    let path = crate::control::control_state_path();
+    let parent = path.parent().context("control directory missing")?;
+    fs::create_dir_all(parent)?;
+    let directory = high_descriptor(fs::File::open(parent)?)?;
+    let owner = high_descriptor(
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(userspace_dir(options)?.join("owner.json"))?,
+    )?;
+    // SAFETY: only async-signal-safe descriptor operations run after fork.
+    // Command owns the directory until spawning; the parent keeps CLOEXEC.
+    unsafe {
+        command.pre_exec(move || {
+            for (source, target) in [
+                (directory.as_raw_fd(), crate::control::SHARED_CONTROL_FD),
+                (owner.as_raw_fd(), OWNER_FD),
+            ] {
+                if libc::dup2(source, target) < 0 || libc::fcntl(target, libc::F_SETFD, 0) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
+            Ok(())
+        });
+    }
+    Ok(())
+}
+
+fn high_descriptor(file: fs::File) -> Result<fs::File> {
+    use std::os::fd::{AsRawFd, FromRawFd};
+    // Reserve descriptors 3 and 4 without source/target collisions after fork.
+    let fd = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_DUPFD_CLOEXEC, OWNER_FD + 1) };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    // SAFETY: fcntl returned a new descriptor owned by this File.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
+}
+
+#[derive(Serialize, Deserialize)]
+struct UserspaceOwner {
+    pid: u32,
+    start_ticks: u64,
+    session_id: String,
+    #[serde(default)]
+    root_device: Option<String>,
+}
+
+pub fn record_inner_userspace(options: &DaemonOptions) -> Result<()> {
+    use std::{
+        io::{Read, Seek, Write},
+        os::{fd::FromRawFd, unix::fs::MetadataExt},
+    };
+    // SAFETY: the supervisor passed this owner marker at descriptor 4.
+    let mut file = unsafe { fs::File::from_raw_fd(OWNER_FD) };
+    if !file.metadata()?.is_file() {
+        bail!("runtime owner descriptor is not a file");
+    }
+    let mut text = String::new();
+    file.read_to_string(&mut text)?;
+    let mut owner: UserspaceOwner = serde_json::from_str(&text)?;
+    if owner.session_id != options.session_id {
+        bail!("runtime owner belongs to another session");
+    }
+    // bubblewrap without a private PID namespace can leave its payload alive
+    // when its monitor dies. Chain parent death into the controller itself.
+    let parent = unsafe { libc::getppid() };
+    if unsafe { libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL) } != 0 {
+        return Err(std::io::Error::last_os_error().into());
+    }
+    if unsafe { libc::getppid() } != parent
+        || crate::workspace::process_start_ticks(owner.pid) != Some(owner.start_ticks)
+    {
+        bail!("runtime supervisor exited before controller startup");
+    }
+    let device = fs::metadata("/")?.dev();
+    owner.root_device = Some(format!("{}:{}", libc::major(device), libc::minor(device)));
+    file.rewind()?;
+    file.set_len(0)?;
+    file.write_all(&serde_json::to_vec(&owner)?)?;
+    // Drop closes the capability before any app can inherit it.
+    Ok(())
+}
+
 fn userspace_dir(options: &DaemonOptions) -> Result<PathBuf> {
     let cache = cache_dir()?;
     let base = cache
@@ -559,19 +669,141 @@ pub fn cleanup_userspace(options: &DaemonOptions) -> Result<()> {
     if !path.exists() {
         return Ok(());
     }
-    let owner: serde_json::Value = serde_json::from_slice(&fs::read(path.join("owner.json"))?)?;
-    if owner["session_id"] != options.session_id || owner["pid"] != std::process::id() {
+    let owner: UserspaceOwner = serde_json::from_slice(&fs::read(path.join("owner.json"))?)?;
+    if owner.session_id != options.session_id || owner.pid != std::process::id() {
         bail!(
             "refusing to remove userspace with a different owner: {}",
             path.display()
         );
     }
-    make_directories_removable(&path)?;
-    fs::remove_dir_all(&path)?;
+    if userspace_in_use(&path, &owner)? {
+        bail!("userspace is still in use; run workspace cleanup after its processes stop");
+    }
+    remove_userspace(&path)
+}
+
+fn remove_userspace(path: &std::path::Path) -> Result<()> {
+    make_directories_removable(path)?;
+    fs::remove_dir_all(path)?;
     if let Some(parent) = path.parent() {
         let _ = fs::remove_dir(parent);
     }
     Ok(())
+}
+
+/// Reap this workspace's abandoned layers only after their supervisor and
+/// all processes mounting the writable filesystem have stopped.
+pub fn cleanup_stale_userspaces(id: &str, dry_run: bool) -> Result<Vec<String>> {
+    let id = crate::workspace::sanitize_workspace_id(id)?;
+    let cache = cache_dir()?;
+    let directory = cache
+        .parent()
+        .and_then(|path| path.parent())
+        .context("cache parent missing")?
+        .join("runtime-sessions")
+        .join(id);
+    if !directory.exists() {
+        return Ok(Vec::new());
+    }
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&directory)? {
+        let path = entry?.path();
+        if !fs::symlink_metadata(&path)?.is_dir() {
+            bail!("unexpected userspace entry {}", path.display());
+        }
+        let owner: UserspaceOwner = serde_json::from_slice(&fs::read(path.join("owner.json"))?)?;
+        if path.file_name().and_then(|name| name.to_str()) != Some(owner.session_id.as_str()) {
+            bail!("userspace identity mismatch");
+        }
+        if crate::workspace::process_start_ticks(owner.pid) == Some(owner.start_ticks) {
+            let stat = fs::read_to_string(format!("/proc/{}/stat", owner.pid)).unwrap_or_default();
+            if !stat
+                .rsplit_once(") ")
+                .is_some_and(|(_, state)| state.starts_with('Z') || state.starts_with('X'))
+            {
+                bail!("userspace supervisor {} is still active", owner.pid);
+            }
+        }
+        if !dry_run && userspace_in_use(&path, &owner)? {
+            bail!(
+                "userspace {} is still mounted by an active process",
+                path.display()
+            );
+        }
+        candidates.push(path);
+    }
+    let mut actions = Vec::new();
+    for path in candidates {
+        actions.push(format!(
+            "{} prepared userspace {}",
+            if dry_run {
+                "would verify and remove"
+            } else {
+                "removed"
+            },
+            path.display()
+        ));
+        if !dry_run {
+            remove_userspace(&path)?;
+        }
+    }
+    Ok(actions)
+}
+
+fn userspace_in_use(path: &std::path::Path, owner: &UserspaceOwner) -> Result<bool> {
+    use std::{collections::BTreeSet, os::unix::ffi::OsStrExt};
+    let upper = path.join("upper");
+    let uid = unsafe { libc::geteuid() };
+    let mut namespaces = BTreeSet::new();
+    for entry in fs::read_dir("/proc")? {
+        let process = entry?.path();
+        if process
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.parse::<u32>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        let Ok(status) = fs::read_to_string(process.join("status")) else {
+            continue;
+        };
+        let effective_uid = status
+            .lines()
+            .find(|line| line.starts_with("Uid:"))
+            .and_then(|line| line.split_whitespace().nth(2))
+            .and_then(|value| value.parse::<u32>().ok());
+        if effective_uid != Some(uid) {
+            continue;
+        }
+        if let Some(device) = &owner.root_device {
+            if let Ok(namespace) = fs::read_link(process.join("ns/mnt")) {
+                if !namespaces.insert(namespace) {
+                    continue;
+                }
+            }
+            match fs::read_to_string(process.join("mountinfo")) {
+                Ok(mounts) => {
+                    if mounts
+                        .lines()
+                        .any(|line| line.split_whitespace().nth(2) == Some(device.as_str()))
+                    {
+                        return Ok(true);
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                Err(error) => return Err(error).context("cannot verify userspace mount lifetime"),
+            }
+        } else if let Ok(command) = fs::read(process.join("cmdline")) {
+            if command
+                .split(|byte| *byte == 0)
+                .any(|argument| argument == upper.as_os_str().as_bytes())
+            {
+                return Ok(true);
+            }
+        }
+    }
+    Ok(false)
 }
 
 fn make_directories_removable(path: &std::path::Path) -> Result<()> {

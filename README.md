@@ -133,7 +133,7 @@ The prepared runtime uses Ubuntu 24.04's GNOME and Mutter packages. Preparing it
 
 Use `"session":{"backend":"gnome","version":"46","scale":1.25}` through MCP or in a saved profile. Omit `version`, or pass `--session-version host`, to use host packages. `runtime list` and the doctor's `session_runtimes` field show availability and the installed version. GNOME 46 is the only prepared entry; other versions can be added when needed.
 
-The selected runtime supplies system programs and libraries. Your home directory and the workspace's private runtime remain accessible. Display sockets and session buses are private. The writable image layer and its temporary files are removed after shutdown. The prepared image stays cached for reuse.
+The selected runtime supplies system programs and libraries. Your home directory and the workspace's private runtime remain accessible. Display sockets and session buses are private. This QA runtime does not relay the host session bus, keyring, SSH/GPG agents, dconf or sound. Use the host runtime for those services. The writable image layer and its temporary files are removed after shutdown. After an interrupted supervisor, stale cleanup removes abandoned layers once their processes have stopped. The prepared image stays cached for reuse.
 
 | Backend | `--session` | What runs | Scale | GPU |
 |---|---|---|---|---|
@@ -279,7 +279,7 @@ ws = websocket.create_connection(ws_debugger_url, suppress_origin=True)
 
 ## Security model
 
-The workspace is not a sandbox. Apps launched in it run as you, with your files, network, keyring and SSH agent. Only their windows stay in the workspace. An agent acting there acts for you, so the controls decide what it may do, not what it can reach.
+The workspace is not a sandbox. Apps launched in it run as you, with your files and network. Host runtimes also relay your keyring and SSH agent; prepared GNOME 46 does not relay host session services. Only their windows stay in the workspace. An agent acting there acts for you, so the controls decide what it may do, not what it can reach.
 
 ### What decides what an agent does
 
@@ -292,7 +292,7 @@ The workspace is not a sandbox. Apps launched in it run as you, with your files,
 
 ### What a workspace app gets
 
-- **Your session.** Your home, config and data directories, network, SSH and GPG agents, sound, your settings (dconf) and your keyring: the workspace relays the Secret Service, KWallet and dconf from your session bus, so Chrome on your profile has your saved logins.
+- **Your session (host runtimes).** Your home, config and data directories, network, SSH and GPG agents, sound, your settings (dconf) and your keyring: the workspace relays the Secret Service, KWallet and dconf from your session bus, so Chrome on your profile has your saved logins.
 - **The workspace's display and bus.** A private display and its own session bus, so a single-instance app opens its window in the workspace, not on your desktop.
 
 See [docs/permission-model.md](docs/permission-model.md) and [SECURITY.md](SECURITY.md).
@@ -320,7 +320,7 @@ The MCP exposes about 86 tools. To keep them out of the agent's context, it ship
 ## Features
 
 - Hidden X11 or native Wayland workspaces on six backends, with window listing, screenshots, keyboard and mouse input, clipboard and per-app logs, all scoped to the workspace.
-- Apps that act as you: your files, network, keyring and SSH agent, with windows kept in the workspace.
+- Apps that act as you: your files, network, keyring and SSH agent, with windows kept in the workspace. Prepared GNOME 46 shares files and network but does not relay host session services.
 - Read-only, write and destructive marks on every tool, and an optional daemon-enforced app allowlist.
 - Workspace-owned browser control over loopback CDP: discover targets, read pages, navigate, extract results.
 - A native floating viewer with live pause, read-only and stop.

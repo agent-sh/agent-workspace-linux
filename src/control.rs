@@ -10,6 +10,8 @@ use std::{
 };
 
 const CONTROL_FILE: &str = "mcp-control.json";
+pub(crate) const SHARED_CONTROL_ENV: &str = "AGENT_WORKSPACE_SHARED_CONTROL";
+pub(crate) const SHARED_CONTROL_FD: i32 = 3;
 const STAGING_ATTEMPTS: u32 = 64;
 static STAGING_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
@@ -255,8 +257,26 @@ fn save_control_state_to_path(path: &Path, state: &McpControlState) -> Result<()
     staging.publish(path)
 }
 
-fn control_state_path() -> PathBuf {
+pub(crate) fn control_state_path() -> PathBuf {
+    if env::var_os(SHARED_CONTROL_ENV).is_some() {
+        return PathBuf::from(format!("/proc/self/fd/{SHARED_CONTROL_FD}")).join(CONTROL_FILE);
+    }
     runtime_dir_from_env(env::var_os("XDG_RUNTIME_DIR").map(PathBuf::from)).join(CONTROL_FILE)
+}
+
+/// Retain the host control directory in the daemon, not in executed apps.
+pub(crate) fn claim_shared_control_directory() -> Result<()> {
+    let directory = PathBuf::from(format!("/proc/self/fd/{SHARED_CONTROL_FD}"));
+    if env::var(SHARED_CONTROL_ENV).as_deref() != Ok("1") || !fs::metadata(&directory)?.is_dir() {
+        bail!("prepared runtime is missing its shared control directory");
+    }
+    // SAFETY: the launcher passed an owned directory at this descriptor. Set
+    // a descriptor flag only; the directory stays open in this daemon.
+    let result = unsafe { libc::fcntl(SHARED_CONTROL_FD, libc::F_SETFD, libc::FD_CLOEXEC) };
+    if result < 0 {
+        return Err(io::Error::last_os_error().into());
+    }
+    Ok(())
 }
 
 fn runtime_dir_from_env(xdg_runtime_dir: Option<PathBuf>) -> PathBuf {
@@ -276,6 +296,35 @@ fn wall_clock_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_descriptor_observes_atomic_control_replacements() {
+        use std::os::fd::AsRawFd;
+        let directory = temp_control_dir("descriptor");
+        let descriptor = fs::File::open(&directory).unwrap();
+        let through_fd =
+            PathBuf::from(format!("/proc/self/fd/{}", descriptor.as_raw_fd())).join(CONTROL_FILE);
+        let direct = directory.join(CONTROL_FILE);
+        let paused = McpControlState {
+            mode: McpControlMode::Paused,
+            ..Default::default()
+        };
+        save_control_state_to_path(&direct, &paused).unwrap();
+        assert_eq!(
+            load_existing_control_state_from_path(&through_fd)
+                .unwrap()
+                .mode,
+            McpControlMode::Paused
+        );
+        save_control_state_to_path(&direct, &McpControlState::default()).unwrap();
+        assert_eq!(
+            load_existing_control_state_from_path(&through_fd)
+                .unwrap()
+                .mode,
+            McpControlMode::Active
+        );
+        fs::remove_dir_all(directory).unwrap();
+    }
 
     fn temp_control_path(name: &str) -> PathBuf {
         env::temp_dir().join(format!(

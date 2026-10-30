@@ -4,6 +4,8 @@ import json
 import os
 from pathlib import Path
 import shutil
+import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -16,7 +18,15 @@ BIN = Path(os.environ.get('AGENT_WORKSPACE_BIN', ROOT / 'target/debug/agent-work
 ARTIFACTS = Path(sys.argv[1]).resolve()
 ARTIFACTS.mkdir(parents=True, exist_ok=True)
 ID = 'versioned-gnome-46-smoke'
-ENV = dict(os.environ, XDG_CONFIG_HOME=str(ARTIFACTS / 'config'))
+runtime_target = Path(os.environ.get('GNOME46_RUNTIME_DIR', ARTIFACTS / 'r'))
+runtime_target.mkdir(parents=True, exist_ok=True, mode=0o700)
+runtime_link = None
+if 'GNOME46_RUNTIME_DIR' not in os.environ:
+    # Exercise a /tmp runtime path while storing its files on disk.
+    runtime_link = Path('/tmp') / f'awl-v46-{os.getpid()}'
+    runtime_link.symlink_to(runtime_target.parent, target_is_directory=True)
+ENV = dict(os.environ, XDG_CONFIG_HOME=str(ARTIFACTS / 'config'),
+           XDG_RUNTIME_DIR=str(runtime_link / runtime_target.name if runtime_link else runtime_target))
 sequence = 0
 
 
@@ -54,6 +64,14 @@ def png_size(path):
     return struct.unpack('>II', data[16:24])
 
 
+def ipc_click(status, x, y):
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(5)
+        connection.connect(status['socket_path'])
+        connection.sendall((json.dumps({'method': 'click', 'x': x, 'y': y, 'button': 1, 'count': 1})+'\n').encode())
+        return json.loads(connection.makefile().readline())
+
+
 client = Mcp(str(BIN), ARTIFACTS / 'mcp.stderr', headless=True, env=ENV)
 status = None
 try:
@@ -76,6 +94,12 @@ try:
     reported = client.tool('workspace_run_app', {'id': ID, 'command': ['gnome-shell', '--version'],
                             'timeout_ms': 10000, 'kill_on_timeout': True})
     assert reported['run']['succeeded'] and 'GNOME Shell 46.' in reported['run']['stdout']['content'], reported
+    inherited = client.tool('workspace_run_app', {'id': ID, 'command': ['python3', '-c',
+        'import os; assert "AGENT_WORKSPACE_SHARED_CONTROL" not in os.environ; '
+        'assert not any("owner.json" in os.readlink("/proc/self/fd/"+f) '
+        'for f in os.listdir("/proc/self/fd") if os.path.exists("/proc/self/fd/"+f))'],
+        'timeout_ms': 10000, 'kill_on_timeout': True})
+    assert inherited['run']['succeeded'], inherited
     mismatch = cli('workspace', 'start', '--id', ID, '--ack-hidden-workspace', '--session', 'gnome', expected=False)
     assert 'differs' in mismatch, mismatch
     evidence = ARTIFACTS / 'gtk.json'
@@ -122,16 +146,63 @@ try:
         '--dest', 'org.gnome.Shell', '--object-path', '/org/gnome/Shell', '--method', 'org.gnome.Shell.Eval', '1+1'],
         'timeout_ms': 10000, 'kill_on_timeout': True})
     assert not denied['run']['succeeded'] and 'AccessDenied' in denied['run']['stderr']['content'], denied
+    # Bypass the MCP front end to prove the daemon sees atomic host pause
+    # updates through its namespace. This control file is test-private.
+    paused = client.tool('mcp_control_update', {'mode': 'paused', 'reason': 'private runtime regression'})
+    assert paused['ok'], paused
+    blocked = ipc_click(status, x, y)
+    assert not blocked['ok'] and 'paused' in blocked['message'], blocked
+    resumed = client.tool('mcp_control_update', {'mode': 'active', 'confirmed_user_request': True,
+                          'reason': 'resume private test fixture'})
+    assert resumed['ok'], resumed
+    assert ipc_click(status, x, y)['ok']
     print('GNOME 46/Mutter 46, 125% physical input, Unicode, clipboard, window controls, capture and bus denial passed.', flush=True)
+    runtime = Path(status['runtime_dir'])
+    for path in [*runtime.glob('*.log'), runtime / 'output-config.json']:
+        if path.is_file():
+            shutil.copy2(path, ARTIFACTS / path.name)
+    ws('stop')
+    cache = Path(os.environ.get('XDG_CACHE_HOME', str(Path.home() / '.cache')))
+    userspace = cache / 'agent-workspace-linux/runtime-sessions' / ID
+    wait(lambda: not userspace.exists(), 'prepared userspace cleanup')
+    # Interrupt only the verified supervisor of this test workspace.
+    restarted = client.tool('workspace_start', {
+        'id': ID, 'profile': profile['id'], 'acknowledge_hidden_workspace': True,
+        'open_viewer': False,
+    })
+    assert restarted['ok'], restarted
+    ws('launch', '--', 'sleep', '300')
+    layers = list(userspace.iterdir())
+    assert len(layers) == 1, layers
+    owner = json.loads((layers[0] / 'owner.json').read_text())
+    pid = owner['pid']
+    proc = Path('/proc') / str(pid)
+    assert ID.encode() in (proc / 'cmdline').read_bytes().split(b'\0')
+    assert int((proc / 'stat').read_text().rsplit(') ', 1)[1].split()[19]) == owner['start_ticks']
+    os.kill(pid, signal.SIGTERM)
+    wait(lambda: not Path(status['socket_path']).exists() or
+         subprocess.run([str(BIN), 'workspace', 'status', '--id', ID],
+                        env=ENV, capture_output=True, timeout=5).returncode != 0,
+         'interrupted daemon exit')
+    preview = ws('cleanup', '--dry-run')
+    assert preview['candidates'] and userspace.exists(), preview
+    cleaned = ws('cleanup')
+    assert cleaned['removed'] and not cleaned['skipped'], cleaned
+    assert not userspace.exists(), userspace
+    print('Interrupted-supervisor dry-run and verified stale-layer cleanup passed.', flush=True)
 finally:
-    if status:
-        runtime = Path(status['runtime_dir'])
-        for path in [*runtime.glob('*.log'), runtime / 'output-config.json']:
-            if path.is_file():
-                shutil.copy2(path, ARTIFACTS / path.name)
-        ws('stop')
-        cache = Path(os.environ.get('XDG_CACHE_HOME', str(Path.home() / '.cache')))
-        userspace = cache / 'agent-workspace-linux/runtime-sessions' / ID
-        wait(lambda: not userspace.exists(), 'prepared userspace cleanup')
-    client.close()
+    try:
+        # Cleanup is scoped to this test's isolated runtime and workspace id.
+        current = subprocess.run([str(BIN), 'workspace', 'status', '--id', ID],
+                                 env=ENV, capture_output=True, timeout=10)
+        if current.returncode == 0:
+            ws('stop')
+        preview = ws('cleanup', '--dry-run')
+        if preview.get('candidates'):
+            cleaned = ws('cleanup')
+            assert not cleaned['skipped'], cleaned
+    finally:
+        client.close()
+        if runtime_link:
+            runtime_link.unlink()
 print('Selected-runtime shutdown and writable-layer cleanup passed.', flush=True)

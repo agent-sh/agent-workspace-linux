@@ -1534,7 +1534,7 @@ pub fn cleanup_stale_workspaces(id: Option<String>, dry_run: bool) -> Result<Wor
             continue;
         }
 
-        let process_cleanup = match cleanup_stale_workspace_processes(
+        let mut process_cleanup = match cleanup_stale_workspace_processes(
             workspace.manifest.as_ref(),
             &workspace.id,
             &workspace.runtime_dir,
@@ -1551,6 +1551,18 @@ pub fn cleanup_stale_workspaces(id: Option<String>, dry_run: bool) -> Result<Wor
                 continue;
             }
         };
+        match crate::session::runtime::cleanup_stale_userspaces(&workspace.id, dry_run) {
+            Ok(actions) => process_cleanup.extend(actions),
+            Err(error) => {
+                skipped.push(WorkspaceCleanupEntry {
+                    id: workspace.id,
+                    runtime_dir: workspace.runtime_dir,
+                    reason: format!("prepared userspace cleanup could not be verified: {error:#}"),
+                    process_cleanup,
+                });
+                continue;
+            }
+        }
         if dry_run {
             candidates.push(WorkspaceCleanupEntry {
                 id: workspace.id,
@@ -3244,6 +3256,10 @@ pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
         }
         return Ok(());
     }
+    if options.session.version.is_some() {
+        control::claim_shared_control_directory()?;
+        crate::session::runtime::record_inner_userspace(&options)?;
+    }
     options.purpose = normalize_workspace_purpose(options.purpose)?;
     remove_stale_socket(&options.socket_path)?;
 
@@ -3602,6 +3618,9 @@ fn daemon_command(options: &DaemonOptions, detached: bool) -> Result<Command> {
         .arg(&options.socket_path)
         .arg("--xauthority")
         .arg(&options.xauthority_path);
+    if !detached && options.session.version.is_some() {
+        crate::session::runtime::share_runtime_descriptors(&mut daemon, options)?;
+    }
     Ok(daemon)
 }
 
@@ -3759,7 +3778,7 @@ fn workspace_manifest(status: &WorkspaceStatus, stopped_at_unix: Option<u64>) ->
     }
 }
 
-fn process_start_ticks(pid: u32) -> Option<u64> {
+pub(crate) fn process_start_ticks(pid: u32) -> Option<u64> {
     let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     process_start_ticks_from_proc_stat(&stat)
 }
@@ -8585,8 +8604,16 @@ fn wait_for_daemon_startup(options: &DaemonOptions) -> Result<()> {
             }
         }
     }
+    let cleanup = if options.session.version.is_some() {
+        match crate::session::runtime::cleanup_stale_userspaces(&options.id, false) {
+            Ok(_) => String::new(),
+            Err(error) => format!("; retained userspace for verified cleanup: {error:#}"),
+        }
+    } else {
+        String::new()
+    };
     bail!(
-        "workspace daemon did not become ready within {} s and was stopped",
+        "workspace daemon did not become ready within {} s and was stopped{cleanup}",
         DAEMON_STARTUP_HANG_GUARD.as_secs()
     )
 }
@@ -8877,7 +8904,7 @@ fn temp_runtime_dir() -> PathBuf {
     PathBuf::from(format!("/tmp/agent-workspace-linux-{user}"))
 }
 
-fn sanitize_workspace_id(id: &str) -> Result<String> {
+pub(crate) fn sanitize_workspace_id(id: &str) -> Result<String> {
     let trimmed = id.trim();
     if trimmed.is_empty() {
         bail!("workspace id cannot be empty");
