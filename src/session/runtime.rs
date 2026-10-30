@@ -791,44 +791,56 @@ fn userspace_in_use(path: &std::path::Path, owner: &UserspaceOwner) -> Result<bo
         if effective_uid != Some(uid) {
             continue;
         }
-        if process_is_dead(&process) {
-            continue;
-        }
-        if let Some(device) = &owner.root_device {
-            let namespace = fs::read_link(process.join("ns/mnt")).ok();
-            if namespace.as_ref().is_some_and(|ns| namespaces.contains(ns)) {
+        let tasks = match fs::read_dir(process.join("task")) {
+            Ok(tasks) => tasks,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error).context("cannot enumerate userspace task holders"),
+        };
+        // A dead thread-group leader can still have live workers. Each task
+        // owns its own namespace reference, including after unshare/setns.
+        for task in tasks {
+            let task = task?.path();
+            if process_is_dead(&task) {
                 continue;
             }
-            match fs::read_to_string(process.join("mountinfo")) {
-                Ok(mounts) => {
-                    if let Some(namespace) = namespace {
-                        namespaces.insert(namespace);
+            if let Some(device) = &owner.root_device {
+                let namespace = fs::read_link(task.join("ns/mnt")).ok();
+                if namespace.as_ref().is_some_and(|ns| namespaces.contains(ns)) {
+                    continue;
+                }
+                match fs::read_to_string(task.join("mountinfo")) {
+                    Ok(mounts) => {
+                        if let Some(namespace) = namespace {
+                            namespaces.insert(namespace);
+                        }
+                        if mounts.lines().any(|line| {
+                            line.split_whitespace().nth(2) == Some(device.as_str())
+                                && line.split_once(" - ").is_some_and(|(_, signature)| {
+                                    owner.mount_signature.as_ref().map_or_else(
+                                        || signature.starts_with("overlay "),
+                                        |expected| signature == expected,
+                                    )
+                                })
+                        }) {
+                            return Ok(true);
+                        }
                     }
-                    if mounts.lines().any(|line| {
-                        line.split_whitespace().nth(2) == Some(device.as_str())
-                            && line.split_once(" - ").is_some_and(|(_, signature)| {
-                                owner.mount_signature.as_ref().map_or_else(
-                                    || signature.starts_with("overlay "),
-                                    |expected| signature == expected,
-                                )
-                            })
-                    }) {
-                        return Ok(true);
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                    // A process may become a zombie between status and mountinfo.
+                    // It no longer owns a namespace. Do not mark its namespace
+                    // checked until a live representative was actually read.
+                    Err(_) if process_is_dead(&task) => (),
+                    Err(error) => {
+                        return Err(error).context("cannot verify userspace mount lifetime")
                     }
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-                // A process may become a zombie between status and mountinfo.
-                // It no longer owns a namespace. Do not mark its namespace
-                // checked until a live representative was actually read.
-                Err(_) if process_is_dead(&process) => (),
-                Err(error) => return Err(error).context("cannot verify userspace mount lifetime"),
-            }
-        } else if let Ok(command) = fs::read(process.join("cmdline")) {
-            if command
-                .split(|byte| *byte == 0)
-                .any(|argument| argument == upper.as_os_str().as_bytes())
-            {
-                return Ok(true);
+            } else if let Ok(command) = fs::read(task.join("cmdline")) {
+                if command
+                    .split(|byte| *byte == 0)
+                    .any(|argument| argument == upper.as_os_str().as_bytes())
+                {
+                    return Ok(true);
+                }
             }
         }
     }

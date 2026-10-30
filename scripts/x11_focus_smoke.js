@@ -42,6 +42,15 @@ function waitForFile(file, phase) {
     if (fs.existsSync(file)) { clearTimeout(timer); watcher.close(); resolve(); }
   });
 }
+async function waitForStopped(pid) {
+  const deadline = Date.now() + 5000;
+  while (Date.now() < deadline) {
+    const state = fs.readFileSync(`/proc/${pid}/stat`, "utf8").split(/\) /).pop().split(" ")[0];
+    if (state === "T") return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error("Popup fixture did not stop within 5 seconds");
+}
 function assertNoApplicationFocus() {
   const empty = JSON.parse(run(bin, ["workspace", "active-window", "--id", id]));
   assert.equal(empty.ok, false, "empty workspace has no application focus");
@@ -73,6 +82,7 @@ try {
   assert.ok(Number.isInteger(inputGroup) && inputGroup > 1);
   process.kill(-inputGroup, "SIGSTOP");
   try {
+    await waitForStopped(inputApp.apps[0].pid);
     run("xdotool", ["windowfocus", childId], display);
     assert.equal(run("xdotool", ["getwindowfocus", "-f"], display).trim(), childId);
     cli("focus-window", "--id", id, windowId);

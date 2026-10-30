@@ -176,7 +176,14 @@ try:
         'open_viewer': False,
     })
     assert restarted['ok'], restarted
-    ws('launch', '--', 'sleep', '300')
+    holder = ARTIFACTS / 'holder-thread'
+    app = ws('launch', '--', 'python3', '-c',
+        'import ctypes,threading,time; from pathlib import Path; '
+        't=threading.Thread(target=lambda: '
+        f'(Path({str(holder)!r}).write_text(str(threading.get_native_id())),time.sleep(300))); '
+        't.start(); ctypes.CDLL(None).pthread_exit(None)')['apps'][0]
+    wait(lambda: holder.exists() and Path(f"/proc/{app['pid']}/stat").read_text()
+         .rsplit(') ', 1)[1].startswith('Z'), 'dead leader with live worker')
     layers = list(userspace.iterdir())
     assert len(layers) == 1, layers
     owner = json.loads((layers[0] / 'owner.json').read_text())
@@ -189,6 +196,11 @@ try:
          subprocess.run([str(BIN), 'workspace', 'status', '--id', ID],
                         env=ENV, capture_output=True, timeout=5).returncode != 0,
          'interrupted daemon exit')
+    retained = cli('workspace', 'start', '--id', ID, '--session', 'gnome',
+                   '--session-version', '46', '--ack-hidden-workspace', expected=False)
+    assert 'still mounted' in retained and layers[0].exists(), retained
+    # The worker is still alive, so its writable layer must remain intact.
+    assert Path(f"/proc/{app['pid']}/task/{holder.read_text()}/mountinfo").exists()
     preview = ws('cleanup', '--dry-run')
     assert preview['candidates'] and userspace.exists(), preview
     cleaned = ws('cleanup')
