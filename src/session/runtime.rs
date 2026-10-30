@@ -377,6 +377,7 @@ pub fn daemon_prefix(options: &DaemonOptions) -> Result<Vec<std::ffi::OsString>>
             start_ticks: crate::workspace::process_start_ticks(std::process::id())
                 .context("supervisor process identity missing")?,
             root_device: None,
+            mount_signature: None,
         })?,
     )?;
     // The control daemon keeps its own ABI. Only its private executable gets
@@ -613,6 +614,8 @@ struct UserspaceOwner {
     session_id: String,
     #[serde(default)]
     root_device: Option<String>,
+    #[serde(default)]
+    mount_signature: Option<String>,
 }
 
 pub fn record_inner_userspace(options: &DaemonOptions) -> Result<()> {
@@ -644,6 +647,18 @@ pub fn record_inner_userspace(options: &DaemonOptions) -> Result<()> {
     }
     let device = fs::metadata("/")?.dev();
     owner.root_device = Some(format!("{}:{}", libc::major(device), libc::minor(device)));
+    owner.mount_signature = fs::read_to_string("/proc/self/mountinfo")?
+        .lines()
+        .find(|line| line.split_whitespace().nth(4) == Some("/"))
+        .and_then(|line| line.split_once(" - "))
+        .map(|(_, signature)| signature.to_owned());
+    if !owner
+        .mount_signature
+        .as_ref()
+        .is_some_and(|signature| signature.starts_with("overlay "))
+    {
+        bail!("prepared runtime root is not the expected overlay filesystem");
+    }
     file.rewind()?;
     file.set_len(0)?;
     file.write_all(&serde_json::to_vec(&owner)?)?;
@@ -776,22 +791,36 @@ fn userspace_in_use(path: &std::path::Path, owner: &UserspaceOwner) -> Result<bo
         if effective_uid != Some(uid) {
             continue;
         }
+        if process_is_dead(&process) {
+            continue;
+        }
         if let Some(device) = &owner.root_device {
-            if let Ok(namespace) = fs::read_link(process.join("ns/mnt")) {
-                if !namespaces.insert(namespace) {
-                    continue;
-                }
+            let namespace = fs::read_link(process.join("ns/mnt")).ok();
+            if namespace.as_ref().is_some_and(|ns| namespaces.contains(ns)) {
+                continue;
             }
             match fs::read_to_string(process.join("mountinfo")) {
                 Ok(mounts) => {
-                    if mounts
-                        .lines()
-                        .any(|line| line.split_whitespace().nth(2) == Some(device.as_str()))
-                    {
+                    if let Some(namespace) = namespace {
+                        namespaces.insert(namespace);
+                    }
+                    if mounts.lines().any(|line| {
+                        line.split_whitespace().nth(2) == Some(device.as_str())
+                            && line.split_once(" - ").is_some_and(|(_, signature)| {
+                                owner.mount_signature.as_ref().map_or_else(
+                                    || signature.starts_with("overlay "),
+                                    |expected| signature == expected,
+                                )
+                            })
+                    }) {
                         return Ok(true);
                     }
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
+                // A process may become a zombie between status and mountinfo.
+                // It no longer owns a namespace. Do not mark its namespace
+                // checked until a live representative was actually read.
+                Err(_) if process_is_dead(&process) => (),
                 Err(error) => return Err(error).context("cannot verify userspace mount lifetime"),
             }
         } else if let Ok(command) = fs::read(process.join("cmdline")) {
@@ -804,6 +833,15 @@ fn userspace_in_use(path: &std::path::Path, owner: &UserspaceOwner) -> Result<bo
         }
     }
     Ok(false)
+}
+
+fn process_is_dead(process: &std::path::Path) -> bool {
+    match fs::read_to_string(process.join("stat")) {
+        Ok(stat) => stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, state)| state.starts_with('Z') || state.starts_with('X')),
+        Err(error) => error.kind() == std::io::ErrorKind::NotFound,
+    }
 }
 
 fn make_directories_removable(path: &std::path::Path) -> Result<()> {

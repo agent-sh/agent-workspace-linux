@@ -73,6 +73,11 @@ def ipc_click(status, x, y):
 
 
 client = Mcp(str(BIN), ARTIFACTS / 'mcp.stderr', headless=True, env=ENV)
+# Deliberately leave one child unreaped until cleanup finishes. A zombie has
+# no mount namespace and must not obstruct another workspace's collection.
+zombie = subprocess.Popen(['true'])
+wait(lambda: Path(f'/proc/{zombie.pid}/stat').read_text().rsplit(') ', 1)[1].startswith('Z'),
+     'unreaped regression child')
 status = None
 try:
     profile = {'id': 'gnome46-regression', 'session': {'backend': 'gnome', 'version': '46', 'scale': 1.25}}
@@ -203,6 +208,7 @@ finally:
             assert not cleaned['skipped'], cleaned
     finally:
         client.close()
+        zombie.wait(timeout=5)
         if runtime_link:
             runtime_link.unlink()
 print('Selected-runtime shutdown and writable-layer cleanup passed.', flush=True)
