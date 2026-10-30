@@ -35,7 +35,7 @@ zbus = "5.15"
 wayland-client = "0.31"
 wayland-scanner = "0.31"
 wayland-backend = "0.3"
-xkbcommon = "0.8"
+xkbcommon = "0.9"
 libc = "0.2"
 cosmic-client-toolkit = { git = "https://github.com/pop-os/cosmic-protocols", rev = "c0cff4db14c37ed954983158e4055aa94c7741d9" }
 cosmic-protocols = { git = "https://github.com/pop-os/cosmic-protocols", rev = "c0cff4db14c37ed954983158e4055aa94c7741d9" }
