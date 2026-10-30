@@ -79,6 +79,7 @@ zombie = subprocess.Popen(['true'])
 wait(lambda: Path(f'/proc/{zombie.pid}/stat').read_text().rsplit(') ', 1)[1].startswith('Z'),
      'unreaped regression child')
 status = None
+holder_identity = None
 try:
     profile = {'id': 'gnome46-regression', 'session': {'backend': 'gnome', 'version': '46', 'scale': 1.25}}
     saved = client.tool('profile_put', {'profile': profile})
@@ -184,6 +185,8 @@ try:
         't.start(); ctypes.CDLL(None).pthread_exit(None)')['apps'][0]
     wait(lambda: holder.exists() and Path(f"/proc/{app['pid']}/stat").read_text()
          .rsplit(') ', 1)[1].startswith('Z'), 'dead leader with live worker')
+    holder_identity = (app['pid'], app['process_group_id'],
+                       Path(f"/proc/{app['pid']}/stat").read_text().rsplit(') ', 1)[1].split()[19])
     layers = list(userspace.iterdir())
     assert len(layers) == 1, layers
     owner = json.loads((layers[0] / 'owner.json').read_text())
@@ -209,6 +212,18 @@ try:
     print('Interrupted-supervisor dry-run and verified stale-layer cleanup passed.', flush=True)
 finally:
     try:
+        # Also reap an orphaned holder when an older candidate incorrectly
+        # starts a replacement daemon and overwrites its launch manifest.
+        if holder_identity:
+            holder_pid, holder_group, holder_ticks = holder_identity
+            try:
+                same_process = Path(f'/proc/{holder_pid}/stat').read_text().rsplit(') ', 1)[1].split()[19] == holder_ticks
+                if same_process and holder_group > 1 and os.getpgid(holder_pid) == holder_group:
+                    os.killpg(holder_group, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            except FileNotFoundError:
+                pass
         # Cleanup is scoped to this test's isolated runtime and workspace id.
         current = subprocess.run([str(BIN), 'workspace', 'status', '--id', ID],
                                  env=ENV, capture_output=True, timeout=10)
