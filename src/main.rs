@@ -116,6 +116,10 @@ async fn main() -> Result<()> {
             args.remove(0);
             handle_profile(args, &permissions)
         }
+        Some("runtime") => {
+            args.remove(0);
+            handle_runtime(args)
+        }
         Some("workspace") => {
             args.remove(0);
             handle_workspace(args, &permissions)
@@ -168,10 +172,35 @@ async fn main() -> Result<()> {
         }
         Some(command) => {
             bail!(
-                "unknown command '{command}'. Expected one of: doctor, guardrails, mcp, permissions, profile, workspace, viewer, --help, --version"
+                "unknown command '{command}'. Expected one of: doctor, guardrails, mcp, permissions, profile, runtime, workspace, viewer, --help, --version"
             )
         }
     }
+}
+
+fn handle_runtime(args: Vec<String>) -> Result<()> {
+    if args.first().map(String::as_str) == Some("list") {
+        parse_no_options(&args[1..], "runtime list")?;
+        return print_json(&session::runtime::catalog());
+    }
+    if args.first().map(String::as_str) != Some("prepare") {
+        bail!("expected runtime list or runtime prepare --backend gnome --version 46");
+    }
+    let mut selected = SessionSpec::default();
+    let mut index = 1;
+    while index < args.len() {
+        match args[index].as_str() {
+            "--backend" => {
+                selected.backend = value_after(&args, index, "--backend")?.parse()?;
+            }
+            "--version" => {
+                selected.version = Some(value_after(&args, index, "--version")?.parse()?);
+            }
+            flag => bail!("unknown runtime prepare option {flag:?}"),
+        }
+        index += 2;
+    }
+    print_json(&session::runtime::prepare(selected)?.summary())
 }
 
 fn parse_global_options(args: &mut Vec<String>) -> Result<permissions::McpPermissionState> {
@@ -1114,6 +1143,7 @@ fn parse_start_options(args: &[String]) -> Result<ParsedStartOptions> {
     let mut profile_id = None;
     let mut session = None;
     let mut scale = None;
+    let mut version = None;
     let mut width_explicit = false;
     let mut height_explicit = false;
     let mut index = 0;
@@ -1137,6 +1167,15 @@ fn parse_start_options(args: &[String]) -> Result<ParsedStartOptions> {
             }
             "--session" => {
                 session = Some(value_after(args, index, "--session")?.parse()?);
+                index += 2;
+            }
+            "--session-version" => {
+                let value = value_after(args, index, "--session-version")?;
+                version = Some(if value == "host" {
+                    None
+                } else {
+                    Some(value.parse()?)
+                });
                 index += 2;
             }
             "--scale" => {
@@ -1184,6 +1223,9 @@ fn parse_start_options(args: &[String]) -> Result<ParsedStartOptions> {
     if let Some(scale) = scale {
         options.session.scale = scale;
     }
+    if let Some(version) = version {
+        options.session.version = version;
+    }
     options.session.validate()?;
     Ok(ParsedStartOptions {
         options,
@@ -1204,6 +1246,7 @@ fn parse_open_profile_options(
     let mut profile_id = None;
     let mut session = None;
     let mut scale = None;
+    let mut version = None;
     let mut width_explicit = false;
     let mut height_explicit = false;
     let mut open_options = profile::ProfileWorkspaceOpenOptions::default();
@@ -1225,6 +1268,15 @@ fn parse_open_profile_options(
             }
             "--session" => {
                 session = Some(value_after(args, index, "--session")?.parse()?);
+                index += 2;
+            }
+            "--session-version" => {
+                let value = value_after(args, index, "--session-version")?;
+                version = Some(if value == "host" {
+                    None
+                } else {
+                    Some(value.parse()?)
+                });
                 index += 2;
             }
             "--scale" => {
@@ -1309,6 +1361,9 @@ fn parse_open_profile_options(
     options.session = SessionSpec::resolve(session, Some(options.session));
     if let Some(scale) = scale {
         options.session.scale = scale;
+    }
+    if let Some(version) = version {
+        options.session.version = version;
     }
     options.session.validate()?;
     Ok((
@@ -4207,6 +4262,7 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
     let mut id = None;
     let mut session = SessionSpec::default();
     let mut scale = None;
+    let mut version = None;
     let mut session_id = None;
     let mut purpose = None;
     let mut profile_id = None;
@@ -4235,6 +4291,10 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
             }
             "--session" => {
                 session = value_after(&args, index, "--session")?.parse()?;
+                index += 2;
+            }
+            "--session-version" => {
+                version = Some(value_after(&args, index, "--session-version")?.parse()?);
                 index += 2;
             }
             "--scale" => {
@@ -4326,6 +4386,7 @@ fn parse_daemon_options(args: Vec<String>) -> Result<DaemonOptions> {
     if let Some(scale) = scale {
         session.scale = scale;
     }
+    session.version = version;
     session.validate()?;
     Ok(DaemonOptions {
         id,
@@ -4384,6 +4445,8 @@ Usage:
   agent-workspace-linux --version
   agent-workspace-linux doctor
   agent-workspace-linux guardrails
+  agent-workspace-linux runtime list
+  agent-workspace-linux runtime prepare --backend gnome --version 46
   agent-workspace-linux mcp [--permissions PATH] [--headless]
   agent-workspace-linux viewer [--id ID] [--always-on-top] [--exit-when-workspace-gone]
   agent-workspace-linux permissions validate --json PATH
@@ -4397,8 +4460,8 @@ Usage:
   agent-workspace-linux profile template project-dev [--id ID] [--host-path PATH]
   agent-workspace-linux profile template chrome [--id ID] [--browser-path PATH]
   agent-workspace-linux profile template browser-session [--id ID] [--browser-path PATH] --user-data-dir PATH
-  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland|cosmic] [--scale N] [--width PX] [--height PX]
-  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland|cosmic] [--scale N] [--width PX] [--height PX]
+  agent-workspace-linux workspace start [--dry-run] --ack-hidden-workspace [--foreground] [--profile PROFILE] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland|cosmic] [--session-version VERSION|host] [--scale N] [--width PX] [--height PX]
+  agent-workspace-linux workspace open-profile [--dry-run] [--ack-hidden-workspace] --profile PROFILE [--setup] [--setup-timeout-ms N] [--setup-kill-on-timeout] [--startup-wait-window] [--startup-window-timeout-ms N] [--startup-screenshot-window] [--id ID] [--purpose TEXT] [--session x11|kwin|gnome|i3|hyprland|cosmic] [--session-version VERSION|host] [--scale N] [--width PX] [--height PX]
   agent-workspace-linux workspace list
   agent-workspace-linux workspace cleanup [--id ID] [--dry-run]
   agent-workspace-linux workspace status [--id ID]
@@ -4595,6 +4658,49 @@ mod tests {
             Err(error) => error,
         };
         assert!(error.to_string().contains("must be x11"));
+    }
+
+    #[test]
+    fn version_selection_is_order_independent_and_explicit_host_clears_it() {
+        for options in [
+            args(&[
+                "--session",
+                "gnome",
+                "--session-version",
+                "46",
+                "--scale",
+                "1.25",
+            ]),
+            args(&[
+                "--session-version",
+                "46",
+                "--scale",
+                "1.25",
+                "--session",
+                "gnome",
+            ]),
+        ] {
+            let parsed = parse_start_options(&options).unwrap();
+            assert_eq!(parsed.options.session.version.unwrap().to_string(), "46");
+            assert_eq!(parsed.options.session.scale, 1.25);
+        }
+        let cleared = parse_start_options(&args(&[
+            "--session",
+            "gnome",
+            "--session-version",
+            "46",
+            "--session-version",
+            "host",
+        ]))
+        .unwrap();
+        assert!(cleared.options.session.version.is_none());
+        assert!(
+            parse_start_options(&args(&["--session", "gnome", "--session-version", "../46"]))
+                .is_err()
+        );
+        assert!(
+            parse_start_options(&args(&["--session", "kwin", "--session-version", "46"])).is_err()
+        );
     }
 
     #[test]

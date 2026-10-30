@@ -211,7 +211,7 @@ async function startExtraTerminal(id, terminalId) {
 }
 
 async function main() {
-  const workspaceId = `t-${process.pid}`;
+  const workspaceId = `t-${process.pid.toString(36)}`;
   const terminalId = "game";
   const socket = terminalSocket(workspaceId, terminalId);
   try {

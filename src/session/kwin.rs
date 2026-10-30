@@ -291,6 +291,7 @@ impl KwinSession {
             .context("KWin output scale missing")?;
         let actual = crate::session::SessionSpec {
             backend: crate::session::SessionBackend::Kwin,
+            version: options.session.version,
             scale: actual_scale,
         };
         actual.validate()?;

@@ -116,6 +116,7 @@ impl FromStr for ScrollDirection {
 
 #[derive(Debug, Clone, Serialize, JsonSchema)]
 pub struct DoctorReport {
+    pub session_runtimes: serde_json::Value,
     pub runtime: RuntimeReport,
     pub viewer: ViewerRuntimeReport,
     pub ready_for_x11_workspace: bool,
@@ -1158,6 +1159,7 @@ pub fn doctor_report() -> DoctorReport {
     let hyprland_blockers = crate::session::hyprland::blockers();
     let cosmic_blockers = crate::session::cosmic::blockers();
     DoctorReport {
+        session_runtimes: crate::session::runtime::catalog(),
         ready_for_i3_workspace: i3_blockers.is_empty(),
         i3_blockers,
         ready_for_gnome_workspace: gnome_blockers.is_empty(),
@@ -3220,15 +3222,30 @@ pub fn stop_workspace(id: &str, timeout_ms: Option<u64>, dry_run: bool) -> Resul
 pub fn run_daemon(mut options: DaemonOptions) -> Result<()> {
     let id = sanitize_workspace_id(&options.id)?;
     let session_id = normalize_session_id(&options.session_id)?;
-    options.purpose = normalize_workspace_purpose(options.purpose)?;
     validate_unix_socket_path(&options.socket_path)?;
     create_private_runtime_dir(&options.runtime_dir)?;
-    remove_stale_socket(&options.socket_path)?;
     fs::write(
         options.runtime_dir.join(DAEMON_PID_FILE),
         format!("{}\n", std::process::id()),
     )
     .context("record workspace daemon pid")?;
+    if options.session.version.is_some() && !crate::session::runtime::inside(options.session) {
+        if id != options.id || session_id != options.session_id {
+            bail!("versioned runtime requires normalized workspace and session ids");
+        }
+        let result = daemon_command(&options, false).and_then(|mut command| Ok(command.status()?));
+        let cleanup = crate::session::runtime::cleanup_userspace(&options);
+        let status = result?;
+        cleanup.with_context(|| {
+            format!("cleanup selected runtime after daemon exited with {status}")
+        })?;
+        if !status.success() {
+            bail!("versioned workspace daemon exited with {status}");
+        }
+        return Ok(());
+    }
+    options.purpose = normalize_workspace_purpose(options.purpose)?;
+    remove_stale_socket(&options.socket_path)?;
 
     // Load the spawn-time MCP permission ceiling (if any) before serving any
     // IPC. Fail closed: if a ceiling path was provided but cannot be read or
@@ -3507,18 +3524,50 @@ fn prepare_workspace_start(options: WorkspaceStartOptions) -> Result<WorkspaceSt
 fn spawn_detached_daemon(options: &DaemonOptions) -> Result<()> {
     let stdout_path = options.runtime_dir.join("daemon.out.log");
     let stderr_path = options.runtime_dir.join("daemon.err.log");
-    let exe = daemon_executable_path()?;
-    let mut daemon = Command::new("setsid");
+    let mut daemon = daemon_command(options, true)?;
     daemon
-        .arg("--fork")
-        .arg(exe)
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(fs::File::create(&stdout_path)?))
+        .stderr(Stdio::from(fs::File::create(&stderr_path)?));
+    let status = daemon
+        .spawn()
+        .context("failed to spawn agent workspace daemon launcher")?
+        .wait()
+        .context("failed to wait for agent workspace daemon launcher")?;
+    if !status.success() {
+        bail!("agent workspace daemon launcher exited with {status}");
+    }
+    Ok(())
+}
+
+fn daemon_command(options: &DaemonOptions, detached: bool) -> Result<Command> {
+    let prefix = if !detached && options.session.version.is_some() {
+        crate::session::runtime::daemon_prefix(options)?
+    } else {
+        vec![daemon_executable_path()?.into_os_string()]
+    };
+    let mut daemon = if detached {
+        let mut command = Command::new("setsid");
+        command.arg("--fork").args(&prefix);
+        command
+    } else {
+        let mut command = Command::new(&prefix[0]);
+        command.args(&prefix[1..]);
+        command
+    };
+    daemon
         .arg("daemon")
         .arg("--protocol")
         .arg(IPC_PROTOCOL_VERSION.to_string())
         .arg("--id")
         .arg(&options.id);
     daemon.arg("--session-id").arg(&options.session_id);
-    daemon.arg("--session").arg(options.session.to_string());
+    daemon
+        .arg("--session")
+        .arg(options.session.backend.as_str());
+    if let Some(version) = options.session.version {
+        daemon.arg("--session-version").arg(version.to_string());
+    }
     daemon.arg("--scale").arg(options.session.scale.to_string());
     if let Some(purpose) = &options.purpose {
         daemon.arg("--purpose").arg(purpose);
@@ -3552,24 +3601,8 @@ fn spawn_detached_daemon(options: &DaemonOptions) -> Result<()> {
         .arg("--socket")
         .arg(&options.socket_path)
         .arg("--xauthority")
-        .arg(&options.xauthority_path)
-        .stdin(Stdio::null())
-        .stdout(Stdio::from(fs::File::create(&stdout_path).with_context(
-            || format!("failed to create {}", stdout_path.display()),
-        )?))
-        .stderr(Stdio::from(fs::File::create(&stderr_path).with_context(
-            || format!("failed to create {}", stderr_path.display()),
-        )?));
-
-    let status = daemon
-        .spawn()
-        .context("failed to spawn agent workspace daemon launcher")?
-        .wait()
-        .context("failed to wait for agent workspace daemon launcher")?;
-    if !status.success() {
-        bail!("agent workspace daemon launcher exited with {status}");
-    }
-    Ok(())
+        .arg(&options.xauthority_path);
+    Ok(daemon)
 }
 
 pub(crate) fn daemon_executable_path() -> Result<PathBuf> {

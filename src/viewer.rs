@@ -2883,7 +2883,12 @@ impl Render for AgentWorkspaceViewer {
             .selected_profile()
             .map(|profile| profile.session)
             .unwrap_or_default();
-        let (doctor_ready, doctor_blockers) = self.snapshot.start_readiness(start_session);
+        let version_blockers = start_session.version.map(|_| start_session.blockers());
+        let (doctor_ready, doctor_blockers) = if let Some(blockers) = &version_blockers {
+            (blockers.is_empty(), blockers.as_slice())
+        } else {
+            self.snapshot.start_readiness(start_session)
+        };
         let cleanup_confirm_seconds_left = self.pending_cleanup.as_ref().and_then(|pending| {
             (pending.id == self.target_id && pending.expires_at_unix > now)
                 .then_some(pending.expires_at_unix.saturating_sub(now).max(1))
@@ -6057,6 +6062,7 @@ mod tests {
         let x11 = SessionSpec::default();
         let kwin = SessionSpec {
             backend: SessionBackend::Kwin,
+            version: None,
             scale: 1.5,
         };
         let mut snapshot = ViewerSnapshot {
@@ -6072,6 +6078,7 @@ mod tests {
         assert_eq!(snapshot.start_readiness(kwin), (true, &[][..]));
         let gnome = SessionSpec {
             backend: SessionBackend::Gnome,
+            version: None,
             scale: 1.5,
         };
         snapshot.gnome_doctor_blockers = vec!["Install GNOME".into()];

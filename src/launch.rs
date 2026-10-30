@@ -29,6 +29,7 @@ pub(crate) fn merged_env(mut base: Vec<EnvVar>, overrides: Vec<EnvVar>) -> Vec<E
 /// from the user's session what acts for the user: agents, sound and the
 /// XDG directories (`use_the_users_session`). PATH and HOME are left intact.
 const HOST_SESSION_ENV_VARS: &[&str] = &[
+    "AGENT_WORKSPACE_SESSION_RUNTIME",
     "DBUS_SESSION_BUS_ADDRESS",
     "DBUS_STARTER_ADDRESS",
     "DBUS_STARTER_BUS_TYPE",

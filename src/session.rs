@@ -5,6 +5,7 @@ pub(crate) mod hyprland;
 pub(crate) mod i3;
 pub(crate) mod kwin;
 pub(crate) mod private;
+pub(crate) mod runtime;
 pub(crate) mod x11;
 
 use crate::desktop::DesktopControl;
@@ -18,6 +19,10 @@ use std::{fmt, path::Path, process::Command, str::FromStr};
 pub struct SessionSpec {
     #[serde(default)]
     pub backend: SessionBackend,
+    /// Compositor version in a prepared runtime. Omit to use the host runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(with = "Option<String>")]
+    pub version: Option<runtime::Version>,
     #[serde(default = "default_scale", skip_serializing_if = "is_default_scale")]
     pub scale: f64,
 }
@@ -29,6 +34,7 @@ impl SessionSpec {
 
     pub fn matches(self, other: Self) -> bool {
         self.backend == other.backend
+            && self.version == other.version
             && (self.scale - other.scale).abs()
                 <= match self.backend {
                     SessionBackend::Kwin | SessionBackend::Hyprland | SessionBackend::Cosmic => {
@@ -40,6 +46,7 @@ impl SessionSpec {
                 }
     }
     pub fn validate(self) -> Result<()> {
+        runtime::validate_selection(self)?;
         if !self.scale.is_finite() || self.scale <= 0.0 {
             bail!("session scale must be finite and positive");
         }
@@ -50,10 +57,13 @@ impl SessionSpec {
     }
 
     pub fn blockers(self) -> Vec<String> {
+        if self.version.is_some() && !runtime::inside(self) {
+            return runtime::blockers(self);
+        }
         match self.backend {
             SessionBackend::X11 => crate::workspace::doctor_report().blockers,
             SessionBackend::Kwin => kwin::blockers(),
-            SessionBackend::Gnome => gnome::blockers(),
+            SessionBackend::Gnome => gnome::blockers_for(self.version),
             SessionBackend::Hyprland => hyprland::blockers(),
             SessionBackend::I3 => i3::blockers(),
             SessionBackend::Cosmic => cosmic::blockers(),
@@ -62,6 +72,12 @@ impl SessionSpec {
 
     pub(crate) fn start(self, options: &mut DaemonOptions) -> Result<Session> {
         self.validate()?;
+        if self.version.is_some() {
+            let blockers = self.blockers();
+            if !blockers.is_empty() {
+                bail!("versioned runtime is not ready: {}", blockers.join("; "));
+            }
+        }
         match self.backend {
             SessionBackend::X11 => x11::X11Session::start(options).map(Session::X11),
             SessionBackend::Kwin => kwin::KwinSession::start(options).map(Session::Kwin),
@@ -165,6 +181,7 @@ impl Default for SessionSpec {
     fn default() -> Self {
         Self {
             backend: SessionBackend::X11,
+            version: None,
             scale: default_scale(),
         }
     }
@@ -176,6 +193,7 @@ impl FromStr for SessionSpec {
     fn from_str(value: &str) -> Result<Self> {
         Ok(Self {
             backend: value.parse()?,
+            version: None,
             scale: default_scale(),
         })
     }
@@ -183,7 +201,11 @@ impl FromStr for SessionSpec {
 
 impl fmt::Display for SessionSpec {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(self.backend.as_str())
+        formatter.write_str(self.backend.as_str())?;
+        if let Some(version) = self.version {
+            write!(formatter, "@{version}")?;
+        }
+        Ok(())
     }
 }
 
@@ -200,7 +222,7 @@ pub enum SessionBackend {
 }
 
 impl SessionBackend {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::X11 => "x11",
             Self::Kwin => "kwin",
@@ -280,6 +302,7 @@ mod tests {
     fn native_scale_identity_allows_only_fixed_point_rounding() {
         let requested = SessionSpec {
             backend: SessionBackend::Kwin,
+            version: None,
             scale: 1.3,
         };
         assert!(requested.matches(SessionSpec {
@@ -293,6 +316,7 @@ mod tests {
         assert!(!requested.matches(SessionSpec::default()));
         let gnome = SessionSpec {
             backend: SessionBackend::Gnome,
+            version: None,
             scale: 4.0 / 3.0,
         };
         assert!(gnome.matches(SessionSpec {

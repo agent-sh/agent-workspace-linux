@@ -6,6 +6,7 @@ import Shell from 'gi://Shell';
 import St from 'gi://St';
 import {Extension} from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
+import * as Config from 'resource:///org/gnome/shell/misc/config.js';
 
 const XML = `<node><interface name="org.agent_sh.Workspace.Gnome"><method name="Command"><arg type="s" direction="in"/><arg type="s" direction="out"/></method></interface></node>`;
 const delay = () => new Promise(resolve => GLib.timeout_add(GLib.PRIORITY_DEFAULT, 30, () => { resolve(); return GLib.SOURCE_REMOVE; }));
@@ -17,7 +18,9 @@ export default class Workspace extends Extension {
         this._controller = Number(GLib.getenv('AGENT_WORKSPACE_CONTROLLER_PID'));
         if (!Number.isSafeInteger(this._controller) || this._controller < 1)
             throw new Error('Missing workspace controller PID');
-        this._seat = global.stage.context.get_backend().get_default_seat();
+        this._seat = global.stage.context
+            ? global.stage.context.get_backend().get_default_seat()
+            : Clutter.get_default_backend().get_default_seat();
         this._pointer = this._seat.create_virtual_device(Clutter.InputDeviceType.POINTER_DEVICE);
         this._keyboard = this._seat.create_virtual_device(Clutter.InputDeviceType.KEYBOARD_DEVICE);
         Main.panel.hide();
@@ -112,7 +115,15 @@ export default class Workspace extends Extension {
         case 'focus': { const w=this._window(q.id); w.unminimize(); w.activate(global.get_current_time()); break; }
         case 'close': this._window(q.id).delete(global.get_current_time()); break;
         case 'move': this._window(q.id).move_frame(true, Math.round(q.x/s), Math.round(q.y/s)); break;
-        case 'resize': { const w=this._window(q.id), r=w.get_frame_rect(); w.unmaximize(); w.move_resize_frame(true, r.x, r.y, Math.round(q.width/s), Math.round(q.height/s)); break; }
+        case 'resize': {
+            const w=this._window(q.id), r=w.get_frame_rect();
+            if (Config.PACKAGE_VERSION.split('.')[0] === '46')
+                w.unmaximize(Meta.MaximizeFlags.BOTH);
+            else
+                w.unmaximize();
+            w.move_resize_frame(true, r.x, r.y, Math.round(q.width/s), Math.round(q.height/s));
+            break;
+        }
         case 'raise': this._window(q.id).raise(); break;
         case 'minimize': this._window(q.id).minimize(); break;
         case 'show': this._window(q.id).unminimize(); break;

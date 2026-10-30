@@ -40,6 +40,10 @@ const CONTROL_BUS_POLICY: &str = r#"<deny send_interface="org.gnome.Shell"/>
 <deny send_interface="org.gtk.Application"/>"#;
 
 pub(crate) fn blockers() -> Vec<String> {
+    blockers_for(None)
+}
+
+pub(crate) fn blockers_for(version: Option<super::runtime::Version>) -> Vec<String> {
     let mut blockers: Vec<String> = [
         "gnome-shell",
         "Xwayland",
@@ -61,15 +65,16 @@ pub(crate) fn blockers() -> Vec<String> {
             .ok()
             .filter(|r| r.status.success())
             .and_then(|r| String::from_utf8(r.stdout).ok())
-            .and_then(|v| {
-                v.split_whitespace()
-                    .last()
-                    .and_then(|v| v.split('.').next())
-                    .map(str::to_owned)
-            })
-            .is_some_and(|v| matches!(v.as_str(), "50" | "51"));
+            .and_then(|v| v.split_whitespace().last().map(str::to_owned))
+            .is_some_and(|v| match version {
+                Some(version) => version.matches(&v),
+                None => matches!(v.split('.').next(), Some("50" | "51")),
+            });
         if !compatible {
-            blockers.push("Native GNOME workspaces require GNOME Shell 50 or 51 and matching Mutter libraries.".into());
+            blockers.push(match version {
+                Some(version) => format!("Prepared GNOME runtime does not provide requested Shell {version}."),
+                None => "Native GNOME workspaces require GNOME Shell 50 or 51 and matching Mutter libraries.".into(),
+            });
         }
     }
     blockers
@@ -178,7 +183,7 @@ impl GnomeSession {
         session.private.start_system_bus(runtime, |command| {
             configure_process_environment(command, runtime, "", &options.xauthority_path)
         })?;
-        for (schema, key, value) in [
+        let mut settings = vec![
             ("org.gnome.desktop.interface", "enable-animations", "false"),
             ("org.gnome.desktop.session", "idle-delay", "0"),
             ("org.gnome.desktop.lockdown", "disable-command-line", "true"),
@@ -186,7 +191,15 @@ impl GnomeSession {
             ("org.gnome.shell", "disable-user-extensions", "true"),
             ("org.gnome.shell", "enabled-extensions", "[]"),
             ("org.gnome.shell", "disabled-extensions", "[]"),
-        ] {
+        ];
+        if options.session.version.is_some() {
+            settings.push((
+                "org.gnome.mutter",
+                "experimental-features",
+                "['scale-monitor-framebuffer']",
+            ));
+        }
+        for (schema, key, value) in settings {
             let mut command = Command::new("timeout");
             configure_process_environment(&mut command, runtime, "", &options.xauthority_path);
             let result = command

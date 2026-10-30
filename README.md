@@ -121,12 +121,26 @@ Use `--id NAME` to name a workspace. The name `viewers` is reserved for the shar
 
 Choose a backend with `--session` on `workspace start` and `workspace open-profile`, or with `"session": {"backend":"hyprland"}` in MCP calls and saved profiles. Explicit CLI or MCP input overrides the profile. With neither, the workspace uses X11.
 
+Choose GNOME 46 independently of your host's GNOME version:
+
+```bash
+agent-workspace-linux runtime prepare --backend gnome --version 46
+agent-workspace-linux workspace start --ack-hidden-workspace --id gnome46 \
+  --session gnome --session-version 46 --scale 1.25 --width 1600 --height 1000
+```
+
+The prepared runtime uses Ubuntu 24.04's GNOME and Mutter packages. Preparing it requires Docker; starting it requires bubblewrap with overlay support. Preparation downloads the packages once. Startup uses the cached runtime and never downloads or substitutes another version. The host desktop and system packages stay unchanged.
+
+Use `"session":{"backend":"gnome","version":"46","scale":1.25}` through MCP or in a saved profile. Omit `version`, or pass `--session-version host`, to use host packages. `runtime list` and the doctor's `session_runtimes` field show availability and the installed version. GNOME 46 is the only prepared entry; other versions can be added when needed.
+
+The selected runtime supplies system programs and libraries. Your home directory and the workspace's private runtime remain accessible. Display sockets and session buses are private. The writable image layer and its temporary files are removed after shutdown. The prepared image stays cached for reuse.
+
 | Backend | `--session` | What runs | Scale | GPU |
 |---|---|---|---|---|
 | **X11** (default) | `x11` | Xvfb + Openbox | 1 | none |
 | **i3** | `i3` | Xvfb + i3 | 1 | none |
 | **KWin** | `kwin` | KWin 6.6+ virtual Wayland compositor | fractional | render node |
-| **GNOME** | `gnome` | GNOME Shell 50/51 + Mutter, headless | fractional | none |
+| **GNOME** | `gnome` | GNOME 46 in a prepared runtime, or host Shell 50/51 + Mutter | fractional | none |
 | **Hyprland** | `hyprland` | Hyprland 0.53 on a private KWin renderer | fractional | render node |
 | **COSMIC** | `cosmic` | `cosmic-comp` under a headless Weston parent | fractional | none |
 

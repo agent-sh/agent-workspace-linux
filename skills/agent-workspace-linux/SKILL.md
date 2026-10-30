@@ -132,6 +132,19 @@ Minimize uses the scratchpad; show restores the window to the current workspace.
 Pointer and window coordinates use screenshot pixels on every backend.
 Unsupported session names are rejected.
 
+For a prepared GNOME 46 userspace, pass
+`session: {"backend":"gnome","version":"46","scale":1.25}` or
+`--session gnome --session-version 46 --scale 1.25`. Check the doctor's
+`session_runtimes` field or `agent-workspace-linux runtime list` first.
+Prepare a missing runtime with
+`agent-workspace-linux runtime prepare --backend gnome --version 46`.
+Preparation requires Docker and writes a versioned cache; startup requires
+bubblewrap with overlay support. It never replaces host packages or falls
+back to a different version. Omit `version` to keep using host packages.
+GNOME 46 is the only prepared entry. Its system programs and libraries come
+from Ubuntu 24.04; user files in HOME remain accessible, and display/bus
+sockets and temporary files remain private.
+
 Skip unless: each step's precondition is visible in the previous tool result
 (workspace id, app id, target window, browser target, or explicit user approval).
 
