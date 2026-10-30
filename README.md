@@ -343,7 +343,7 @@ Each native backend has a disposable Ubuntu 26.04 acceptance probe. Build the bi
 | Script | What it checks |
 |---|---|
 | `scripts/gnome_probe.sh` | Real GTK input at 100% and 150%, clipboard, window operations, physical screenshot sizes, MCP and viewer IPC, private-bus restrictions, managed terminal cleanup, native and XWayland apps. No host display, input device, system bus or GPU. Override `GNOME_PROBE_BIN` and `GNOME_PROBE_ARTIFACT_DIR`. |
-| `scripts/kwin_probe.sh` | Actual 100% and 150% scaling, native Qt input and capture, MCP startup, viewer frames, denied desktop-service activation, a managed terminal. One DRM render node, no host display, input device or session runtime. |
+| `scripts/kwin_probe.sh` | Actual 100% and 150% scaling, native Qt input and capture, GTK/Qt button presses, releases and activation through CLI/MCP, drag and wheel delivery, MCP startup, viewer frames, denied desktop-service activation, a managed terminal. One DRM render node, no host display, input device or session runtime. |
 | `scripts/kwin_cul_probe.sh` | computer-use-linux against the same KWin desktop: AT-SPI activation, global logical-coordinate clicks and client-local element fallback on a Qt window at 150%. Set `KWIN_PROBE_BIN` and `COMPUTER_USE_LINUX_BIN`. |
 | `scripts/hyprland_probe.sh` | See [the Hyprland guide](docs/hyprland.md). |
 | `scripts/cosmic_probe.sh` | See [the COSMIC guide](docs/native-cosmic.md). |

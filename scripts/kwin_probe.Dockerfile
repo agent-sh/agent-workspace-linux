@@ -15,6 +15,9 @@ RUN apt-get update \
         libcap2-bin \
         procps \
         python3 \
+        python3-pyqt6 \
+        python3-gi \
+        gir1.2-gtk-3.0 \
         qdbus-qt6 \
         kde-spectacle \
         qt6-wayland \
@@ -46,7 +49,7 @@ RUN apt-get update \
 
 RUN apt-get update && apt-get install -y --no-install-recommends xterm tmux libkscreen-bin && rm -rf /var/lib/apt/lists/*
 
-COPY kwin_probe_guest.sh kwin_smoke.py kwin_mcp.py /opt/kwin-probe/
+COPY kwin_probe_guest.sh kwin_smoke.py kwin_mcp.py kwin_click_smoke.py kwin_click_fixture.py kwin_click_gtk_fixture.py /opt/kwin-probe/
 RUN chmod 0755 /opt/kwin-probe/kwin_probe_guest.sh
 
 ENTRYPOINT ["/opt/kwin-probe/kwin_probe_guest.sh"]

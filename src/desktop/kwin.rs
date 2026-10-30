@@ -214,6 +214,17 @@ catch(e) {{ callDBus({unique}, {path}, {interface}, 'Result', JSON.stringify({{o
     fn input(&self) -> Result<input::Input> {
         input::Input::connect(&self.status.runtime_dir)
     }
+    fn input_at(&self, x: i32, y: i32) -> Result<input::Input> {
+        validate_workspace_coordinates(self.status, x, y, "pointer")?;
+        let mut input = self.input()?;
+        let scale = self.status.session.scale;
+        input.pointer(x as f64 / scale, y as f64 / scale)?;
+        // KWin applies pointer focus asynchronously after the motion roundtrip.
+        // Keep the same authenticated device and allow one 60 Hz input frame
+        // before sending buttons or axes to the newly entered surface (#175).
+        std::thread::sleep(Duration::from_millis(20));
+        Ok(input)
+    }
 }
 
 impl DesktopControl for KwinDesktopControl<'_> {
@@ -306,8 +317,7 @@ impl DesktopControl for KwinDesktopControl<'_> {
     }
     fn click(&self, x: i32, y: i32, button: u8, count: u8) -> Result<()> {
         validate_click_options(button, count)?;
-        self.move_pointer(x, y)?;
-        let mut input = self.input()?;
+        let mut input = self.input_at(x, y)?;
         for _ in 0..count {
             input.button(linux_button(button)?, true)?;
             input.button(linux_button(button)?, false)?;
@@ -325,9 +335,8 @@ impl DesktopControl for KwinDesktopControl<'_> {
         validate_click_options(button, 1)?;
         validate_workspace_coordinates(self.status, fx, fy, "drag start")?;
         validate_workspace_coordinates(self.status, tx, ty, "drag end")?;
-        let mut i = self.input()?;
+        let mut i = self.input_at(fx, fy)?;
         let s = self.status.session.scale;
-        i.pointer(fx as f64 / s, fy as f64 / s)?;
         i.button(linux_button(button)?, true)?;
         for step in 1..=12 {
             i.pointer(
@@ -339,14 +348,13 @@ impl DesktopControl for KwinDesktopControl<'_> {
     }
     fn scroll(&self, x: i32, y: i32, direction: ScrollDirection, amount: u8) -> Result<()> {
         validate_scroll_options(direction, amount)?;
-        self.move_pointer(x, y)?;
         let (h, n) = match direction {
             ScrollDirection::Up => (false, -1.0),
             ScrollDirection::Down => (false, 1.0),
             ScrollDirection::Left => (true, -1.0),
             ScrollDirection::Right => (true, 1.0),
         };
-        self.input()?.axis(h, n * 15.0 * amount as f64)
+        self.input_at(x, y)?.axis(h, n * 15.0 * amount as f64)
     }
     fn key(&self, key: &str) -> Result<()> {
         let symbols = input::keysyms(key)?;
