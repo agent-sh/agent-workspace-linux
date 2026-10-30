@@ -49,7 +49,18 @@ async function waitForStopped(pid) {
     if (state === "T") return;
     await new Promise(resolve => setTimeout(resolve, 10));
   }
-  throw new Error("Popup fixture did not stop within 5 seconds");
+  throw new Error(`Process ${pid} did not stop within 5 seconds`);
+}
+async function waitForWindowManager(display) {
+  const deadline = Date.now() + 10000;
+  while (Date.now() < deadline) {
+    const result = cp.spawnSync("xprop", ["-root", "_NET_SUPPORTED"], {
+      env: { ...env, ...display }, encoding: "utf8", timeout: 2000,
+    });
+    if (result.status === 0 && result.stdout.includes("_NET_ACTIVE_WINDOW")) return;
+    await new Promise(resolve => setTimeout(resolve, 10));
+  }
+  throw new Error("Window manager did not advertise active-window support within 10 seconds");
 }
 function assertNoApplicationFocus() {
   const empty = JSON.parse(run(bin, ["workspace", "active-window", "--id", id]));
@@ -63,6 +74,7 @@ let primaryError;
 try {
   status = cli("start", "--id", id, "--ack-hidden-workspace", "--purpose", "Native focus regression smoke").status;
   const display = { DISPLAY: status.display, XAUTHORITY: status.xauthority_path };
+  await waitForWindowManager(display);
   assertNoApplicationFocus();
   const inputApp = cli("launch", "--id", id, "--name", "input", "--",
     "wish", path.join(__dirname, "fixtures", "focus-popup.tcl"), marker, childIdFile);
@@ -81,8 +93,18 @@ try {
   const inputGroup = inputApp.apps[0].process_group_id;
   assert.ok(Number.isInteger(inputGroup) && inputGroup > 1);
   process.kill(-inputGroup, "SIGSTOP");
+  let wmStopped = false;
   try {
     await waitForStopped(inputApp.apps[0].pid);
+    // The WM can repair focus or replace our deliberately stale EWMH property.
+    // Freeze only this workspace's WM while checking the native X11 contract.
+    const manifest = cli("manifest", "--id", id).manifest;
+    const wmStat = fs.readFileSync(`/proc/${status.window_manager_pid}/stat`, "utf8");
+    assert.equal(wmStat.slice(wmStat.lastIndexOf(") ") + 2).split(" ")[19],
+      String(manifest.process_start_ticks.window_manager), "WM must be the process this workspace started");
+    process.kill(status.window_manager_pid, "SIGSTOP");
+    wmStopped = true;
+    await waitForStopped(status.window_manager_pid);
     run("xdotool", ["windowfocus", childId], display);
     assert.equal(run("xdotool", ["getwindowfocus", "-f"], display).trim(), childId);
     cli("focus-window", "--id", id, windowId);
@@ -93,7 +115,11 @@ try {
     assert.equal(cli("active-window", "--id", id).active_window?.id, childId);
     assert.equal(cli("observe", "--id", id).active_window?.id, childId);
   } finally {
-    process.kill(-inputGroup, "SIGCONT");
+    try {
+      if (wmStopped) process.kill(status.window_manager_pid, "SIGCONT");
+    } finally {
+      process.kill(-inputGroup, "SIGCONT");
+    }
   }
 
   const managedMarker = path.join(root, "managed-received");
