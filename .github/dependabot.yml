@@ -4,6 +4,12 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # zbus 6 removes our blocking API and does not migrate GPUI's zbus 5
+      # consumers. Upgrade it with the complete D-Bus migration in #135.
+      - dependency-name: zbus
+        update-types:
+          - version-update:semver-major
     groups:
       # Both crates come from one zed commit and only build together.
       gpui:
