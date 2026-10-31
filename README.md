@@ -27,6 +27,9 @@
 
 > Running open models for your company? [**Tiyuvta**](https://tiyuvta.ai/services/) helps with model choice, deployment and optimization, and fine-tuning on your hardware or cloud account.
 
+> Built and maintained with a lot of agent tokens and hours.
+> If it saves you time, [sponsoring](https://github.com/sponsors/avifenesh) helps keep it going.
+
 Agents that "use a computer" usually take over *your* screen. They move your mouse, steal focus and drive your logged-in browser. `agent-workspace-linux` gives the agent its **own** desktop: a private X11 or native Wayland display with its own window manager or compositor, apps, clipboard and browser, on any of [six backends](#desktop-backends). The agent launches apps, types, clicks, takes screenshots and browses there. You watch, pause or stop it from a small floating viewer. It speaks [MCP](https://modelcontextprotocol.io) over stdio, so it works with Claude Code, Codex and other MCP hosts.
 
 ## Why this project
