@@ -40,15 +40,16 @@ reports failure and leaves the previously installed binary untouched.
 Each install uses its own uniquely created staging directory beside the binary.
 Concurrent installs do not remove or overwrite one another's downloads. Normal
 completion and errors clean up the attempt's own staging directory; forced
-termination can leave an abandoned `.staging-*` directory. A later install does
-not delete it automatically, because another installer may still be using it.
+termination can leave an abandoned `.staging-*` directory. A later install
+removes staging directories older than one hour and leaves newer ones, which
+may belong to an installer still running.
 
 ## Usage
 
-Once installed, the server is on your PATH (the command stays unscoped):
+Once installed, the command is on your PATH (it stays unscoped). Start the MCP server with:
 
 ```sh
-agent-workspace-linux
+agent-workspace-linux mcp
 ```
 
 It is an [MCP](https://modelcontextprotocol.io/) server that speaks JSON-RPC over stdio. For Codex for Linux, prefer the dedicated **Agent Workspaces** feature page so command paths, permission rules, and reconnect/restart control stay out of the generic MCP settings page. If an older Codex install still shows this backend in generic MCP/configuration pages, remove the stale `agent-workspace-linux` MCP tables before reconnecting through the feature page. For other MCP clients, wire it into the client config, e.g. for Claude Code:
@@ -58,7 +59,7 @@ It is an [MCP](https://modelcontextprotocol.io/) server that speaks JSON-RPC ove
   "mcpServers": {
     "agent-workspace-linux": {
       "command": "agent-workspace-linux",
-      "args": []
+      "args": ["mcp"]
     }
   }
 }

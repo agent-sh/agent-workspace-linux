@@ -25,10 +25,10 @@
   <a href="#docs">Docs</a>
 </p>
 
-> Running open models for your company? [**Tiyuvta**](https://tiyuvta.ai/services/) helps with model choice, deployment and optimization, and fine-tuning on your hardware or cloud account.
-
-> Built and maintained with a lot of agent tokens and hours.
-> If it saves you time, [sponsoring](https://github.com/sponsors/avifenesh) helps keep it going.
+<p align="center">
+  <a href="https://github.com/sponsors/avifenesh"><img src="https://img.shields.io/badge/Sponsor-%E2%9D%A4-db61a2?style=for-the-badge&logo=githubsponsors&logoColor=white" alt="Sponsor"></a>
+</p>
+<p align="center"><b>Built and maintained with a lot of agent tokens and hours. If it saves you time, <a href="https://github.com/sponsors/avifenesh">sponsoring</a> helps keep it going.</b></p>
 
 Agents that "use a computer" usually take over *your* screen. They move your mouse, steal focus and drive your logged-in browser. `agent-workspace-linux` gives the agent its **own** desktop: a private X11 or native Wayland display with its own window manager or compositor, apps, clipboard and browser, on any of [six backends](#desktop-backends). The agent launches apps, types, clicks, takes screenshots and browses there. You watch, pause or stop it from a small floating viewer. It speaks [MCP](https://modelcontextprotocol.io) over stdio, so it works with Claude Code, Codex and other MCP hosts.
 
@@ -63,7 +63,7 @@ Other backends need [their own packages](#backend-packages).
 # npm: downloads the prebuilt binary from the matching release and checks its sha256
 npm install -g @agent-sh/agent-workspace-linux
 
-# cargo: builds from git and installs only the binary (add --tag v0.6.2 to pin)
+# cargo: builds from git and installs only the binary (add --tag v0.6.3 to pin)
 cargo install --git https://github.com/agent-sh/agent-workspace-linux
 ```
 
@@ -316,7 +316,7 @@ Managed terminal sessions end when their workspace stops, even after the termina
 
 ## The skill
 
-The MCP exposes about 86 tools. To keep them out of the agent's context, it ships a skill at [`skills/agent-workspace-linux/SKILL.md`](skills/agent-workspace-linux/SKILL.md). Only its short description stays loaded. When a task needs a background desktop or browser, the agent reads the skill, which routes it through the phases (orient, start, observe, act, stop) and loads tool schemas on demand.
+The MCP exposes 82 tools. To keep them out of the agent's context, it ships a skill at [`skills/agent-workspace-linux/SKILL.md`](skills/agent-workspace-linux/SKILL.md). Only its short description stays loaded. When a task needs a background desktop or browser, the agent reads the skill, which routes it through the phases (orient, start, observe, act, stop) and loads tool schemas on demand.
 
 `./install.sh` installs it to `~/.codex/skills/`. Use `--skills-dir ~/.claude/skills` for Claude.
 
