@@ -90,6 +90,13 @@ pub fn inside(session: SessionSpec) -> bool {
     session.version.is_some() && env::var(MARKER).is_ok_and(|value| value == key(session))
 }
 
+fn sha256_hex(content: &[u8]) -> String {
+    Sha256::digest(content)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 fn cache_dir() -> Result<PathBuf> {
     let base = env::var_os("XDG_CACHE_HOME")
         .map(PathBuf::from)
@@ -99,9 +106,9 @@ fn cache_dir() -> Result<PathBuf> {
         bail!("runtime cache must be an absolute path");
     }
     Ok(base.join("agent-workspace-linux/runtimes").join(format!(
-        "gnome-46-{}-{:x}",
+        "gnome-46-{}-{}",
         env::consts::ARCH,
-        Sha256::digest(DEFINITION.as_bytes())
+        sha256_hex(DEFINITION.as_bytes())
     )))
 }
 
@@ -872,6 +879,13 @@ fn make_directories_removable(path: &std::path::Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn runtime_cache_hash_uses_stable_lowercase_sha256() {
+        assert_eq!(
+            sha256_hex(b"abc"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+    }
     #[test]
     fn version_roundtrip_and_component_matching() {
         let value: Version = "46.0".parse().unwrap();
