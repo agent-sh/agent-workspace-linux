@@ -8738,6 +8738,18 @@ fn remove_dead_x11_display_artifacts(number: u32, socket: &Path, lock: &Path) ->
         match fs::remove_file(path) {
             Ok(()) => {}
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            // On a multi-user host /tmp carries the sticky bit, so another
+            // user's leftover lock or socket cannot be unlinked by us (EPERM).
+            // The artifacts are still dead, but the display is not ours to
+            // reclaim: report it as unusable and let the caller try the next
+            // number in DISPLAY_RANGE instead of failing the whole start.
+            Err(error) if error.kind() == std::io::ErrorKind::PermissionDenied => {
+                eprintln!(
+                    "skipping :{number}: cannot remove stale X11 {what} {} ({error})",
+                    path.display()
+                );
+                return Ok(false);
+            }
             Err(error) => {
                 return Err(error).with_context(|| {
                     format!("failed to remove stale X11 {what} {}", path.display())
@@ -9581,6 +9593,36 @@ mod tests {
         assert_eq!(
             recorded_process(Some(0), None, pick, "wm", &mut actions),
             None
+        );
+    }
+
+    // A stale lock owned by another unix user on a sticky /tmp cannot be
+    // unlinked by us; the display scan must move on, not abort the start.
+    #[test]
+    fn a_stale_artifact_we_cannot_remove_leaves_the_display_unusable() {
+        if unsafe { libc::geteuid() } == 0 {
+            // root ignores the directory write bit, so the EACCES/EPERM path
+            // under test cannot be produced here.
+            return;
+        }
+        let scratch = env::temp_dir().join(format!("awl-stale-lock-{}", std::process::id()));
+        let dir = scratch.join("tmp");
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        // A lock naming a pid that can never exist, in a directory we cannot
+        // write to: the artifacts are provably dead but not ours to remove.
+        let lock = dir.join(".X177-lock");
+        let socket = dir.join("X177");
+        fs::write(&lock, "4294967295\n").expect("write lock");
+        fs::write(&socket, "").expect("write socket");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).expect("chmod scratch");
+
+        let outcome = remove_dead_x11_display_artifacts(177, &socket, &lock);
+
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).expect("restore scratch");
+        let _ = fs::remove_dir_all(&scratch);
+        assert!(
+            !outcome.expect("an artifact we may not remove is not a fatal error"),
+            "the display must be reported unusable, not reclaimed"
         );
     }
 
