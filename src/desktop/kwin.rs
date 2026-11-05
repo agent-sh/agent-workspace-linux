@@ -441,7 +441,7 @@ fn decode_image(
     if width == 0
         || height == 0
         || stride < width.checked_mul(4).context("image width overflow")?
-        || !matches!(format, 4..=6 | 17 | 18)
+        || !matches!(format, 4..=6 | 16..=18)
     {
         bail!(
             "unsupported KWin screenshot layout {width}x{height}, stride {stride}, format {format}"
@@ -460,7 +460,7 @@ fn decode_image(
             let (r, g, b, a) = if format <= 6 {
                 (p[2], p[1], p[0], if format == 4 { 255 } else { p[3] })
             } else {
-                (p[0], p[1], p[2], p[3])
+                (p[0], p[1], p[2], if format == 16 { 255 } else { p[3] })
             };
             let unpremul = |v: u8| {
                 if a > 0 && matches!(format, 6 | 18) {
@@ -550,6 +550,10 @@ mod tests {
         assert_eq!(
             decode_image(&mut &raw[..], 1, 1, 8, 17).unwrap(),
             [25, 50, 100, 128]
+        );
+        assert_eq!(
+            decode_image(&mut &raw[..], 1, 1, 8, 16).unwrap(),
+            [25, 50, 100, 255]
         );
         assert!(decode_image(&mut &raw[..], 2, 1, 4, 6).is_err());
         assert!(decode_image(&mut &raw[..], 1, 3, 4, 6).is_err());
