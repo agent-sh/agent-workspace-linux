@@ -341,13 +341,17 @@ mod tests {
 
     #[test]
     fn absolute_and_bare_app_allow_entries_keep_distinct_matching_semantics() {
+        // Use the `sh` that PATH actually finds. `/bin/sh` is not always the
+        // same file: on NixOS it and PATH's `sh` are different bash builds.
+        let sh = resolve_command_path("sh").expect("sh on PATH");
+        let sh_str = sh.to_str().expect("utf-8 sh path");
         let absolute = configured_state(McpPermissionCeiling {
             apps: AppPermissionCeiling {
-                allow: vec![PathBuf::from("/bin/sh")],
+                allow: vec![sh.clone()],
             },
         });
         absolute
-            .validate_launch_spec(&launch_spec(&["/bin/sh"], None))
+            .validate_launch_spec(&launch_spec(&[sh_str], None))
             .expect("absolute path should match itself");
         absolute
             .validate_launch_spec(&launch_spec(&["sh"], None))
@@ -361,7 +365,7 @@ mod tests {
         bare.validate_launch_spec(&launch_spec(&["sh"], None))
             .expect("bare command should match the same bare allow entry");
         assert!(
-            bare.validate_launch_spec(&launch_spec(&["/bin/sh"], None))
+            bare.validate_launch_spec(&launch_spec(&[sh_str], None))
                 .is_err(),
             "a bare allow entry must not start matching arbitrary absolute spellings"
         );
