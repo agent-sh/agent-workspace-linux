@@ -344,6 +344,7 @@ mod tests {
         // Use the `sh` that PATH actually finds. `/bin/sh` is not always the
         // same file: on NixOS it and PATH's `sh` are different bash builds.
         let sh = resolve_command_path("sh").expect("sh on PATH");
+        assert!(sh.is_absolute(), "PATH resolved sh to {}", sh.display());
         let sh_str = sh.to_str().expect("utf-8 sh path");
         let absolute = configured_state(McpPermissionCeiling {
             apps: AppPermissionCeiling {
@@ -369,6 +370,26 @@ mod tests {
                 .is_err(),
             "a bare allow entry must not start matching arbitrary absolute spellings"
         );
+    }
+
+    #[test]
+    fn absolute_allow_entry_matches_a_symlink_to_the_resolved_command() {
+        // An allow entry may name a link to the binary PATH finds (/bin/sh vs
+        // /usr/bin/sh on a merged-/usr system); matching goes through canonicalize.
+        let sh = resolve_command_path("sh").expect("sh on PATH");
+        let dir = std::env::temp_dir().join(format!("awl-sh-link-{}", std::process::id()));
+        fs::create_dir_all(&dir).expect("create scratch dir");
+        let link = dir.join("sh");
+        let _ = fs::remove_file(&link);
+        std::os::unix::fs::symlink(&sh, &link).expect("symlink sh");
+        let state = configured_state(McpPermissionCeiling {
+            apps: AppPermissionCeiling {
+                allow: vec![link.clone()],
+            },
+        });
+        let outcome = state.validate_launch_spec(&launch_spec(&["sh"], None));
+        let _ = fs::remove_dir_all(&dir);
+        outcome.expect("a symlink to the resolved binary should match the bare command");
     }
 
     #[test]
