@@ -56,11 +56,11 @@ impl From<Version> for String {
 }
 impl fmt::Display for Version {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for index in 0..self.length {
+        for (index, number) in self.numbers.iter().take(self.length).enumerate() {
             if index != 0 {
                 f.write_str(".")?;
             }
-            write!(f, "{}", self.numbers[index])?;
+            write!(f, "{number}")?;
         }
         Ok(())
     }
