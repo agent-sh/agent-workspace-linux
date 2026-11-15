@@ -472,14 +472,6 @@ impl Element for BoundsTrackedDiv {
     }
 }
 
-impl IntoElement for BoundsTrackedDiv {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
-
 struct ViewerTooltip {
     text: SharedString,
     palette: ViewerPalette,
