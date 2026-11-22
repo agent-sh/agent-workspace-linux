@@ -57,7 +57,7 @@ jobs:
           components: clippy, rustfmt
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@f4371d1ec7179bfbd04a82a81e3b3af7f720750f # v2
+        uses: Swatinem/rust-cache@eedcf2fb1c22f010a0eb66b92f378c110977f266 # v2
 
       - name: Install nextest
         uses: taiki-e/install-action@d042af60014eb018fcd01f57f4f62118b69e3ea6 # nextest
@@ -138,6 +138,11 @@ jobs:
         #     (quick-xml 0.30/0.39 reachable only through wayland-scanner /
         #     gpui asset pipelines parsing vendored XML at build time, never
         #     attacker input; unignore when upstream moves to quick-xml >= 0.41)
+        #   RUSTSEC-2026-0543 chrono          unmaintained, all versions affected;
+        #     transitive via rmcp (chrono is a direct rmcp dependency) and the
+        #     gpui git dependency's scheduler crate. No patched chrono exists
+        #     (alternatives jiff/time are upstream migrations). Remove when
+        #     rmcp and gpui upstream move off chrono.
         # Everything else is still denied, so a real advisory fails CI.
         run: |
           cargo audit --deny warnings \
@@ -152,7 +157,8 @@ jobs:
             --ignore RUSTSEC-2026-0206 \
             --ignore RUSTSEC-2026-0370 \
             --ignore RUSTSEC-2026-0371 \
-            --ignore RUSTSEC-2026-0372
+            --ignore RUSTSEC-2026-0372 \
+            --ignore RUSTSEC-2026-0543
 
   # Validate the shipped SKILL.md and any agent config via agnix.
   # Scoped to skills/ rather than the repo root so the linter only sees the
