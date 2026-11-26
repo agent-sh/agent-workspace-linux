@@ -3051,12 +3051,37 @@ impl AgentWorkspaceLinux {
     }
 }
 
-/// schemars emits Rust-specific integer formats (`uint`, `uint8`, `uint32`,
-/// `uint64`) that strict JSON-Schema validators reject with a flood of
-/// "unknown format" warnings at client startup (opencode printed ~3.6k per
-/// launch). `format` is annotation-only in draft 2020-12 and schemars already
-/// emits the matching minimum/maximum bounds, so stripping the nonstandard
-/// values loses no information.
+/// Normalize schemars output for strict MCP JSON-Schema / Zod validators:
+///
+/// 1. schemars emits Rust-specific integer formats (`uint`, `uint8`, `uint32`,
+///    `uint64`) that strict JSON-Schema validators reject with a flood of
+///    "unknown format" warnings at client startup. `format` is annotation-only
+///    in draft 2020-12 and schemars already emits the matching minimum/maximum
+///    bounds, so stripping the nonstandard values loses no information.
+/// 2. schemars 1.x emits boolean JSON Schemas (`true`) for untyped
+///    `serde_json::Value` fields (such as `DoctorReport.session_runtimes`,
+///    `WorkspaceEvent.detail`, and action `arguments`). Strict MCP SDK Zod
+///    validators (used by Kimi Code, Claude Desktop, and mcphub) require
+///    object schemas in `properties`, `$defs`, `items`, and combinators, so
+///    boolean subschemas are rewritten to their equivalent object forms (`{}`
+///    for `true`, `{"not": {}}` for `false`).
+fn normalize_boolean_subschema(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Bool(true) => {
+            *value = serde_json::Value::Object(serde_json::Map::new());
+        }
+        serde_json::Value::Bool(false) => {
+            let mut not_any = serde_json::Map::new();
+            not_any.insert(
+                "not".to_string(),
+                serde_json::Value::Object(serde_json::Map::new()),
+            );
+            *value = serde_json::Value::Object(not_any);
+        }
+        _ => {}
+    }
+}
+
 fn drop_unknown_schema_formats(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
@@ -3087,8 +3112,43 @@ fn drop_unknown_schema_formats(value: &mut serde_json::Value) {
                     map.remove("format");
                 }
             }
-            for (_, v) in map.iter_mut() {
-                drop_unknown_schema_formats(v);
+            for (key, v) in map.iter_mut() {
+                match key.as_str() {
+                    // Data-only keywords hold example/default JSON values, not subschemas.
+                    "default" | "const" | "enum" | "examples" => continue,
+                    // Map-of-subschemas keywords.
+                    "properties" | "patternProperties" | "$defs" | "definitions"
+                    | "dependentSchemas" => {
+                        if let serde_json::Value::Object(entries) = v {
+                            for entry in entries.values_mut() {
+                                normalize_boolean_subschema(entry);
+                                drop_unknown_schema_formats(entry);
+                            }
+                        }
+                    }
+                    // Direct subschema keywords.
+                    "items" | "contains" | "not" | "if" | "then" | "else" | "propertyNames" => {
+                        if let serde_json::Value::Array(items) = v {
+                            for item in items {
+                                normalize_boolean_subschema(item);
+                                drop_unknown_schema_formats(item);
+                            }
+                        } else {
+                            normalize_boolean_subschema(v);
+                            drop_unknown_schema_formats(v);
+                        }
+                    }
+                    // Array-of-subschemas combinator keywords.
+                    "anyOf" | "oneOf" | "allOf" | "prefixItems" => {
+                        if let serde_json::Value::Array(items) = v {
+                            for item in items {
+                                normalize_boolean_subschema(item);
+                                drop_unknown_schema_formats(item);
+                            }
+                        }
+                    }
+                    _ => drop_unknown_schema_formats(v),
+                }
             }
         }
         serde_json::Value::Array(items) => {
@@ -10293,6 +10353,82 @@ mod tests {
         );
         assert_eq!(result["ttlMs"].as_u64(), Some(TOOLS_LIST_TTL_MS));
         assert_eq!(result["cacheScope"], "private");
+    }
+
+    #[tokio::test]
+    async fn tools_list_rewrites_boolean_subschemas_to_objects() {
+        fn assert_no_boolean_subschemas(value: &serde_json::Value, path: &str) {
+            let Some(map) = value.as_object() else {
+                return;
+            };
+            for (key, child) in map {
+                match key.as_str() {
+                    "default" | "const" | "enum" | "examples" => continue,
+                    "properties" | "patternProperties" | "$defs" | "definitions"
+                    | "dependentSchemas" => {
+                        if let Some(entries) = child.as_object() {
+                            for (name, subschema) in entries {
+                                let child_path = format!("{path}.{key}.{name}");
+                                assert!(
+                                    subschema.is_object(),
+                                    "subschema at {child_path} must be an object, got {subschema}"
+                                );
+                                assert_no_boolean_subschemas(subschema, &child_path);
+                            }
+                        }
+                    }
+                    "items" | "contains" | "not" | "if" | "then" | "else" | "propertyNames" => {
+                        let child_path = format!("{path}.{key}");
+                        if let Some(items) = child.as_array() {
+                            for (idx, item) in items.iter().enumerate() {
+                                assert!(
+                                    item.is_object(),
+                                    "subschema at {child_path}[{idx}] must be an object, got {item}"
+                                );
+                                assert_no_boolean_subschemas(item, &format!("{child_path}[{idx}]"));
+                            }
+                        } else {
+                            assert!(
+                                child.is_object(),
+                                "subschema at {child_path} must be an object, got {child}"
+                            );
+                            assert_no_boolean_subschemas(child, &child_path);
+                        }
+                    }
+                    "anyOf" | "oneOf" | "allOf" | "prefixItems" => {
+                        if let Some(items) = child.as_array() {
+                            for (idx, item) in items.iter().enumerate() {
+                                let child_path = format!("{path}.{key}[{idx}]");
+                                assert!(
+                                    item.is_object(),
+                                    "subschema at {child_path} must be an object, got {item}"
+                                );
+                                assert_no_boolean_subschemas(item, &child_path);
+                            }
+                        }
+                    }
+                    _ => assert_no_boolean_subschemas(child, &format!("{path}.{key}")),
+                }
+            }
+        }
+
+        let result = modern_tools_list_result().await;
+        let tools = result["tools"].as_array().expect("tools array");
+        let doctor = tools
+            .iter()
+            .find(|tool| tool["name"] == "workspace_doctor")
+            .expect("workspace_doctor tool");
+        assert!(
+            doctor["outputSchema"]["properties"]["session_runtimes"].is_object(),
+            "workspace_doctor.outputSchema.properties.session_runtimes must be an object schema"
+        );
+        for tool in tools {
+            let name = tool["name"].as_str().unwrap_or("<unnamed>");
+            assert_no_boolean_subschemas(&tool["inputSchema"], &format!("{name}.inputSchema"));
+            if let Some(output_schema) = tool.get("outputSchema") {
+                assert_no_boolean_subschemas(output_schema, &format!("{name}.outputSchema"));
+            }
+        }
     }
 
     fn catalog_tool<'a>(catalog: &'a McpActionCatalog, name: &str) -> &'a McpActionInfo {
