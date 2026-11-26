@@ -3051,20 +3051,6 @@ impl AgentWorkspaceLinux {
     }
 }
 
-/// Normalize schemars output for strict MCP JSON-Schema / Zod validators:
-///
-/// 1. schemars emits Rust-specific integer formats (`uint`, `uint8`, `uint32`,
-///    `uint64`) that strict JSON-Schema validators reject with a flood of
-///    "unknown format" warnings at client startup. `format` is annotation-only
-///    in draft 2020-12 and schemars already emits the matching minimum/maximum
-///    bounds, so stripping the nonstandard values loses no information.
-/// 2. schemars 1.x emits boolean JSON Schemas (`true`) for untyped
-///    `serde_json::Value` fields (such as `DoctorReport.session_runtimes`,
-///    `WorkspaceEvent.detail`, and action `arguments`). Strict MCP SDK Zod
-///    validators (used by Kimi Code, Claude Desktop, and mcphub) require
-///    object schemas in `properties`, `$defs`, `items`, and combinators, so
-///    boolean subschemas are rewritten to their equivalent object forms (`{}`
-///    for `true`, `{"not": {}}` for `false`).
 fn normalize_boolean_subschema(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Bool(true) => {
@@ -3082,7 +3068,20 @@ fn normalize_boolean_subschema(value: &mut serde_json::Value) {
     }
 }
 
-fn drop_unknown_schema_formats(value: &mut serde_json::Value) {
+/// Normalize schemars output for strict MCP JSON-Schema / Zod validators:
+///
+/// 1. schemars emits Rust-specific integer formats (`uint`, `uint8`, `uint32`,
+///    `uint64`) that strict JSON-Schema validators reject with a flood of
+///    "unknown format" warnings at client startup. `format` is annotation-only
+///    in draft 2020-12 and schemars already emits the matching minimum/maximum
+///    bounds, so stripping the nonstandard values loses no information.
+/// 2. schemars 1.x emits boolean JSON Schemas (`true`) for untyped
+///    `serde_json::Value` fields (such as `DoctorReport.session_runtimes`,
+///    `WorkspaceEvent.detail`, and action `arguments`). Strict MCP SDK Zod
+///    validators require object schemas in `properties`, `$defs`, `items`, and
+///    combinators, so boolean subschemas are rewritten to their equivalent
+///    object forms (`{}` for `true`, `{"not": {}}` for `false`).
+fn sanitize_schema_value(value: &mut serde_json::Value) {
     match value {
         serde_json::Value::Object(map) => {
             if let Some(format) = map.get("format").and_then(|f| f.as_str()) {
@@ -3116,44 +3115,58 @@ fn drop_unknown_schema_formats(value: &mut serde_json::Value) {
                 match key.as_str() {
                     // Data-only keywords hold example/default JSON values, not subschemas.
                     "default" | "const" | "enum" | "examples" => continue,
+                    // Keep boolean `additionalProperties` / `unevaluated*` intact for
+                    // strict JSON-Schema / OpenAPI consumers, while still recursing
+                    // when their value is an object schema.
+                    "additionalProperties" | "unevaluatedProperties" | "unevaluatedItems" => {
+                        if v.is_object() {
+                            sanitize_schema_value(v);
+                        }
+                    }
                     // Map-of-subschemas keywords.
                     "properties" | "patternProperties" | "$defs" | "definitions"
                     | "dependentSchemas" => {
                         if let serde_json::Value::Object(entries) = v {
                             for entry in entries.values_mut() {
                                 normalize_boolean_subschema(entry);
-                                drop_unknown_schema_formats(entry);
+                                sanitize_schema_value(entry);
                             }
                         }
                     }
-                    // Direct subschema keywords.
-                    "items" | "contains" | "not" | "if" | "then" | "else" | "propertyNames" => {
+                    // `items` is either a single subschema (2020-12) or a tuple array (draft-07).
+                    "items" => {
                         if let serde_json::Value::Array(items) = v {
                             for item in items {
                                 normalize_boolean_subschema(item);
-                                drop_unknown_schema_formats(item);
+                                sanitize_schema_value(item);
                             }
                         } else {
                             normalize_boolean_subschema(v);
-                            drop_unknown_schema_formats(v);
+                            sanitize_schema_value(v);
                         }
+                    }
+                    // Single-subschema keywords.
+                    "additionalItems" | "contains" | "contentSchema" | "not" | "if" | "then"
+                    | "else" | "propertyNames" => {
+                        normalize_boolean_subschema(v);
+                        sanitize_schema_value(v);
                     }
                     // Array-of-subschemas combinator keywords.
                     "anyOf" | "oneOf" | "allOf" | "prefixItems" => {
                         if let serde_json::Value::Array(items) = v {
                             for item in items {
                                 normalize_boolean_subschema(item);
-                                drop_unknown_schema_formats(item);
+                                sanitize_schema_value(item);
                             }
                         }
                     }
-                    _ => drop_unknown_schema_formats(v),
+                    _ => sanitize_schema_value(v),
                 }
             }
         }
         serde_json::Value::Array(items) => {
             for v in items {
-                drop_unknown_schema_formats(v);
+                sanitize_schema_value(v);
             }
         }
         _ => {}
@@ -3162,13 +3175,13 @@ fn drop_unknown_schema_formats(value: &mut serde_json::Value) {
 
 fn sanitize_tool_schema(tool: &mut rmcp::model::Tool) {
     let mut schema = serde_json::Value::Object(tool.input_schema.as_ref().clone());
-    drop_unknown_schema_formats(&mut schema);
+    sanitize_schema_value(&mut schema);
     if let serde_json::Value::Object(map) = schema {
         tool.input_schema = std::sync::Arc::new(map);
     }
     if let Some(out) = tool.output_schema.take() {
         let mut schema = serde_json::Value::Object(out.as_ref().clone());
-        drop_unknown_schema_formats(&mut schema);
+        sanitize_schema_value(&mut schema);
         if let serde_json::Value::Object(map) = schema {
             tool.output_schema = Some(std::sync::Arc::new(map));
         }
@@ -10377,7 +10390,7 @@ mod tests {
                             }
                         }
                     }
-                    "items" | "contains" | "not" | "if" | "then" | "else" | "propertyNames" => {
+                    "items" => {
                         let child_path = format!("{path}.{key}");
                         if let Some(items) = child.as_array() {
                             for (idx, item) in items.iter().enumerate() {
@@ -10394,6 +10407,15 @@ mod tests {
                             );
                             assert_no_boolean_subschemas(child, &child_path);
                         }
+                    }
+                    "additionalItems" | "contains" | "contentSchema" | "not" | "if" | "then"
+                    | "else" | "propertyNames" => {
+                        let child_path = format!("{path}.{key}");
+                        assert!(
+                            child.is_object(),
+                            "subschema at {child_path} must be an object, got {child}"
+                        );
+                        assert_no_boolean_subschemas(child, &child_path);
                     }
                     "anyOf" | "oneOf" | "allOf" | "prefixItems" => {
                         if let Some(items) = child.as_array() {
@@ -10429,6 +10451,67 @@ mod tests {
                 assert_no_boolean_subschemas(output_schema, &format!("{name}.outputSchema"));
             }
         }
+
+        // Direct `get_tool` applies the same sanitization as `list_tools`.
+        let direct_doctor = AgentWorkspaceLinux::default()
+            .get_tool("workspace_doctor")
+            .expect("workspace_doctor via get_tool");
+        let direct_out =
+            serde_json::Value::Object(direct_doctor.output_schema.unwrap().as_ref().clone());
+        assert!(direct_out["properties"]["session_runtimes"].is_object());
+    }
+
+    #[test]
+    fn sanitize_schema_value_handles_boolean_subschemas_and_preserves_data_keywords() {
+        let mut schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+                "any_val": true,
+                "never_val": false,
+                "count": { "type": "integer", "format": "uint64", "default": false },
+                "raw_default": { "type": "object", "default": { "format": "uint32", "flag": true } },
+                "list": { "type": "array", "items": true, "additionalItems": false },
+                "union": { "anyOf": [true, false] },
+                "encoded": { "type": "string", "contentSchema": true }
+            },
+            "$defs": {
+                "Any": true,
+                "Never": false
+            }
+        });
+        sanitize_schema_value(&mut schema);
+
+        assert_eq!(schema["additionalProperties"], serde_json::json!(false));
+        assert_eq!(schema["properties"]["any_val"], serde_json::json!({}));
+        assert_eq!(
+            schema["properties"]["never_val"],
+            serde_json::json!({ "not": {} })
+        );
+        assert!(schema["properties"]["count"].get("format").is_none());
+        assert_eq!(
+            schema["properties"]["count"]["default"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            schema["properties"]["raw_default"]["default"],
+            serde_json::json!({ "format": "uint32", "flag": true })
+        );
+        assert_eq!(schema["properties"]["list"]["items"], serde_json::json!({}));
+        assert_eq!(
+            schema["properties"]["list"]["additionalItems"],
+            serde_json::json!({ "not": {} })
+        );
+        assert_eq!(
+            schema["properties"]["union"]["anyOf"],
+            serde_json::json!([{}, { "not": {} }])
+        );
+        assert_eq!(
+            schema["properties"]["encoded"]["contentSchema"],
+            serde_json::json!({})
+        );
+        assert_eq!(schema["$defs"]["Any"], serde_json::json!({}));
+        assert_eq!(schema["$defs"]["Never"], serde_json::json!({ "not": {} }));
     }
 
     fn catalog_tool<'a>(catalog: &'a McpActionCatalog, name: &str) -> &'a McpActionInfo {
